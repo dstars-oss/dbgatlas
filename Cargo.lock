@@ -157,7 +157,9 @@ version = "0.1.0"
 dependencies = [
  "dbgatlas-dbgeng-sys",
  "serde",
+ "tempfile",
  "thiserror",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -195,6 +197,7 @@ dependencies = [
 name = "dbgatlas-service"
 version = "0.1.0"
 dependencies = [
+ "dbgatlas-dbgeng",
  "dbgatlas-debug",
  "dbgatlas-model",
  "dbgatlas-worker-protocol",

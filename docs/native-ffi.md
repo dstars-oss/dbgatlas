@@ -42,10 +42,15 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 最小 session ABI 包括：
 
 - `da_dbgeng_session_open_dump(path_utf8, out_handle)`
+- `da_dbgeng_session_attach_process(pid, out_handle)`
 - `da_dbgeng_session_execute(handle, command_utf8, out_text)`
+- `da_dbgeng_session_add_symbols(handle, symbol_path_utf8, reload, out_text)`
+- `da_dbgeng_session_read_virtual(handle, address, length, out_bytes)`
 - `da_dbgeng_session_close(handle)`
 
-当前实现是可编译的 session skeleton，用于稳定 ABI 与 Rust safe wrapper；真实 DbgEng open dump / command execution 仍是后续 MVP 1 任务。
+当前实现使用 DbgEng `DebugCreate` 建立 session。dump 通过 `OpenDumpFile` 打开，attach 使用非侵入 attach，不在 close 时终止目标进程。raw command 通过 `IDebugControl::Execute` 执行，并用 output callbacks 捕获输出。`add_symbols` 追加当前 session 的 symbol path，可选执行 `.reload`。`read_virtual` 用 `IDebugDataSpaces::ReadVirtual` 返回二进制 view。
+
+`DA_DbgEngTextView` 也用于 read memory 的 byte view；Rust safe wrapper 按 `data/len` 复制为 `Vec<u8>` 后调用 `da_dbgeng_release_view(owner)`。
 
 ## 错误处理
 
@@ -57,5 +62,7 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 ## 线程模型
 
 DbgEng session、callback、event polling、COM 初始化和线程归属必须封装在 C++ DLL 内部，Rust 只看到 session handle 或 safe wrapper。
+
+MVP 1 的真实 DbgEng session 由 per-session worker 持有。worker 主循环串行处理同一 session 的 start/eval/add_symbols/read_memory/close 请求，避免跨线程直接操作同一 DbgEng client。
 
 DbgEng、ETW、DIA 后续必须各自维护 header、DLL adapter 和 `*-sys` crate。不要新增中心化 protocol crate，也不要把多个 native adapter 过早聚合到一个 DLL ABI。

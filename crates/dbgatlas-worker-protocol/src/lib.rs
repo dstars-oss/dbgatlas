@@ -1,4 +1,4 @@
-use dbgatlas_debug::{DebugCommandResult, DebugTarget};
+use dbgatlas_debug::{DebugCommandResult, DebugMemoryResult, DebugTarget};
 use dbgatlas_model::{OperationRef, SessionRef, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -37,6 +37,20 @@ pub enum WorkerRequest {
         command: String,
         artifact_dir: PathBuf,
     },
+    AddSymbols {
+        session_id: SessionRef,
+        operation_id: OperationRef,
+        symbol_path: String,
+        reload: bool,
+        artifact_dir: PathBuf,
+    },
+    ReadMemory {
+        session_id: SessionRef,
+        operation_id: OperationRef,
+        address: u64,
+        length: u64,
+        artifact_dir: PathBuf,
+    },
     CloseSession {
         session_id: SessionRef,
     },
@@ -58,6 +72,10 @@ pub enum WorkerResponse {
     },
     DebugCommand {
         result: DebugCommandResult,
+        writes: Vec<WorkerArtifactWrite>,
+    },
+    DebugMemory {
+        result: DebugMemoryResult,
         writes: Vec<WorkerArtifactWrite>,
     },
     Failed {
@@ -136,6 +154,24 @@ mod tests {
 
         let encoded = encode_jsonl(&request).unwrap();
         assert!(encoded.ends_with('\n'));
+        let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn read_memory_round_trips_as_jsonl() {
+        let request = WorkerEnvelope::new(
+            "req-003",
+            WorkerRequest::ReadMemory {
+                session_id: SessionRef::new(Id::new("session-001").unwrap()),
+                operation_id: OperationRef::new(Id::new("op-001").unwrap()),
+                address: 0x1000,
+                length: 32,
+                artifact_dir: PathBuf::from(r"C:\case\dbgatlas\artifacts\sessions\session-001"),
+            },
+        );
+
+        let encoded = encode_jsonl(&request).unwrap();
         let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
         assert_eq!(decoded, request);
     }

@@ -34,18 +34,19 @@ Tasks:
 - [x] 将 DbgEng bootstrap ABI 迁移为 adapter-specific `dbgatlas_dbgeng.h`。
 - [x] 在 `dbgatlas-dbgeng-sys` 中绑定新的 DbgEng C ABI。
 - [x] 在 `dbgatlas-dbgeng` 中提供 safe session wrapper。
-- [ ] 支持 open dump。
-- [ ] 支持 attach process。
-- [ ] 支持 execute raw WinDbg command。
-- [ ] 捕获 command output。
-- [ ] 将 transcript / events / raw output 写入 `artifacts/sessions/<session_id>/`。
-- [ ] 登记 debug session 相关 artifact metadata 和 operation records。
-- [ ] 支持 list modules。
-- [ ] 支持 list threads。
-- [ ] 支持 get stack。
-- [ ] 支持 read memory to artifact file。
-- [ ] 为 worker 卡死、cancel、kill、native failure 增加测试。
-- [ ] 增加 CLI debug session 命令。
+- [x] 支持 open dump。
+- [x] 支持 attach process。
+- [x] 支持 execute raw WinDbg command。
+- [x] 捕获 command output。
+- [x] 支持 per-session add_symbols。
+- [x] 将 transcript / events / raw output 写入 `artifacts/sessions/<session_id>/`。
+- [x] 登记 debug session 相关 artifact metadata 和 operation records。
+- [x] 支持 list modules。
+- [x] 支持 list threads。
+- [x] 支持 get stack。
+- [x] 支持 read memory to artifact file。
+- [x] 为 worker 卡死、cancel、kill、native failure 增加测试。
+- [x] 增加 CLI debug session 命令。
 
 Non-goals:
 
@@ -56,10 +57,10 @@ Non-goals:
 
 Acceptance:
 
-- [ ] CLI 能创建 session、打开 dump、执行一条 raw command、关闭 session。
-- [ ] worker 卡死时主进程可 cancel/kill，并写入 failed 或 canceled operation。
-- [ ] 内部 `<project_root>/dbgatlas` 里可审计 replay：operation log、artifact metadata、transcript/raw output 均可定位。
-- [ ] `cargo test --workspace` 和 DbgEng 相关集成测试通过。
+- [x] CLI 能创建 session、打开 dump、执行一条 raw command、关闭 session。
+- [x] worker 卡死时主进程可 cancel/kill，并写入 failed 或 canceled operation。
+- [x] 内部 `<project_root>/dbgatlas` 里可审计 replay：operation log、artifact metadata、transcript/raw output 均可定位。
+- [x] `cargo test --workspace` 和 DbgEng 相关集成测试通过。
 
 ## MVP 2: Recording And Agent Entry
 

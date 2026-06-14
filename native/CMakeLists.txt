@@ -20,6 +20,10 @@ target_include_directories(dbgatlas_dbgeng
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+if(WIN32)
+    target_link_libraries(dbgatlas_dbgeng PRIVATE DbgEng)
+endif()
+
 if(MSVC)
     target_compile_options(dbgatlas_dbgeng PRIVATE /W4 /permissive-)
 else()

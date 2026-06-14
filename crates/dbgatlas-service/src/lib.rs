@@ -1,5 +1,6 @@
 use dbgatlas_debug::{
-    CreateDebugSession, DebugCommandResult, DebugSessionState, DebugTarget, EvalDebugCommand,
+    AddSymbolsRequest, CreateDebugSession, DebugCommandResult, DebugMemoryResult,
+    DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
 };
 use dbgatlas_model::{ArtifactRef, Id, OperationRef, SessionRef, Timestamp};
 use dbgatlas_worker_protocol::{
@@ -24,6 +25,7 @@ use thiserror::Error;
 
 pub const INTERNAL_WORKSPACE_DIR: &str = "dbgatlas";
 pub const DEFAULT_SERVICE_PORT: u16 = 7331;
+pub const MAX_MEMORY_READ_LENGTH: u64 = 16 * 1024 * 1024;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -121,9 +123,11 @@ impl ServiceHost {
             "debug.session.close" => self.debug_session_close(request.params),
             "debug.session.kill" => self.debug_session_kill(request.params),
             "debug.eval" => self.debug_eval(request.params),
-            "debug.modules" => self.debug_builtin_eval(request.params, "lm"),
-            "debug.threads" => self.debug_builtin_eval(request.params, "~"),
-            "debug.stack" => self.debug_builtin_eval(request.params, "k"),
+            "debug.modules" => self.debug_builtin_eval(request.params, "debug.modules", "lm"),
+            "debug.threads" => self.debug_builtin_eval(request.params, "debug.threads", "~"),
+            "debug.stack" => self.debug_builtin_eval(request.params, "debug.stack", "k"),
+            "debug.add_symbols" => self.debug_add_symbols(request.params),
+            "debug.read_memory" => self.debug_read_memory(request.params),
             other => Err(ServiceError::Rpc(format!("unknown method `{other}`"))),
         };
 
@@ -260,24 +264,43 @@ impl ServiceHost {
                 artifact_dir: session_dir.clone(),
             },
         );
-        match start {
-            Ok(WorkerResponse::Ok { .. }) => {}
+        let start_writes = match start {
+            Ok(WorkerResponse::Ok { writes, .. }) => writes,
             Ok(WorkerResponse::Failed { code, message, .. }) => {
                 let _ = self.supervisor.kill_worker(&worker);
+                self.record_failed_session_create(
+                    &workspace,
+                    &operation_id,
+                    &session_id,
+                    format!("{code}: {message}"),
+                )?;
                 return Err(ServiceError::Worker(format!("{code}: {message}")));
             }
             Ok(other) => {
                 let _ = self.supervisor.kill_worker(&worker);
-                return Err(ServiceError::Worker(format!(
-                    "unexpected start response: {other:?}"
-                )));
+                let message = format!("unexpected start response: {other:?}");
+                self.record_failed_session_create(
+                    &workspace,
+                    &operation_id,
+                    &session_id,
+                    &message,
+                )?;
+                return Err(ServiceError::Worker(message));
             }
             Err(error) => {
                 let _ = self.supervisor.kill_worker(&worker);
+                self.record_failed_session_create(
+                    &workspace,
+                    &operation_id,
+                    &session_id,
+                    error.to_string(),
+                )?;
                 return Err(error);
             }
-        }
+        };
         let now = Timestamp::now();
+        let registered_start_writes =
+            register_worker_writes(&workspace, &operation_id, &start_writes)?;
 
         let session = ManagedSession {
             session_id: session_id.clone(),
@@ -294,12 +317,13 @@ impl ServiceHost {
             last_operation: Some(operation_id.clone()),
         };
 
-        let operation = ServiceOperation::success(
+        let mut operation = ServiceOperation::success(
             operation_id.clone(),
             "debug.session.create",
             Some(session_id.clone()),
             "debug session created",
         );
+        operation.artifacts = registered_start_writes.artifacts.clone();
         workspace.append_operation(&OperationRecord {
             operation_id: operation_id.clone(),
             adapter_id: "service".to_string(),
@@ -307,7 +331,7 @@ impl ServiceHost {
             status: OperationStatus::Success,
             created_at: now,
             summary: "debug session created".to_string(),
-            artifacts: Vec::new(),
+            artifacts: registered_start_writes.artifacts.clone(),
         })?;
 
         let mut state = self.lock_state()?;
@@ -443,12 +467,13 @@ impl ServiceHost {
             timeout_ms: params.timeout_ms,
         };
         request.validate()?;
-        self.eval_command(request)
+        self.eval_command(request, "debug.eval")
     }
 
     fn debug_builtin_eval(
         &self,
         params: Option<Value>,
+        capability: &'static str,
         command: &'static str,
     ) -> Result<Value, ServiceError> {
         let params: SessionParams = parse_params(params)?;
@@ -457,10 +482,36 @@ impl ServiceHost {
             command: command.to_string(),
             timeout_ms: None,
         };
-        self.eval_command(request)
+        self.eval_command(request, capability)
     }
 
-    fn eval_command(&self, request: EvalDebugCommand) -> Result<Value, ServiceError> {
+    fn debug_add_symbols(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: DebugAddSymbolsParams = parse_params(params)?;
+        let request = AddSymbolsRequest {
+            session_id: params.session_id,
+            symbol_path: params.symbol_path,
+            reload: params.reload,
+        };
+        request.validate()?;
+        self.add_symbols(request)
+    }
+
+    fn debug_read_memory(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: DebugReadMemoryParams = parse_params(params)?;
+        let request = ReadMemoryRequest {
+            session_id: params.session_id,
+            address: parse_u64_param(&params.address, "address")?,
+            length: params.length,
+        };
+        request.validate(MAX_MEMORY_READ_LENGTH)?;
+        self.read_memory(request)
+    }
+
+    fn eval_command(
+        &self,
+        request: EvalDebugCommand,
+        capability: &'static str,
+    ) -> Result<Value, ServiceError> {
         let session = {
             let state = self.lock_state()?;
             state
@@ -496,9 +547,9 @@ impl ServiceHost {
         let workspace = Workspace::open(&session.internal_workspace_root)?;
         let operation = ServiceOperation::running(
             operation_id.clone(),
-            "debug.eval",
+            capability,
             Some(session.session_id.clone()),
-            "debug eval running",
+            format!("{capability} running"),
         );
         {
             let mut state = self.lock_state()?;
@@ -517,6 +568,103 @@ impl ServiceHost {
             },
         );
 
+        self.finish_command_worker_response(
+            &session,
+            &workspace,
+            operation_id,
+            capability,
+            worker_response,
+        )
+    }
+
+    fn add_symbols(&self, request: AddSymbolsRequest) -> Result<Value, ServiceError> {
+        let session = self.reusable_session(&request.session_id)?;
+        let request_lock = session.request_lock.clone();
+        let _request_guard = request_lock
+            .lock()
+            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+        let session = self.reusable_session(&request.session_id)?;
+
+        let operation_id = next_operation_ref();
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let operation = ServiceOperation::running(
+            operation_id.clone(),
+            "debug.add_symbols",
+            Some(session.session_id.clone()),
+            "debug.add_symbols running",
+        );
+        {
+            let mut state = self.lock_state()?;
+            state
+                .operations
+                .insert(operation_id.id.as_str().to_string(), operation);
+        }
+
+        let worker_response = self.supervisor.request_worker(
+            &session.worker,
+            WorkerRequest::AddSymbols {
+                session_id: session.session_id.clone(),
+                operation_id: operation_id.clone(),
+                symbol_path: request.symbol_path,
+                reload: request.reload,
+                artifact_dir: session.artifact_dir.clone(),
+            },
+        );
+
+        self.finish_command_worker_response(
+            &session,
+            &workspace,
+            operation_id,
+            "debug.add_symbols",
+            worker_response,
+        )
+    }
+
+    fn read_memory(&self, request: ReadMemoryRequest) -> Result<Value, ServiceError> {
+        let session = self.reusable_session(&request.session_id)?;
+        let request_lock = session.request_lock.clone();
+        let _request_guard = request_lock
+            .lock()
+            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+        let session = self.reusable_session(&request.session_id)?;
+
+        let operation_id = next_operation_ref();
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let operation = ServiceOperation::running(
+            operation_id.clone(),
+            "debug.read_memory",
+            Some(session.session_id.clone()),
+            "debug.read_memory running",
+        );
+        {
+            let mut state = self.lock_state()?;
+            state
+                .operations
+                .insert(operation_id.id.as_str().to_string(), operation);
+        }
+
+        let worker_response = self.supervisor.request_worker(
+            &session.worker,
+            WorkerRequest::ReadMemory {
+                session_id: session.session_id.clone(),
+                operation_id: operation_id.clone(),
+                address: request.address,
+                length: request.length,
+                artifact_dir: session.artifact_dir.clone(),
+            },
+        );
+
+        self.finish_memory_worker_response(&session, &workspace, operation_id, worker_response)
+    }
+
+    fn finish_command_worker_response(
+        &self,
+        session: &ManagedSession,
+        workspace: &Workspace,
+        operation_id: OperationRef,
+        capability: &'static str,
+        worker_response: Result<WorkerResponse, ServiceError>,
+    ) -> Result<Value, ServiceError> {
         match worker_response {
             Ok(WorkerResponse::DebugCommand { mut result, writes }) => {
                 let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
@@ -533,17 +681,17 @@ impl ServiceHost {
                     OperationStatus::Success
                 };
                 let summary = if was_canceled {
-                    "debug eval canceled"
+                    format!("{capability} canceled")
                 } else {
-                    "debug eval completed by worker"
+                    format!("{capability} completed by worker")
                 };
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
-                    capability: "debug.eval".to_string(),
+                    capability: capability.to_string(),
                     status: workspace_status,
                     created_at: Timestamp::now(),
-                    summary: summary.to_string(),
+                    summary: summary.clone(),
                     artifacts: registered.artifacts.clone(),
                 })?;
 
@@ -552,7 +700,7 @@ impl ServiceHost {
                     if !was_canceled {
                         operation.status = ServiceOperationStatus::Success;
                     }
-                    operation.summary = summary.to_string();
+                    operation.summary = summary;
                     operation.artifacts = registered.artifacts;
                     operation.updated_at = Timestamp::now();
                     operation.events.push(ServiceEvent {
@@ -577,7 +725,7 @@ impl ServiceHost {
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
-                    capability: "debug.eval".to_string(),
+                    capability: capability.to_string(),
                     status: OperationStatus::Failed,
                     created_at: Timestamp::now(),
                     summary: message.clone(),
@@ -596,7 +744,7 @@ impl ServiceHost {
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
-                    capability: "debug.eval".to_string(),
+                    capability: capability.to_string(),
                     status: OperationStatus::Failed,
                     created_at: Timestamp::now(),
                     summary: message.clone(),
@@ -616,7 +764,131 @@ impl ServiceHost {
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
-                    capability: "debug.eval".to_string(),
+                    capability: capability.to_string(),
+                    status: if was_canceled {
+                        OperationStatus::Canceled
+                    } else {
+                        OperationStatus::Failed
+                    },
+                    created_at: Timestamp::now(),
+                    summary: error.to_string(),
+                    artifacts: Vec::new(),
+                })?;
+                if !was_canceled {
+                    self.finish_operation_in_memory(
+                        &operation_id,
+                        ServiceOperationStatus::Failed,
+                        error.to_string(),
+                        Vec::new(),
+                    )?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_memory_worker_response(
+        &self,
+        session: &ManagedSession,
+        workspace: &Workspace,
+        operation_id: OperationRef,
+        worker_response: Result<WorkerResponse, ServiceError>,
+    ) -> Result<Value, ServiceError> {
+        match worker_response {
+            Ok(WorkerResponse::DebugMemory { mut result, writes }) => {
+                let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
+                result.operation_id = Some(operation_id.clone());
+                result.memory = registered.memory.clone();
+                let was_canceled =
+                    self.operation_status(&operation_id)? == Some(ServiceOperationStatus::Canceled);
+                if was_canceled {
+                    result.warnings.push("operation was canceled".to_string());
+                }
+                let status = if was_canceled {
+                    OperationStatus::Canceled
+                } else {
+                    OperationStatus::Success
+                };
+                let summary = if was_canceled {
+                    "debug.read_memory canceled"
+                } else {
+                    "debug.read_memory completed by worker"
+                };
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "service".to_string(),
+                    capability: "debug.read_memory".to_string(),
+                    status,
+                    created_at: Timestamp::now(),
+                    summary: summary.to_string(),
+                    artifacts: registered.artifacts.clone(),
+                })?;
+
+                let mut state = self.lock_state()?;
+                if let Some(operation) = state.operations.get_mut(operation_id.id.as_str()) {
+                    if !was_canceled {
+                        operation.status = ServiceOperationStatus::Success;
+                    }
+                    operation.summary = summary.to_string();
+                    operation.artifacts = registered.artifacts;
+                    operation.updated_at = Timestamp::now();
+                }
+                if let Some(session) = state.sessions.get_mut(session.session_id.id.as_str()) {
+                    session.last_operation = Some(operation_id.clone());
+                    session.updated_at = Timestamp::now();
+                }
+
+                Ok(serde_json::to_value(result)?)
+            }
+            Ok(WorkerResponse::Failed {
+                code,
+                message,
+                writes,
+            }) => {
+                let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "service".to_string(),
+                    capability: "debug.read_memory".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: registered.artifacts.clone(),
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    message.clone(),
+                    registered.artifacts,
+                )?;
+                Err(ServiceError::Worker(format!("{code}: {message}")))
+            }
+            Ok(other) => {
+                let message = format!("unexpected read memory response: {other:?}");
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "service".to_string(),
+                    capability: "debug.read_memory".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: Vec::new(),
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    message.clone(),
+                    Vec::new(),
+                )?;
+                Err(ServiceError::Worker(message))
+            }
+            Err(error) => {
+                let was_canceled =
+                    self.operation_status(&operation_id)? == Some(ServiceOperationStatus::Canceled);
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "service".to_string(),
+                    capability: "debug.read_memory".to_string(),
                     status: if was_canceled {
                         OperationStatus::Canceled
                     } else {
@@ -671,6 +943,51 @@ impl ServiceHost {
             operation.updated_at = Timestamp::now();
         }
         Ok(())
+    }
+
+    fn record_failed_session_create(
+        &self,
+        workspace: &Workspace,
+        operation_id: &OperationRef,
+        session_id: &SessionRef,
+        summary: impl Into<String>,
+    ) -> Result<(), ServiceError> {
+        let summary = summary.into();
+        workspace.append_operation(&OperationRecord {
+            operation_id: operation_id.clone(),
+            adapter_id: "service".to_string(),
+            capability: "debug.session.create".to_string(),
+            status: OperationStatus::Failed,
+            created_at: Timestamp::now(),
+            summary: summary.clone(),
+            artifacts: Vec::new(),
+        })?;
+
+        let mut operation = ServiceOperation::failed(
+            operation_id.clone(),
+            "debug.session.create",
+            Some(session_id.clone()),
+            summary,
+        );
+        operation.updated_at = Timestamp::now();
+        let mut state = self.lock_state()?;
+        state
+            .operations
+            .insert(operation_id.id.as_str().to_string(), operation);
+        Ok(())
+    }
+
+    fn reusable_session(&self, session_id: &SessionRef) -> Result<ManagedSession, ServiceError> {
+        let state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get(session_id.id.as_str())
+            .cloned()
+            .ok_or_else(|| ServiceError::SessionNotFound(session_id.to_string()))?;
+        if !session.state.is_reusable() {
+            return Err(ServiceError::SessionNotReusable(session_id.to_string()));
+        }
+        Ok(session)
     }
 }
 
@@ -980,6 +1297,27 @@ fn mock_worker_response(request: WorkerRequest) -> Result<WorkerResponse, Servic
             command,
             artifact_dir,
         } => write_mock_eval_response(session_id, operation_id, command, artifact_dir),
+        WorkerRequest::AddSymbols {
+            session_id,
+            operation_id,
+            symbol_path,
+            reload,
+            artifact_dir,
+        } => {
+            let command = if reload {
+                format!(".sympath+ {symbol_path}; .reload")
+            } else {
+                format!(".sympath+ {symbol_path}")
+            };
+            write_mock_eval_response(session_id, operation_id, command, artifact_dir)
+        }
+        WorkerRequest::ReadMemory {
+            session_id,
+            operation_id,
+            address,
+            length,
+            artifact_dir,
+        } => write_mock_memory_response(session_id, operation_id, address, length, artifact_dir),
         WorkerRequest::CloseSession { .. } => Ok(WorkerResponse::Ok {
             summary: "debug session closed by mock worker".to_string(),
             writes: Vec::new(),
@@ -1006,10 +1344,12 @@ fn write_mock_eval_response(
         &format!("raw/{}.txt", operation_id.id.as_str()),
     );
     let transcript_relative_path = session_relative_path(&session_id, "transcript.log");
+    let events_relative_path = session_relative_path(&session_id, "events.jsonl");
     let raw_path = artifact_dir
         .join("raw")
         .join(format!("{}.txt", operation_id.id.as_str()));
     let transcript_path = artifact_dir.join("transcript.log");
+    let events_path = artifact_dir.join("events.jsonl");
     if let Some(parent) = raw_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1024,6 +1364,22 @@ fn write_mock_eval_response(
         .append(true)
         .open(&transcript_path)?;
     transcript_file.write_all(transcript.as_bytes())?;
+    let mut events_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&events_path)?;
+    serde_json::to_writer(
+        &mut events_file,
+        &json!({
+            "event": "output",
+            "session_id": session_id,
+            "operation_id": operation_id,
+            "command": command,
+            "timestamp": Timestamp::now(),
+            "byte_len": output.len(),
+        }),
+    )?;
+    events_file.write_all(b"\n")?;
 
     Ok(WorkerResponse::DebugCommand {
         result: DebugCommandResult {
@@ -1049,13 +1405,62 @@ fn write_mock_eval_response(
                 byte_len: transcript.len() as u64,
                 description: Some("debug session transcript".to_string()),
             },
+            WorkerArtifactWrite {
+                relative_path: events_relative_path,
+                kind: "debug.events".to_string(),
+                byte_len: output.len() as u64,
+                description: Some("debug session events".to_string()),
+            },
         ],
+    })
+}
+
+fn write_mock_memory_response(
+    session_id: SessionRef,
+    operation_id: OperationRef,
+    address: u64,
+    length: u64,
+    artifact_dir: PathBuf,
+) -> Result<WorkerResponse, ServiceError> {
+    let length = usize::try_from(length)
+        .map_err(|_| ServiceError::Worker("memory read length is too large".to_string()))?;
+    let relative_path = session_relative_path(
+        &session_id,
+        &format!("memory/{}.bin", operation_id.id.as_str()),
+    );
+    let memory_path = artifact_dir
+        .join("memory")
+        .join(format!("{}.bin", operation_id.id.as_str()));
+    if let Some(parent) = memory_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = vec![0u8; length];
+    fs::write(&memory_path, &bytes)?;
+
+    Ok(WorkerResponse::DebugMemory {
+        result: DebugMemoryResult {
+            session_id,
+            operation_id: None,
+            address,
+            requested_length: length as u64,
+            bytes_read: length as u64,
+            memory: None,
+            warnings: vec!["mock worker: real DbgEng memory read is not wired yet".to_string()],
+            error: None,
+        },
+        writes: vec![WorkerArtifactWrite {
+            relative_path,
+            kind: "debug.memory".to_string(),
+            byte_len: length as u64,
+            description: Some("mock debug memory read".to_string()),
+        }],
     })
 }
 
 struct RegisteredWorkerWrites {
     artifacts: Vec<ArtifactRef>,
     raw_output: Option<ArtifactRef>,
+    memory: Option<ArtifactRef>,
 }
 
 fn register_worker_writes(
@@ -1065,10 +1470,14 @@ fn register_worker_writes(
 ) -> Result<RegisteredWorkerWrites, ServiceError> {
     let mut artifacts = Vec::new();
     let mut raw_output = None;
+    let mut memory = None;
     for write in writes {
         let artifact_id = next_artifact_ref();
         if write.kind == "debug.raw_output" {
             raw_output = Some(artifact_id.clone());
+        }
+        if write.kind == "debug.memory" {
+            memory = Some(artifact_id.clone());
         }
         workspace.register_artifact(&ArtifactMetadata {
             artifact_id: artifact_id.clone(),
@@ -1083,6 +1492,7 @@ fn register_worker_writes(
     Ok(RegisteredWorkerWrites {
         artifacts,
         raw_output,
+        memory,
     })
 }
 
@@ -1360,6 +1770,26 @@ impl ServiceOperation {
             updated_at: now,
         }
     }
+
+    fn failed(
+        operation_id: OperationRef,
+        capability: impl Into<String>,
+        session_id: Option<SessionRef>,
+        summary: impl Into<String>,
+    ) -> Self {
+        let now = Timestamp::now();
+        Self {
+            operation_id,
+            capability: capability.into(),
+            session_id,
+            status: ServiceOperationStatus::Failed,
+            summary: summary.into(),
+            artifacts: Vec::new(),
+            events: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1443,6 +1873,21 @@ struct DebugEvalParams {
     command: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DebugAddSymbolsParams {
+    session_id: SessionRef,
+    symbol_path: String,
+    #[serde(default)]
+    reload: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DebugReadMemoryParams {
+    session_id: SessionRef,
+    address: Value,
+    length: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1660,6 +2105,31 @@ fn validate_config(config: &ServiceConfig) -> Result<(), ServiceError> {
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<T, ServiceError> {
     serde_json::from_value(params.unwrap_or(Value::Object(Default::default()))).map_err(Into::into)
+}
+
+fn parse_u64_param(value: &Value, field: &'static str) -> Result<u64, ServiceError> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| ServiceError::Rpc(format!("{field} must be a non-negative integer"))),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(ServiceError::Rpc(format!("{field} must not be empty")));
+            }
+            if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16)
+                    .map_err(|_| ServiceError::Rpc(format!("{field} is not a valid hex integer")))
+            } else {
+                text.parse::<u64>().map_err(|_| {
+                    ServiceError::Rpc(format!("{field} is not a valid unsigned integer"))
+                })
+            }
+        }
+        _ => Err(ServiceError::Rpc(format!(
+            "{field} must be an integer or integer string"
+        ))),
+    }
 }
 
 fn session_relative_path(session_id: &SessionRef, suffix: &str) -> PathBuf {
@@ -1891,6 +2361,23 @@ mod tests {
     }
 
     #[test]
+    fn failed_session_create_is_recorded_as_failed_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::new(Arc::new(FailingStartSupervisor));
+        let response = create_debug_session(&host, temp.path());
+
+        assert!(response.error.is_some());
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let operations = workspace.list_operations().unwrap();
+        let operation = operations
+            .iter()
+            .find(|operation| operation.capability == "debug.session.create")
+            .unwrap();
+        assert!(matches!(operation.status, OperationStatus::Failed));
+        assert!(operation.summary.contains("start_failed"));
+    }
+
+    #[test]
     fn session_id_is_enough_after_create() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
@@ -1991,7 +2478,35 @@ mod tests {
             .iter()
             .find(|operation| operation.capability == "debug.eval")
             .unwrap();
-        assert_eq!(eval_operation.artifacts.len(), 2);
+        assert_eq!(eval_operation.artifacts.len(), 3);
+    }
+
+    #[test]
+    fn add_symbols_uses_distinct_operation_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "debug.add_symbols".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "symbol_path": r"srv*C:\symbols*https://msdl.microsoft.com/download/symbols",
+                "reload": true
+            })),
+        });
+        assert!(response.error.is_none(), "{:?}", response.error);
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let operations = workspace.list_operations().unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.capability == "debug.add_symbols")
+        );
     }
 
     #[test]
@@ -2190,7 +2705,7 @@ mod tests {
     }
 
     #[test]
-    fn read_memory_is_not_exposed_until_real_memory_artifacts_exist() {
+    fn read_memory_registers_memory_artifact() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
         let session_id =
@@ -2206,7 +2721,22 @@ mod tests {
             })),
         });
 
-        assert!(response.error.unwrap().message.contains("unknown method"));
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.result.as_ref().unwrap()["bytes_read"], 16);
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "debug.memory")
+        );
+        let operations = workspace.list_operations().unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.capability == "debug.read_memory")
+        );
     }
 
     #[test]
@@ -2284,6 +2814,55 @@ mod tests {
         wait_for_cancel: bool,
         canceled: AtomicBool,
         operation_id: Mutex<Option<OperationRef>>,
+    }
+
+    struct FailingStartSupervisor;
+
+    impl WorkerSupervisor for FailingStartSupervisor {
+        fn create_debug_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Ok(WorkerHandle {
+                worker_id: Id::new(format!("test-worker-{}", request.session_id.id.as_str()))
+                    .unwrap(),
+                session_id: request.session_id,
+                pipe_name: "test-pipe".to_string(),
+                identity: WorkerIdentity::CurrentUserDevMode,
+            })
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::StartDebugSession { .. } => Ok(WorkerResponse::Failed {
+                    code: "start_failed".to_string(),
+                    message: "native open failed".to_string(),
+                    writes: Vec::new(),
+                }),
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
     }
 
     impl InstrumentedWorkerSupervisor {

@@ -53,8 +53,21 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_last_error(
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_dump(
     const char* path_utf8,
     DA_DbgEngSessionHandle** out_handle);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
+    uint32_t pid,
+    DA_DbgEngSessionHandle** out_handle);
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_execute(
     DA_DbgEngSessionHandle* handle,
     const char* command_utf8,
+    DA_DbgEngTextView* out);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_add_symbols(
+    DA_DbgEngSessionHandle* handle,
+    const char* symbol_path_utf8,
+    int32_t reload,
+    DA_DbgEngTextView* out);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_read_virtual(
+    DA_DbgEngSessionHandle* handle,
+    uint64_t address,
+    uint32_t length,
     DA_DbgEngTextView* out);
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_close(DA_DbgEngSessionHandle* handle);

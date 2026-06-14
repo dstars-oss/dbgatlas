@@ -56,9 +56,25 @@ unsafe extern "C" {
         path_utf8: *const c_char,
         out_handle: *mut *mut DA_DbgEngSessionHandle,
     ) -> i32;
+    pub fn da_dbgeng_session_attach_process(
+        pid: u32,
+        out_handle: *mut *mut DA_DbgEngSessionHandle,
+    ) -> i32;
     pub fn da_dbgeng_session_execute(
         handle: *mut DA_DbgEngSessionHandle,
         command_utf8: *const c_char,
+        out: *mut DA_DbgEngTextView,
+    ) -> i32;
+    pub fn da_dbgeng_session_add_symbols(
+        handle: *mut DA_DbgEngSessionHandle,
+        symbol_path_utf8: *const c_char,
+        reload: i32,
+        out: *mut DA_DbgEngTextView,
+    ) -> i32;
+    pub fn da_dbgeng_session_read_virtual(
+        handle: *mut DA_DbgEngSessionHandle,
+        address: u64,
+        length: u32,
         out: *mut DA_DbgEngTextView,
     ) -> i32;
     pub fn da_dbgeng_session_close(handle: *mut DA_DbgEngSessionHandle) -> i32;

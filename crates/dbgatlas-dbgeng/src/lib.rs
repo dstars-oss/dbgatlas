@@ -21,10 +21,16 @@ pub enum DbgEngError {
     NullText,
     #[error("dump path must not be empty")]
     EmptyPath,
+    #[error("attach pid must be greater than zero")]
+    InvalidPid,
     #[error("dump path must be valid UTF-8")]
     NonUtf8Path,
     #[error("debug command must not be empty")]
     EmptyCommand,
+    #[error("symbol path must not be empty")]
+    EmptySymbolPath,
+    #[error("memory read length must be greater than zero")]
+    EmptyMemoryRead,
     #[error("input contains interior nul byte")]
     InteriorNul(#[from] std::ffi::NulError),
 }
@@ -48,16 +54,31 @@ impl DbgEngSession {
         let mut handle = std::ptr::null_mut();
         let status =
             unsafe { dbgatlas_dbgeng_sys::da_dbgeng_session_open_dump(path.as_ptr(), &mut handle) };
-        status_to_result(status)?;
-        if handle.is_null() {
-            return Err(DbgEngError::NullSessionHandle);
-        }
-        Ok(Self { handle })
+        session_from_status(handle, status)
     }
 
     #[cfg(not(windows))]
     pub fn open_dump(path: impl AsRef<Path>) -> Result<Self, DbgEngError> {
         path_to_cstring(path.as_ref())?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
+    pub fn attach(pid: u32) -> Result<Self, DbgEngError> {
+        if pid == 0 {
+            return Err(DbgEngError::InvalidPid);
+        }
+        let mut handle = std::ptr::null_mut();
+        let status =
+            unsafe { dbgatlas_dbgeng_sys::da_dbgeng_session_attach_process(pid, &mut handle) };
+        session_from_status(handle, status)
+    }
+
+    #[cfg(not(windows))]
+    pub fn attach(pid: u32) -> Result<Self, DbgEngError> {
+        if pid == 0 {
+            return Err(DbgEngError::InvalidPid);
+        }
         Err(DbgEngError::UnsupportedPlatform)
     }
 
@@ -75,6 +96,54 @@ impl DbgEngSession {
     #[cfg(not(windows))]
     pub fn execute(&self, command: &str) -> Result<String, DbgEngError> {
         command_to_cstring(command)?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
+    pub fn add_symbols(&self, symbol_path: &str, reload: bool) -> Result<String, DbgEngError> {
+        let symbol_path = symbol_path_to_cstring(symbol_path)?;
+        let mut view = dbgatlas_dbgeng_sys::DA_DbgEngTextView::default();
+        let status = unsafe {
+            dbgatlas_dbgeng_sys::da_dbgeng_session_add_symbols(
+                self.handle,
+                symbol_path.as_ptr(),
+                i32::from(reload),
+                &mut view,
+            )
+        };
+        status_to_result(status)?;
+        text_view_to_string(view)
+    }
+
+    #[cfg(not(windows))]
+    pub fn add_symbols(&self, symbol_path: &str, _reload: bool) -> Result<String, DbgEngError> {
+        symbol_path_to_cstring(symbol_path)?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
+    pub fn read_memory(&self, address: u64, length: u32) -> Result<Vec<u8>, DbgEngError> {
+        if length == 0 {
+            return Err(DbgEngError::EmptyMemoryRead);
+        }
+        let mut view = dbgatlas_dbgeng_sys::DA_DbgEngTextView::default();
+        let status = unsafe {
+            dbgatlas_dbgeng_sys::da_dbgeng_session_read_virtual(
+                self.handle,
+                address,
+                length,
+                &mut view,
+            )
+        };
+        status_to_result(status)?;
+        text_view_to_bytes(view)
+    }
+
+    #[cfg(not(windows))]
+    pub fn read_memory(&self, _address: u64, length: u32) -> Result<Vec<u8>, DbgEngError> {
+        if length == 0 {
+            return Err(DbgEngError::EmptyMemoryRead);
+        }
         Err(DbgEngError::UnsupportedPlatform)
     }
 }
@@ -123,9 +192,28 @@ fn status_to_result(status: i32) -> Result<(), DbgEngError> {
 }
 
 #[cfg(windows)]
+fn session_from_status(
+    handle: *mut dbgatlas_dbgeng_sys::DA_DbgEngSessionHandle,
+    status: i32,
+) -> Result<DbgEngSession, DbgEngError> {
+    status_to_result(status)?;
+    if handle.is_null() {
+        return Err(DbgEngError::NullSessionHandle);
+    }
+    Ok(DbgEngSession { handle })
+}
+
+#[cfg(windows)]
 fn text_view_to_string(
     view: dbgatlas_dbgeng_sys::DA_DbgEngTextView,
 ) -> Result<String, DbgEngError> {
+    Ok(String::from_utf8_lossy(&text_view_to_bytes(view)?).into_owned())
+}
+
+#[cfg(windows)]
+fn text_view_to_bytes(
+    view: dbgatlas_dbgeng_sys::DA_DbgEngTextView,
+) -> Result<Vec<u8>, DbgEngError> {
     use std::slice;
 
     if view.data.is_null() && view.len > 0 {
@@ -138,9 +226,9 @@ fn text_view_to_string(
     } else {
         unsafe { slice::from_raw_parts(view.data.cast::<u8>(), view.len) }
     };
-    let text = String::from_utf8_lossy(bytes).into_owned();
+    let bytes = bytes.to_vec();
     release_view(view.owner);
-    Ok(text)
+    Ok(bytes)
 }
 
 #[cfg(windows)]
@@ -189,6 +277,13 @@ fn command_to_cstring(command: &str) -> Result<std::ffi::CString, DbgEngError> {
         return Err(DbgEngError::EmptyCommand);
     }
     std::ffi::CString::new(command).map_err(Into::into)
+}
+
+fn symbol_path_to_cstring(symbol_path: &str) -> Result<std::ffi::CString, DbgEngError> {
+    if symbol_path.trim().is_empty() {
+        return Err(DbgEngError::EmptySymbolPath);
+    }
+    std::ffi::CString::new(symbol_path).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -249,6 +344,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_symbol_path() {
+        assert!(matches!(
+            symbol_path_to_cstring("  "),
+            Err(DbgEngError::EmptySymbolPath)
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_attach_pid() {
+        assert!(matches!(
+            DbgEngSession::attach(0),
+            Err(DbgEngError::InvalidPid)
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_memory_read_length() {
+        #[cfg(windows)]
+        let session = DbgEngSession {
+            handle: std::ptr::NonNull::dangling().as_ptr(),
+        };
+        #[cfg(not(windows))]
+        let session = DbgEngSession { _private: () };
+
+        assert!(matches!(
+            session.read_memory(0x1000, 0),
+            Err(DbgEngError::EmptyMemoryRead)
+        ));
+        std::mem::forget(session);
+    }
+
+    #[test]
     fn rejects_debug_command_with_nul() {
         assert!(matches!(
             command_to_cstring(".echo bad\0command"),
@@ -258,10 +385,71 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn session_skeleton_round_trips_command_text() {
-        let session = DbgEngSession::open_dump("sample.dmp").unwrap();
-        let output = session.execute(".echo probe").unwrap();
-        assert!(output.contains("real DbgEng execution is not wired yet"));
-        assert!(output.contains(".echo probe"));
+    fn opening_missing_dump_reports_native_failure() {
+        let error = DbgEngSession::open_dump("dbgatlas-missing-sample.dmp").unwrap_err();
+        assert!(matches!(error, DbgEngError::Native { .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opens_minidump_executes_command_adds_symbols_and_reads_memory() {
+        let marker = Box::new(0x1122_3344_5566_7788u64);
+        let marker_address = (&*marker as *const u64) as u64;
+        let temp = tempfile::tempdir().unwrap();
+        let dump_path = temp.path().join("self.dmp");
+        write_current_process_minidump(&dump_path);
+
+        let session = DbgEngSession::open_dump(&dump_path).unwrap();
+        let output = session.execute(".echo dbgatlas-probe").unwrap();
+        assert!(output.contains("dbgatlas-probe"));
+
+        let symbol_output = session.add_symbols(r"cache*C:\symbols", false).unwrap();
+        assert!(symbol_output.contains("symbol path appended"));
+
+        let bytes = session
+            .read_memory(marker_address, size_of::<u64>() as u32)
+            .unwrap();
+        assert_eq!(bytes, (*marker).to_le_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn attach_close_does_not_terminate_target_process() {
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .unwrap();
+
+        let session = DbgEngSession::attach(child.id()).unwrap();
+        let output = session.execute(".echo attached").unwrap();
+        assert!(output.contains("attached"));
+        drop(session);
+
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    fn write_current_process_minidump(path: &std::path::Path) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            MiniDumpWithFullMemory, MiniDumpWriteDump,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
+
+        let file = std::fs::File::create(path).unwrap();
+        let ok = unsafe {
+            MiniDumpWriteDump(
+                GetCurrentProcess(),
+                GetCurrentProcessId(),
+                file.as_raw_handle(),
+                MiniDumpWithFullMemory,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(ok, 0, "MiniDumpWriteDump failed");
     }
 }

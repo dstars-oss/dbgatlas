@@ -17,6 +17,14 @@ pub enum DebugError {
     ArgumentContainsNul,
     #[error("debug command must not be empty")]
     EmptyCommand,
+    #[error("symbol path must not be empty")]
+    EmptySymbolPath,
+    #[error("symbol path contains a NUL byte")]
+    SymbolPathContainsNul,
+    #[error("memory read length must be greater than zero")]
+    EmptyMemoryRead,
+    #[error("memory read length exceeds the maximum of {max} bytes")]
+    MemoryReadTooLarge { max: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +127,56 @@ pub struct DebugCommandResult {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddSymbolsRequest {
+    pub session_id: SessionRef,
+    pub symbol_path: String,
+    pub reload: bool,
+}
+
+impl AddSymbolsRequest {
+    pub fn validate(&self) -> Result<(), DebugError> {
+        if self.symbol_path.trim().is_empty() {
+            return Err(DebugError::EmptySymbolPath);
+        }
+        if self.symbol_path.contains('\0') {
+            return Err(DebugError::SymbolPathContainsNul);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadMemoryRequest {
+    pub session_id: SessionRef,
+    pub address: u64,
+    pub length: u64,
+}
+
+impl ReadMemoryRequest {
+    pub fn validate(&self, max_length: u64) -> Result<(), DebugError> {
+        if self.length == 0 {
+            return Err(DebugError::EmptyMemoryRead);
+        }
+        if self.length > max_length {
+            return Err(DebugError::MemoryReadTooLarge { max: max_length });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugMemoryResult {
+    pub session_id: SessionRef,
+    pub operation_id: Option<OperationRef>,
+    pub address: u64,
+    pub requested_length: u64,
+    pub bytes_read: u64,
+    pub memory: Option<ArtifactRef>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
 pub trait DebugSessionManager: Send + Sync {
     fn create_session(&self, request: CreateDebugSession) -> Result<DebugSession, DebugError>;
     fn get_session(&self, session_id: &SessionRef) -> Result<DebugSession, DebugError>;
@@ -199,6 +257,32 @@ mod tests {
             timeout_ms: None,
         };
         assert!(matches!(request.validate(), Err(DebugError::EmptyCommand)));
+    }
+
+    #[test]
+    fn rejects_empty_symbol_path() {
+        let request = AddSymbolsRequest {
+            session_id: SessionRef::new(Id::new("session-001").unwrap()),
+            symbol_path: "  ".to_string(),
+            reload: false,
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(DebugError::EmptySymbolPath)
+        ));
+    }
+
+    #[test]
+    fn validates_memory_read_length_limit() {
+        let request = ReadMemoryRequest {
+            session_id: SessionRef::new(Id::new("session-001").unwrap()),
+            address: 0x1000,
+            length: 17,
+        };
+        assert!(matches!(
+            request.validate(16),
+            Err(DebugError::MemoryReadTooLarge { max: 16 })
+        ));
     }
 
     #[test]

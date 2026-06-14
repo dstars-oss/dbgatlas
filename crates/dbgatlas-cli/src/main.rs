@@ -113,6 +113,27 @@ enum DebugCommand {
         #[arg(long, default_value = "dev-token")]
         token: String,
     },
+    ReadMemory {
+        session_id: String,
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        length: u64,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    AddSymbols {
+        session_id: String,
+        symbol_path: String,
+        #[arg(long)]
+        reload: bool,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -273,6 +294,44 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
             endpoint,
             token,
         } => call_session_tool(endpoint, &token, "debug.stack", session_id, as_json),
+        DebugCommand::ReadMemory {
+            session_id,
+            address,
+            length,
+            endpoint,
+            token,
+        } => {
+            let response = call_service(
+                endpoint,
+                &token,
+                "debug.read_memory",
+                json!({
+                    "session_id": { "id": session_id },
+                    "address": address,
+                    "length": length,
+                }),
+            )?;
+            print_rpc_response(response, as_json)
+        }
+        DebugCommand::AddSymbols {
+            session_id,
+            symbol_path,
+            reload,
+            endpoint,
+            token,
+        } => {
+            let response = call_service(
+                endpoint,
+                &token,
+                "debug.add_symbols",
+                json!({
+                    "session_id": { "id": session_id },
+                    "symbol_path": symbol_path,
+                    "reload": reload,
+                }),
+            )?;
+            print_rpc_response(response, as_json)
+        }
     }
 }
 
@@ -285,8 +344,11 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
             endpoint,
             token,
         } => {
+            let project_root = absolute_path(project_root)?;
             let target = match (dump, attach) {
-                (Some(path), None) => serde_json::to_value(DebugTarget::Dump { path })?,
+                (Some(path), None) => serde_json::to_value(DebugTarget::Dump {
+                    path: std::fs::canonicalize(path)?,
+                })?,
                 (None, Some(pid)) => serde_json::to_value(DebugTarget::Attach { pid })?,
                 _ => anyhow::bail!("provide exactly one of --dump or --attach"),
             };
@@ -379,4 +441,11 @@ fn run_native(command: NativeCommand, as_json: bool) -> Result<()> {
 fn print_json(value: serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()?.join(path))
 }
