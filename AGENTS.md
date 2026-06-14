@@ -15,6 +15,7 @@ MCP、CLI 和后续 UI 都是入口层，不是架构核心。底层 Windows nat
 ```text
 dbgatlas/
   AGENTS.md
+  GOALS.md                  # milestone task list：完成 feature 后同步更新
   Cargo.toml
   CMakePresets.json
   README.md
@@ -84,5 +85,7 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 修改前应先阅读相关目录的 `AGENTS.md`、相邻代码、测试和文档。改动应遵循最小必要变更原则，不做与任务无关的重构、格式化或目录迁移。
 
 新增模块时，先确认它属于 Rust、项目自有 C++、第三方依赖、文档、schema、示例、测试还是工程自动化，再放入对应目录。
+
+`GOALS.md` 是项目的 milestone task list。完成一个 feature 后，应在同一个变更中更新对应 checkbox；只有实现、文档和验证都完成后才标记为已完成。如果 feature 改变了里程碑范围，应先同步调整 `GOALS.md`，再继续实现。
 
 完成非平凡代码、构建、schema 或测试改动后，应运行最相关且范围最小的验证命令。若无法运行，应说明原因和已完成的替代检查。
