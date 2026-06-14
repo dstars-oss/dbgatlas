@@ -16,12 +16,20 @@
 
 ## MVP 1: Debug Session And Minimal DbgEng Loop
 
-目标：建立最小 debug session 闭环，让 DbgAtlas 能以受控 worker 方式打开 dump 或 attach process，执行原始 WinDbg command，并把 transcript、events、raw output 和 operation 记录进 workspace。
+目标：先建立 DbgAtlas 主服务、session lifecycle、worker supervisor 和 RPC 边界，再建立最小 debug session 闭环，让 DbgAtlas 能以受控 worker 方式打开 dump 或 attach process，执行原始 WinDbg command，并把 transcript、events、raw output 和 operation 记录进内部 project workspace。
 
 Tasks:
 
-- [ ] 设计并实现 per-session worker skeleton。
-- [ ] 实现 session create / close / cancel / kill 生命周期。
+- [x] 明确主服务 / session / worker 架构：外部不暴露 `workspace.*`、`project.*`、`worker.*` 业务 API。
+- [x] 新增 `dbgatlas-service` dev-mode skeleton，支持 JSON-RPC HTTP `service.health` / `service.info`。
+- [x] 新增内部 `dbgatlas-worker-protocol` JSONL message skeleton。
+- [x] 实现 `project_root` -> `<project_root>/dbgatlas` 的内部懒创建规则。
+- [x] 实现 session create / close / kill skeleton，并与 mock worker 1:1 绑定。
+- [ ] 实现 Windows service install/start/stop/status/uninstall。
+- [ ] 实现真实 named pipe worker transport。
+- [ ] 实现 worker 子进程启动、Job Object 绑定和退出清理。
+- [ ] 实现 per-session worker skeleton。
+- [ ] 实现 session cancel 生命周期。
 - [ ] 保证同一 session 请求串行化，不同 session 可并发。
 - [ ] 将 DbgEng bootstrap ABI 迁移为 adapter-specific `dbgatlas_dbgeng.h`。
 - [ ] 在 `dbgatlas-dbgeng-sys` 中绑定新的 DbgEng C ABI。
@@ -50,7 +58,7 @@ Acceptance:
 
 - [ ] CLI 能创建 session、打开 dump、执行一条 raw command、关闭 session。
 - [ ] worker 卡死时主进程可 cancel/kill，并写入 failed 或 canceled operation。
-- [ ] workspace 里可审计 replay：operation log、artifact metadata、transcript/raw output 均可定位。
+- [ ] 内部 `<project_root>/dbgatlas` 里可审计 replay：operation log、artifact metadata、transcript/raw output 均可定位。
 - [ ] `cargo test --workspace` 和 DbgEng 相关集成测试通过。
 
 ## MVP 2: Recording And Agent Entry

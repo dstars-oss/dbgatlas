@@ -8,6 +8,8 @@ members = [
     "crates/dbgatlas-dbgeng-sys",
     "crates/dbgatlas-model",
     "crates/dbgatlas-runtime",
+    "crates/dbgatlas-service",
+    "crates/dbgatlas-worker-protocol",
     "crates/dbgatlas-workspace",
     "xtask",
 ]
@@ -35,4 +37,6 @@ dbgatlas-dbgeng = { path = "crates/dbgatlas-dbgeng" }
 dbgatlas-dbgeng-sys = { path = "crates/dbgatlas-dbgeng-sys" }
 dbgatlas-model = { path = "crates/dbgatlas-model" }
 dbgatlas-runtime = { path = "crates/dbgatlas-runtime" }
+dbgatlas-service = { path = "crates/dbgatlas-service" }
+dbgatlas-worker-protocol = { path = "crates/dbgatlas-worker-protocol" }
 dbgatlas-workspace = { path = "crates/dbgatlas-workspace" }

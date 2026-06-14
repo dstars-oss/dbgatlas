@@ -1,7 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dbgatlas_debug::DebugTarget;
+use dbgatlas_service::{
+    JsonRpcRequest, ServiceConfig, ServiceHost, invoke_http_json_rpc, run_http_service,
+};
 use dbgatlas_workspace::{Workspace, WorkspaceInitOptions};
 use serde_json::json;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -19,6 +24,14 @@ enum Commands {
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
+    },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
     },
     Native {
         #[command(subcommand)]
@@ -39,6 +52,100 @@ enum WorkspaceCommand {
 }
 
 #[derive(Subcommand)]
+enum ServiceCommand {
+    Run {
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        bind: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Health {
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Info {
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Install,
+    Start,
+    Stop,
+    Status,
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    Session {
+        #[command(subcommand)]
+        command: DebugSessionCommand,
+    },
+    Eval {
+        session_id: String,
+        command: String,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Modules {
+        session_id: String,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Threads {
+        session_id: String,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Stack {
+        session_id: String,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugSessionCommand {
+    Create {
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        dump: Option<PathBuf>,
+        #[arg(long)]
+        attach: Option<u32>,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Close {
+        session_id: String,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+    Kill {
+        session_id: String,
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        endpoint: SocketAddr,
+        #[arg(long, default_value = "dev-token")]
+        token: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum NativeCommand {
     Version,
 }
@@ -54,6 +161,8 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Workspace { command } => run_workspace(command, cli.json),
+        Commands::Service { command } => run_service(command, cli.json),
+        Commands::Debug { command } => run_debug(command, cli.json),
         Commands::Native { command } => run_native(command, cli.json),
     }
 }
@@ -94,6 +203,160 @@ fn run_workspace(command: WorkspaceCommand, as_json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
+    match command {
+        ServiceCommand::Run { bind, token } => {
+            let config = ServiceConfig {
+                bind,
+                bearer_token: token,
+            };
+            if !as_json {
+                println!("DbgAtlas service listening on http://{}/rpc", config.bind);
+            }
+            run_http_service(config, ServiceHost::with_mock_workers())?;
+        }
+        ServiceCommand::Health { endpoint, token } => {
+            let response = call_service(endpoint, &token, "service.health", json!({}))?;
+            print_rpc_response(response, as_json)?;
+        }
+        ServiceCommand::Info { endpoint, token } => {
+            let response = call_service(endpoint, &token, "service.info", json!({}))?;
+            print_rpc_response(response, as_json)?;
+        }
+        ServiceCommand::Install
+        | ServiceCommand::Start
+        | ServiceCommand::Stop
+        | ServiceCommand::Status
+        | ServiceCommand::Uninstall => {
+            anyhow::bail!(
+                "Windows service control commands are reserved in the CLI surface but not implemented yet; use `dbgatlas service run` for MVP service dev mode"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
+    match command {
+        DebugCommand::Session { command } => run_debug_session(command, as_json),
+        DebugCommand::Eval {
+            session_id,
+            command,
+            endpoint,
+            token,
+        } => {
+            let response = call_service(
+                endpoint,
+                &token,
+                "debug.eval",
+                json!({
+                    "session_id": { "id": session_id },
+                    "command": command,
+                }),
+            )?;
+            print_rpc_response(response, as_json)
+        }
+        DebugCommand::Modules {
+            session_id,
+            endpoint,
+            token,
+        } => call_session_tool(endpoint, &token, "debug.modules", session_id, as_json),
+        DebugCommand::Threads {
+            session_id,
+            endpoint,
+            token,
+        } => call_session_tool(endpoint, &token, "debug.threads", session_id, as_json),
+        DebugCommand::Stack {
+            session_id,
+            endpoint,
+            token,
+        } => call_session_tool(endpoint, &token, "debug.stack", session_id, as_json),
+    }
+}
+
+fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> {
+    match command {
+        DebugSessionCommand::Create {
+            project_root,
+            dump,
+            attach,
+            endpoint,
+            token,
+        } => {
+            let target = match (dump, attach) {
+                (Some(path), None) => serde_json::to_value(DebugTarget::Dump { path })?,
+                (None, Some(pid)) => serde_json::to_value(DebugTarget::Attach { pid })?,
+                _ => anyhow::bail!("provide exactly one of --dump or --attach"),
+            };
+            let response = call_service(
+                endpoint,
+                &token,
+                "debug.session.create",
+                json!({
+                    "project_root": project_root,
+                    "target": target,
+                }),
+            )?;
+            print_rpc_response(response, as_json)
+        }
+        DebugSessionCommand::Close {
+            session_id,
+            endpoint,
+            token,
+        } => call_session_tool(endpoint, &token, "debug.session.close", session_id, as_json),
+        DebugSessionCommand::Kill {
+            session_id,
+            endpoint,
+            token,
+        } => call_session_tool(endpoint, &token, "debug.session.kill", session_id, as_json),
+    }
+}
+
+fn call_session_tool(
+    endpoint: SocketAddr,
+    token: &str,
+    method: &str,
+    session_id: String,
+    as_json: bool,
+) -> Result<()> {
+    let response = call_service(
+        endpoint,
+        token,
+        method,
+        json!({
+            "session_id": { "id": session_id },
+        }),
+    )?;
+    print_rpc_response(response, as_json)
+}
+
+fn call_service(
+    endpoint: SocketAddr,
+    token: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<dbgatlas_service::JsonRpcResponse> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: method.to_string(),
+        params: Some(params),
+    };
+    Ok(invoke_http_json_rpc(endpoint, token, &request)?)
+}
+
+fn print_rpc_response(response: dbgatlas_service::JsonRpcResponse, as_json: bool) -> Result<()> {
+    if as_json {
+        print_json(serde_json::to_value(response)?)?;
+        return Ok(());
+    }
+
+    if let Some(error) = response.error {
+        anyhow::bail!("{} ({})", error.message, error.code);
+    }
+    print_json(response.result.unwrap_or_else(|| json!(null)))
 }
 
 fn run_native(command: NativeCommand, as_json: bool) -> Result<()> {

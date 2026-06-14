@@ -13,5 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 dbgatlas-dbgeng.workspace = true
+dbgatlas-debug.workspace = true
+dbgatlas-service.workspace = true
 dbgatlas-workspace.workspace = true
 serde_json.workspace = true
