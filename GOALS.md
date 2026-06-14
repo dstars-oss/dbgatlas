@@ -26,11 +26,11 @@ Tasks:
 - [x] 实现 `project_root` -> `<project_root>/dbgatlas` 的内部懒创建规则。
 - [x] 实现 session create / close / kill skeleton，并与 mock worker 1:1 绑定。
 - [ ] 实现 Windows service install/start/stop/status/uninstall。
-- [ ] 实现真实 named pipe worker transport。
-- [ ] 实现 worker 子进程启动、Job Object 绑定和退出清理。
-- [ ] 实现 per-session worker skeleton。
-- [ ] 实现 session cancel 生命周期。
-- [ ] 保证同一 session 请求串行化，不同 session 可并发。
+- [x] 实现真实 named pipe worker transport。
+- [x] 实现 worker 子进程启动、Job Object 绑定和退出清理。
+- [x] 实现 per-session worker skeleton。
+- [x] 实现 session cancel 生命周期。
+- [x] 保证同一 session 请求串行化，不同 session 可并发。
 - [ ] 将 DbgEng bootstrap ABI 迁移为 adapter-specific `dbgatlas_dbgeng.h`。
 - [ ] 在 `dbgatlas-dbgeng-sys` 中绑定新的 DbgEng C ABI。
 - [ ] 在 `dbgatlas-dbgeng` 中提供 safe session wrapper。

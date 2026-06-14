@@ -215,7 +215,7 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
             if !as_json {
                 println!("DbgAtlas service listening on http://{}/rpc", config.bind);
             }
-            run_http_service(config, ServiceHost::with_mock_workers())?;
+            run_http_service(config, ServiceHost::with_process_workers()?)?;
         }
         ServiceCommand::Health { endpoint, token } => {
             let response = call_service(endpoint, &token, "service.health", json!({}))?;

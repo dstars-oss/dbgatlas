@@ -43,6 +43,10 @@ pub enum WorkerRequest {
     KillSession {
         session_id: SessionRef,
     },
+    CancelOperation {
+        session_id: SessionRef,
+        operation_id: OperationRef,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +136,21 @@ mod tests {
 
         let encoded = encode_jsonl(&request).unwrap();
         assert!(encoded.ends_with('\n'));
+        let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn cancel_operation_round_trips_as_jsonl() {
+        let request = WorkerEnvelope::new(
+            "req-002",
+            WorkerRequest::CancelOperation {
+                session_id: SessionRef::new(Id::new("session-001").unwrap()),
+                operation_id: OperationRef::new(Id::new("op-001").unwrap()),
+            },
+        );
+
+        let encoded = encode_jsonl(&request).unwrap();
         let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
         assert_eq!(decoded, request);
     }
