@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/dbgatlas-adapter",
+    "crates/dbgatlas-cli",
+    "crates/dbgatlas-core",
+    "crates/dbgatlas-debug",
+    "crates/dbgatlas-dbgeng",
+    "crates/dbgatlas-dbgeng-sys",
+    "crates/dbgatlas-model",
+    "crates/dbgatlas-runtime",
+    "crates/dbgatlas-workspace",
+    "xtask",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.12"
+thiserror = "1.0"
+toml = "0.8"
+
+dbgatlas-adapter = { path = "crates/dbgatlas-adapter" }
+dbgatlas-core = { path = "crates/dbgatlas-core" }
+dbgatlas-debug = { path = "crates/dbgatlas-debug" }
+dbgatlas-dbgeng = { path = "crates/dbgatlas-dbgeng" }
+dbgatlas-dbgeng-sys = { path = "crates/dbgatlas-dbgeng-sys" }
+dbgatlas-model = { path = "crates/dbgatlas-model" }
+dbgatlas-runtime = { path = "crates/dbgatlas-runtime" }
+dbgatlas-workspace = { path = "crates/dbgatlas-workspace" }

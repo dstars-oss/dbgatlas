@@ -1,0 +1,17 @@
+[package]
+name = "dbgatlas-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dbgatlas"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dbgatlas-dbgeng.workspace = true
+dbgatlas-workspace.workspace = true
+serde_json.workspace = true
