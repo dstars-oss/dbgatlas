@@ -31,9 +31,9 @@ Tasks:
 - [x] 实现 per-session worker skeleton。
 - [x] 实现 session cancel 生命周期。
 - [x] 保证同一 session 请求串行化，不同 session 可并发。
-- [ ] 将 DbgEng bootstrap ABI 迁移为 adapter-specific `dbgatlas_dbgeng.h`。
-- [ ] 在 `dbgatlas-dbgeng-sys` 中绑定新的 DbgEng C ABI。
-- [ ] 在 `dbgatlas-dbgeng` 中提供 safe session wrapper。
+- [x] 将 DbgEng bootstrap ABI 迁移为 adapter-specific `dbgatlas_dbgeng.h`。
+- [x] 在 `dbgatlas-dbgeng-sys` 中绑定新的 DbgEng C ABI。
+- [x] 在 `dbgatlas-dbgeng` 中提供 safe session wrapper。
 - [ ] 支持 open dump。
 - [ ] 支持 attach process。
 - [ ] 支持 execute raw WinDbg command。

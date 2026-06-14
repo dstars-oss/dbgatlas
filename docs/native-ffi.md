@@ -2,7 +2,7 @@
 
 DbgAtlas 采用 Rust 主进程 + C++ native adapter DLL。每个 native adapter 维护自己的 C header 和对应 Rust `*-sys` crate，不通过中心化 protocol 层定义边界。
 
-当前 `native/include/dbgatlas_native.h` 是 bootstrap ABI，只用于 MVP 0/0.5 的 hello/version 构建链验证。进入真实 DbgEng MVP 前，应拆出 adapter-specific header，例如 `dbgatlas_dbgeng.h`，并由对应 `dbgatlas-dbgeng-sys` crate 局部绑定。
+MVP 1 起，DbgEng adapter 使用 `native/include/dbgatlas_dbgeng.h` 作为 adapter-specific C ABI，并由 `dbgatlas-dbgeng-sys` crate 局部绑定。早期 `native/include/dbgatlas_native.h` 只保留为 MVP 0/0.5 bootstrap 历史文件，不再作为 DbgEng DLL 的当前导出边界。
 
 ## C ABI 规则
 
@@ -12,34 +12,50 @@ DbgAtlas 采用 Rust 主进程 + C++ native adapter DLL。每个 native adapter 
 - 对外结构使用固定宽度整数类型。
 - 所有复杂函数返回 `int32_t` 状态码。
 - native 内部异常必须被捕获并转换为状态码。
-- 字符串边界使用 UTF-8。
-- C++ 分配的 view 由 `da_release_view` 释放。
+- 字符串边界使用 UTF-8；Rust safe wrapper 必须拒绝无法表示为 UTF-8 的路径。
+- C++ 分配的 view 由 adapter-specific release 函数释放，例如 `da_dbgeng_release_view`。
 
 ## View + Owner
 
-MVP 0 的 `DA_TextView` 形态：
+DbgEng MVP 1 的 `DA_DbgEngTextView` 形态：
 
 ```c
-typedef struct DA_TextView {
+typedef struct DA_DbgEngTextView {
     uint32_t struct_size;
     uint32_t flags;
     const char* data;
     size_t len;
     void* owner;
-} DA_TextView;
+} DA_DbgEngTextView;
 ```
 
-Rust 侧只读 `data/len`，使用后调用 `da_release_view(owner)`。后续数组、string table、stack/module list 沿用同一释放原则。
+Rust 侧只读 `data/len`，使用后调用 `da_dbgeng_release_view(owner)`。后续数组、string table、stack/module list 沿用同一释放原则。
+
+## DbgEng Session Handle
+
+DbgEng adapter 对 Rust 只暴露 opaque handle：
+
+```c
+typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
+```
+
+最小 session ABI 包括：
+
+- `da_dbgeng_session_open_dump(path_utf8, out_handle)`
+- `da_dbgeng_session_execute(handle, command_utf8, out_text)`
+- `da_dbgeng_session_close(handle)`
+
+当前实现是可编译的 session skeleton，用于稳定 ABI 与 Rust safe wrapper；真实 DbgEng open dump / command execution 仍是后续 MVP 1 任务。
 
 ## 错误处理
 
-- `DA_OK` 表示成功。
-- 参数错误返回 `DA_ERR_INVALID_ARGUMENT`。
-- 错误消息通过 `da_last_error` 获取。
-- `da_last_error` 支持先传空 buffer 获取 required length。
+- adapter-specific OK 状态表示成功，例如 `DA_DBGENG_OK`。
+- 参数错误返回 adapter-specific invalid argument 状态，例如 `DA_DBGENG_ERR_INVALID_ARGUMENT`。
+- 错误消息通过 adapter-specific `last_error` 获取，例如 `da_dbgeng_last_error`。
+- `last_error` 支持先传空 buffer 获取 required length。
 
 ## 线程模型
 
-MVP 0 只有 hello/version，不涉及 DbgEng/COM 线程亲和性。进入 MVP 1 后，DbgEng session、callback、event polling、COM 初始化和线程归属必须封装在 C++ DLL 内部，Rust 只看到 session handle 或 safe wrapper。
+DbgEng session、callback、event polling、COM 初始化和线程归属必须封装在 C++ DLL 内部，Rust 只看到 session handle 或 safe wrapper。
 
 DbgEng、ETW、DIA 后续必须各自维护 header、DLL adapter 和 `*-sys` crate。不要新增中心化 protocol crate，也不要把多个 native adapter 过早聚合到一个 DLL ABI。
