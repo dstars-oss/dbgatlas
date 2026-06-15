@@ -34,12 +34,27 @@ analysis-workspace/
 - `proxy`
 - `server.bind`
 
-MVP 0.5 不安装 Windows service，不启动 worker，也不把 runtime config 写入 workspace。
+安装态 Windows service 使用 `%ProgramData%\DbgAtlas\` 作为机器级 install root：
+
+```text
+%ProgramData%\DbgAtlas\
+  bin\                  # installed runtime payload
+    dbgatlas.exe
+    dbgatlas-worker.exe
+    dbgatlas_dbgeng.dll
+  runtime.toml          # runtime config
+  token                 # machine-local bearer token
+```
+
+SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe`，不指向开发目录下的 `target\debug` 或 `target\release`。`dbgatlas service install` 从当前 executable 所在目录复制 runtime payload；`dbgatlas service uninstall` 默认只删除 `bin\` 和 SCM entry，保留 `runtime.toml` 与 `token`，`--purge` 才删除整个 install root。
+
+开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。
 
 ## 校验原则
 
 - 本地服务默认只绑定 loopback。
 - 安装态服务配置和机器级 bearer token 默认属于 `%ProgramData%\DbgAtlas\`。
+- 安装态 bearer token 不进入 `runtime.toml`，CLI 普通输出不显示 token 内容。
 - 对外 HTTP API 需要 bearer token，并校验来自浏览器类客户端的 `Origin`。
 - path、symbol path、proxy value 拒绝控制字符。
 - proxy env 只允许明确支持的 key。

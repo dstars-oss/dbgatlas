@@ -3,6 +3,7 @@ use dbgatlas_debug::{
     DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
 };
 use dbgatlas_model::{ArtifactRef, Id, OperationRef, SessionRef, Timestamp};
+use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
     WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError, WorkerRequest, WorkerResponse,
     decode_jsonl, encode_jsonl,
@@ -18,14 +19,23 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const INTERNAL_WORKSPACE_DIR: &str = "dbgatlas";
 pub const DEFAULT_SERVICE_PORT: u16 = 7331;
 pub const MAX_MEMORY_READ_LENGTH: u64 = 16 * 1024 * 1024;
+pub const WINDOWS_SERVICE_NAME: &str = "DbgAtlas";
+pub const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DbgAtlas Service";
+pub const WINDOWS_SERVICE_DESCRIPTION: &str = "DbgAtlas local debugging service";
+pub const WINDOWS_SERVICE_DIR: &str = "DbgAtlas";
+pub const WINDOWS_SERVICE_BIN_DIR: &str = "bin";
+pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
+pub const WINDOWS_SERVICE_TOKEN_FILE: &str = "token";
+pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] =
+    &["dbgatlas.exe", "dbgatlas-worker.exe", "dbgatlas_dbgeng.dll"];
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -44,6 +54,25 @@ impl ServiceConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_SERVICE_PORT),
             bearer_token: "dev-token".to_string(),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ServiceShutdown {
+    stop: Arc<AtomicBool>,
+}
+
+impl ServiceShutdown {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
     }
 }
 
@@ -77,8 +106,18 @@ pub enum ServiceError {
     Worker(String),
     #[error("worker transport is not supported on this platform")]
     WorkerTransportUnsupported,
+    #[error("Windows service control is not supported on this platform")]
+    ServiceControlUnsupported,
+    #[error("Windows service control error: {0}")]
+    ServiceControl(String),
+    #[error("service install payload is incomplete: {0}")]
+    IncompleteInstallPayload(String),
+    #[error("service is running; stop it before installing or updating payload")]
+    ServiceIsRunning,
     #[error(transparent)]
     Debug(#[from] dbgatlas_debug::DebugError),
+    #[error(transparent)]
+    Runtime(#[from] dbgatlas_runtime::RuntimeConfigError),
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
     #[error(transparent)]
@@ -1523,6 +1562,707 @@ fn worker_executable_path() -> Result<PathBuf, ServiceError> {
     Ok(directory.join(file_name))
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceInstallPaths {
+    pub root_dir: PathBuf,
+    pub bin_dir: PathBuf,
+    pub staging_bin_dir: PathBuf,
+    pub config_path: PathBuf,
+    pub token_file: PathBuf,
+    pub installed_exe: PathBuf,
+}
+
+impl ServiceInstallPaths {
+    pub fn for_root(root_dir: PathBuf) -> Self {
+        let bin_dir = root_dir.join(WINDOWS_SERVICE_BIN_DIR);
+        Self {
+            staging_bin_dir: root_dir.join("bin.staging"),
+            config_path: root_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
+            token_file: root_dir.join(WINDOWS_SERVICE_TOKEN_FILE),
+            installed_exe: bin_dir.join("dbgatlas.exe"),
+            bin_dir,
+            root_dir,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServicePayloadFile {
+    pub file_name: String,
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowsServiceInstallOptions {
+    pub bind: SocketAddr,
+    pub force: bool,
+}
+
+impl Default for WindowsServiceInstallOptions {
+    fn default() -> Self {
+        Self {
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_SERVICE_PORT),
+            force: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WindowsServiceUninstallOptions {
+    pub purge: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowsServiceRunOptions {
+    pub config_path: PathBuf,
+    pub token_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WindowsServiceCommandResult {
+    pub service_name: String,
+    pub display_name: String,
+    pub status: String,
+    pub endpoint: Option<SocketAddr>,
+    pub installed_binary: PathBuf,
+    pub config_path: PathBuf,
+    pub token_file: PathBuf,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<ServicePayloadFile>,
+}
+
+pub fn default_windows_service_paths() -> ServiceInstallPaths {
+    let root = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join(WINDOWS_SERVICE_DIR);
+    ServiceInstallPaths::for_root(root)
+}
+
+pub fn discover_service_payload(
+    source_dir: &Path,
+    destination_dir: &Path,
+) -> Result<Vec<ServicePayloadFile>, ServiceError> {
+    let mut payload = Vec::new();
+    let mut missing = Vec::new();
+    for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+        let source = source_dir.join(file_name);
+        if !source.is_file() {
+            missing.push(source);
+            continue;
+        }
+        payload.push(ServicePayloadFile {
+            file_name: (*file_name).to_string(),
+            destination: destination_dir.join(file_name),
+            source,
+        });
+    }
+    if !missing.is_empty() {
+        let files = missing
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ServiceError::IncompleteInstallPayload(format!(
+            "missing {files}; build dbgatlas, dbgatlas-worker, and dbgatlas_dbgeng.dll with the MSVC native build first"
+        )));
+    }
+    Ok(payload)
+}
+
+pub fn installed_client_config() -> Result<Option<ServiceConfig>, ServiceError> {
+    installed_client_config_from_paths(&default_windows_service_paths())
+}
+
+fn installed_client_config_from_paths(
+    paths: &ServiceInstallPaths,
+) -> Result<Option<ServiceConfig>, ServiceError> {
+    if !paths.installed_exe.is_file() || !paths.config_path.is_file() || !paths.token_file.is_file()
+    {
+        return Ok(None);
+    }
+    let runtime = RuntimeConfig::load(&paths.config_path)?;
+    let bearer_token = fs::read_to_string(&paths.token_file)?.trim().to_string();
+    let config = ServiceConfig {
+        bind: runtime.server.bind,
+        bearer_token,
+    };
+    validate_config(&config)?;
+    Ok(Some(config))
+}
+
+pub fn install_windows_service(
+    options: WindowsServiceInstallOptions,
+) -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::install(options)
+}
+
+pub fn start_windows_service() -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::start()
+}
+
+pub fn stop_windows_service() -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::stop()
+}
+
+pub fn status_windows_service() -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::status()
+}
+
+pub fn uninstall_windows_service(
+    options: WindowsServiceUninstallOptions,
+) -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::uninstall(options)
+}
+
+pub fn run_windows_service_dispatcher(
+    options: WindowsServiceRunOptions,
+) -> Result<(), ServiceError> {
+    windows_service_control::run_dispatcher(options)
+}
+
+fn create_runtime_config_if_missing(
+    paths: &ServiceInstallPaths,
+    bind: SocketAddr,
+) -> Result<RuntimeConfig, ServiceError> {
+    if paths.config_path.exists() {
+        return Ok(RuntimeConfig::load(&paths.config_path)?);
+    }
+    let config = format!("version = 1\n\n[server]\nbind = \"{}\"\n", bind);
+    let runtime = RuntimeConfig::from_toml_str(&config)?;
+    fs::write(&paths.config_path, config)?;
+    Ok(runtime)
+}
+
+fn install_payload(
+    payload: &[ServicePayloadFile],
+    paths: &ServiceInstallPaths,
+) -> Result<(), ServiceError> {
+    if paths.staging_bin_dir.exists() {
+        fs::remove_dir_all(&paths.staging_bin_dir)?;
+    }
+    fs::create_dir_all(&paths.staging_bin_dir)?;
+    for file in payload {
+        fs::copy(&file.source, paths.staging_bin_dir.join(&file.file_name))?;
+    }
+    if paths.bin_dir.exists() {
+        fs::remove_dir_all(&paths.bin_dir)?;
+    }
+    fs::rename(&paths.staging_bin_dir, &paths.bin_dir)?;
+    Ok(())
+}
+
+fn source_is_installed_bin(source_dir: &Path, paths: &ServiceInstallPaths) -> bool {
+    let Ok(source) = fs::canonicalize(source_dir) else {
+        return false;
+    };
+    let Ok(destination) = fs::canonicalize(&paths.bin_dir) else {
+        return false;
+    };
+    source == destination
+}
+
+#[cfg(not(windows))]
+mod windows_service_control {
+    use super::*;
+
+    pub fn install(
+        _options: WindowsServiceInstallOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+
+    pub fn start() -> Result<WindowsServiceCommandResult, ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+
+    pub fn stop() -> Result<WindowsServiceCommandResult, ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+
+    pub fn status() -> Result<WindowsServiceCommandResult, ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+
+    pub fn uninstall(
+        _options: WindowsServiceUninstallOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+
+    pub fn run_dispatcher(_options: WindowsServiceRunOptions) -> Result<(), ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+}
+
+#[cfg(windows)]
+mod windows_service_control {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    use windows_service::service::{
+        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+        ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    };
+    use windows_service::service_control_handler::{
+        self, ServiceControlHandlerResult, ServiceStatusHandle,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    windows_service::define_windows_service!(ffi_service_main, service_main);
+
+    static RUN_OPTIONS: OnceLock<WindowsServiceRunOptions> = OnceLock::new();
+
+    pub fn install(
+        options: WindowsServiceInstallOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = default_windows_service_paths();
+        fs::create_dir_all(&paths.root_dir)?;
+        let current_exe = std::env::current_exe()?;
+        let source_dir = current_exe.parent().ok_or_else(|| {
+            ServiceError::ServiceControl("current executable has no parent".into())
+        })?;
+        if source_is_installed_bin(source_dir, &paths) {
+            return Err(ServiceError::ServiceControl(
+                "cannot install from the installed bin directory; run install from a development or release payload directory".to_string(),
+            ));
+        }
+        let payload = discover_service_payload(source_dir, &paths.bin_dir)?;
+
+        let manager =
+            manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+        if let Some(service) = open_optional(
+            &manager,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG,
+        )? {
+            let status = service.query_status().map_err(map_windows_service_error)?;
+            if status.current_state != ServiceState::Stopped {
+                return Err(ServiceError::ServiceIsRunning);
+            }
+            if !options.force {
+                return Err(ServiceError::ServiceControl(
+                    "service is already installed; use `dbgatlas service install --force` to update payload and service entry".to_string(),
+                ));
+            }
+        }
+
+        let runtime = create_runtime_config_if_missing(&paths, options.bind)?;
+        ensure_token_file(&paths.token_file)?;
+        install_payload(&payload, &paths)?;
+        create_or_update_service(&manager, &paths)?;
+
+        Ok(result(
+            "installed",
+            Some(runtime.server.bind),
+            paths,
+            payload,
+        ))
+    }
+
+    pub fn start() -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = default_windows_service_paths();
+        let manager = manager(ServiceManagerAccess::CONNECT)?;
+        let service = open_required(
+            &manager,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::QUERY_CONFIG,
+        )?;
+        let status = service.query_status().map_err(map_windows_service_error)?;
+        if status.current_state != ServiceState::Running {
+            service
+                .start::<OsString>(&[])
+                .map_err(map_windows_service_error)?;
+            wait_for_state(&service, ServiceState::Running)?;
+        }
+        Ok(result(
+            "running",
+            installed_endpoint(&paths)?,
+            paths,
+            Vec::new(),
+        ))
+    }
+
+    pub fn stop() -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = default_windows_service_paths();
+        let manager = manager(ServiceManagerAccess::CONNECT)?;
+        let service = open_required(
+            &manager,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::QUERY_CONFIG,
+        )?;
+        stop_service(&service)?;
+        Ok(result(
+            "stopped",
+            installed_endpoint(&paths)?,
+            paths,
+            Vec::new(),
+        ))
+    }
+
+    pub fn status() -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = default_windows_service_paths();
+        let manager = manager(ServiceManagerAccess::CONNECT)?;
+        let Some(service) = open_optional(
+            &manager,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+        )?
+        else {
+            return Ok(result(
+                "not_installed",
+                installed_endpoint(&paths).ok().flatten(),
+                paths,
+                Vec::new(),
+            ));
+        };
+        let status = service.query_status().map_err(map_windows_service_error)?;
+        Ok(result(
+            state_name(status.current_state),
+            installed_endpoint(&paths)?,
+            paths,
+            Vec::new(),
+        ))
+    }
+
+    pub fn uninstall(
+        options: WindowsServiceUninstallOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = default_windows_service_paths();
+        let manager = manager(ServiceManagerAccess::CONNECT)?;
+        let Some(service) = open_optional(
+            &manager,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+        )?
+        else {
+            cleanup_install_dirs(&paths, options.purge)?;
+            return Ok(result("not_installed", None, paths, Vec::new()));
+        };
+        stop_service(&service)?;
+        service.delete().map_err(map_windows_service_error)?;
+        cleanup_install_dirs(&paths, options.purge)?;
+        Ok(result("uninstalled", None, paths, Vec::new()))
+    }
+
+    pub fn run_dispatcher(options: WindowsServiceRunOptions) -> Result<(), ServiceError> {
+        append_service_log("starting Windows service dispatcher");
+        RUN_OPTIONS.set(options).map_err(|_| {
+            ServiceError::ServiceControl("service run options were already set".to_string())
+        })?;
+        let result =
+            windows_service::service_dispatcher::start(WINDOWS_SERVICE_NAME, ffi_service_main)
+                .map_err(map_windows_service_error);
+        if let Err(error) = &result {
+            append_service_log(&format!("service dispatcher failed: {error}"));
+        }
+        result
+    }
+
+    fn service_main(_arguments: Vec<OsString>) {
+        append_service_log("entered service_main");
+        if let Err(error) = run_service_main() {
+            append_service_log(&format!("service_main failed: {error}"));
+            eprintln!("DbgAtlas Windows service error: {error:#}");
+        }
+        append_service_log("leaving service_main");
+    }
+
+    fn run_service_main() -> Result<(), ServiceError> {
+        append_service_log("loading service run options");
+        let options = RUN_OPTIONS.get().cloned().ok_or_else(|| {
+            ServiceError::ServiceControl("missing service run options".to_string())
+        })?;
+        let shutdown = ServiceShutdown::new();
+        let stop_signal = shutdown.clone();
+        let event_handler = move |control_event| -> ServiceControlHandlerResult {
+            match control_event {
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    stop_signal.request_stop();
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+        append_service_log("registering service control handler");
+        let status_handle = service_control_handler::register(WINDOWS_SERVICE_NAME, event_handler)
+            .map_err(map_windows_service_error)?;
+        append_service_log("registered service control handler");
+        set_status(&status_handle, ServiceState::StartPending)?;
+        append_service_log("reported start_pending");
+        let runtime = RuntimeConfig::load(&options.config_path)?;
+        let bearer_token = fs::read_to_string(&options.token_file)?.trim().to_string();
+        let config = ServiceConfig {
+            bind: runtime.server.bind,
+            bearer_token,
+        };
+        validate_config(&config)?;
+        set_status(&status_handle, ServiceState::Running)?;
+        append_service_log(&format!("reported running on {}", config.bind));
+        let result = run_http_service_until(config, ServiceHost::with_process_workers()?, shutdown);
+        set_status(&status_handle, ServiceState::Stopped)?;
+        append_service_log("reported stopped");
+        result
+    }
+
+    fn create_or_update_service(
+        manager: &ServiceManager,
+        paths: &ServiceInstallPaths,
+    ) -> Result<(), ServiceError> {
+        let info = service_info(paths);
+        if let Some(service) = open_optional(manager, ServiceAccess::CHANGE_CONFIG)? {
+            service
+                .change_config(&info)
+                .map_err(map_windows_service_error)?;
+            service
+                .set_description(WINDOWS_SERVICE_DESCRIPTION)
+                .map_err(map_windows_service_error)?;
+            return Ok(());
+        }
+        let service = manager
+            .create_service(
+                &info,
+                ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG,
+            )
+            .map_err(map_windows_service_error)?;
+        service
+            .set_description(WINDOWS_SERVICE_DESCRIPTION)
+            .map_err(map_windows_service_error)?;
+        Ok(())
+    }
+
+    fn service_info(paths: &ServiceInstallPaths) -> ServiceInfo {
+        ServiceInfo {
+            name: OsString::from(WINDOWS_SERVICE_NAME),
+            display_name: OsString::from(WINDOWS_SERVICE_DISPLAY_NAME),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::OnDemand,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: paths.installed_exe.clone(),
+            launch_arguments: vec![
+                OsString::from("service"),
+                OsString::from("run"),
+                OsString::from("--windows-service"),
+                OsString::from("--config"),
+                paths.config_path.clone().into_os_string(),
+                OsString::from("--token-file"),
+                paths.token_file.clone().into_os_string(),
+            ],
+            dependencies: Vec::new(),
+            account_name: None,
+            account_password: None,
+        }
+    }
+
+    fn manager(access: ServiceManagerAccess) -> Result<ServiceManager, ServiceError> {
+        ServiceManager::local_computer(None::<&str>, access).map_err(map_windows_service_error)
+    }
+
+    fn open_required(
+        manager: &ServiceManager,
+        access: ServiceAccess,
+    ) -> Result<windows_service::service::Service, ServiceError> {
+        open_optional(manager, access)?.ok_or_else(|| {
+            ServiceError::ServiceControl(format!(
+                "Windows service `{WINDOWS_SERVICE_NAME}` is not installed"
+            ))
+        })
+    }
+
+    fn open_optional(
+        manager: &ServiceManager,
+        access: ServiceAccess,
+    ) -> Result<Option<windows_service::service::Service>, ServiceError> {
+        match manager.open_service(WINDOWS_SERVICE_NAME, access) {
+            Ok(service) => Ok(Some(service)),
+            Err(error) if is_service_not_found(&error) => Ok(None),
+            Err(error) => Err(map_windows_service_error(error)),
+        }
+    }
+
+    fn stop_service(service: &windows_service::service::Service) -> Result<(), ServiceError> {
+        let status = service.query_status().map_err(map_windows_service_error)?;
+        if status.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        match service.stop() {
+            Ok(_) => wait_for_state(service, ServiceState::Stopped),
+            Err(error) if is_service_not_active(&error) => Ok(()),
+            Err(error) => Err(map_windows_service_error(error)),
+        }
+    }
+
+    fn wait_for_state(
+        service: &windows_service::service::Service,
+        expected: ServiceState,
+    ) -> Result<(), ServiceError> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = service.query_status().map_err(map_windows_service_error)?;
+            if status.current_state == expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ServiceError::ServiceControl(format!(
+                    "timed out waiting for service state `{}`; current state is `{}`",
+                    state_name(expected),
+                    state_name(status.current_state)
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    fn set_status(
+        status_handle: &ServiceStatusHandle,
+        current_state: ServiceState,
+    ) -> Result<(), ServiceError> {
+        let controls_accepted = if current_state == ServiceState::Running {
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+        } else {
+            ServiceControlAccept::empty()
+        };
+        status_handle
+            .set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state,
+                controls_accepted,
+                exit_code: ServiceExitCode::NO_ERROR,
+                checkpoint: 0,
+                wait_hint: Duration::from_secs(10),
+                process_id: None,
+            })
+            .map_err(map_windows_service_error)
+    }
+
+    fn ensure_token_file(path: &Path) -> Result<(), ServiceError> {
+        if path.exists() {
+            let token = fs::read_to_string(path)?;
+            if token.trim().is_empty() {
+                return Err(ServiceError::EmptyBearerToken);
+            }
+            return Ok(());
+        }
+        let token = generate_token()?;
+        fs::write(path, format!("{token}\n"))?;
+        Ok(())
+    }
+
+    fn generate_token() -> Result<String, ServiceError> {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+        };
+
+        let mut bytes = [0u8; 32];
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return Err(ServiceError::ServiceControl(format!(
+                "BCryptGenRandom failed with status {status}"
+            )));
+        }
+        Ok(hex_encode(&bytes))
+    }
+
+    fn cleanup_install_dirs(paths: &ServiceInstallPaths, purge: bool) -> Result<(), ServiceError> {
+        if paths.bin_dir.exists() {
+            fs::remove_dir_all(&paths.bin_dir)?;
+        }
+        if paths.staging_bin_dir.exists() {
+            fs::remove_dir_all(&paths.staging_bin_dir)?;
+        }
+        if purge && paths.root_dir.exists() {
+            fs::remove_dir_all(&paths.root_dir)?;
+        }
+        Ok(())
+    }
+
+    fn installed_endpoint(paths: &ServiceInstallPaths) -> Result<Option<SocketAddr>, ServiceError> {
+        Ok(installed_client_config_from_paths(paths)?.map(|config| config.bind))
+    }
+
+    fn result(
+        status: &str,
+        endpoint: Option<SocketAddr>,
+        paths: ServiceInstallPaths,
+        payload: Vec<ServicePayloadFile>,
+    ) -> WindowsServiceCommandResult {
+        WindowsServiceCommandResult {
+            service_name: WINDOWS_SERVICE_NAME.to_string(),
+            display_name: WINDOWS_SERVICE_DISPLAY_NAME.to_string(),
+            status: status.to_string(),
+            endpoint,
+            installed_binary: paths.installed_exe,
+            config_path: paths.config_path,
+            token_file: paths.token_file,
+            payload,
+        }
+    }
+
+    fn state_name(state: ServiceState) -> &'static str {
+        match state {
+            ServiceState::Stopped => "stopped",
+            ServiceState::StartPending => "start_pending",
+            ServiceState::StopPending => "stop_pending",
+            ServiceState::Running => "running",
+            ServiceState::ContinuePending => "continue_pending",
+            ServiceState::PausePending => "pause_pending",
+            ServiceState::Paused => "paused",
+        }
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        output
+    }
+
+    fn is_service_not_found(error: &windows_service::Error) -> bool {
+        matches!(
+            error,
+            windows_service::Error::Winapi(io) if io.raw_os_error() == Some(1060)
+        )
+    }
+
+    fn is_service_not_active(error: &windows_service::Error) -> bool {
+        matches!(
+            error,
+            windows_service::Error::Winapi(io) if io.raw_os_error() == Some(1062)
+        )
+    }
+
+    fn map_windows_service_error(error: windows_service::Error) -> ServiceError {
+        if let windows_service::Error::Winapi(io) = &error {
+            if io.raw_os_error() == Some(5) {
+                return ServiceError::ServiceControl(
+                    "access denied; run this command from an elevated Administrator shell"
+                        .to_string(),
+                );
+            }
+        }
+        ServiceError::ServiceControl(format!("{error:?}"))
+    }
+
+    fn append_service_log(message: &str) {
+        let paths = default_windows_service_paths();
+        let timestamp = Timestamp::now().unix_millis;
+        let line = format!("{timestamp} {message}\n");
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.root_dir.join("service.log"))
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+    }
+}
+
 struct WorkerTransport {
     file: std::fs::File,
 }
@@ -1902,10 +2642,26 @@ enum SessionFinishMode {
 }
 
 pub fn run_http_service(config: ServiceConfig, host: ServiceHost) -> Result<(), ServiceError> {
+    run_http_service_until(config, host, ServiceShutdown::new())
+}
+
+pub fn run_http_service_until(
+    config: ServiceConfig,
+    host: ServiceHost,
+    shutdown: ServiceShutdown,
+) -> Result<(), ServiceError> {
     validate_config(&config)?;
     let listener = TcpListener::bind(config.bind)?;
-    for stream in listener.incoming() {
-        let mut stream = stream?;
+    listener.set_nonblocking(true)?;
+    while !shutdown.is_stopping() {
+        let (mut stream, _) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let config = config.clone();
         let host = host.clone();
         std::thread::spawn(move || {
@@ -2325,8 +3081,126 @@ mod job {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn service_paths_are_rooted_under_dbgatlas_install_dir() {
+        let root = PathBuf::from(r"C:\ProgramData\DbgAtlas");
+        let paths = ServiceInstallPaths::for_root(root.clone());
+
+        assert_eq!(paths.root_dir, root);
+        assert_eq!(paths.bin_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\bin"));
+        assert_eq!(
+            paths.installed_exe,
+            PathBuf::from(r"C:\ProgramData\DbgAtlas\bin\dbgatlas.exe")
+        );
+        assert_eq!(
+            paths.config_path,
+            PathBuf::from(r"C:\ProgramData\DbgAtlas\runtime.toml")
+        );
+        assert_eq!(
+            paths.token_file,
+            PathBuf::from(r"C:\ProgramData\DbgAtlas\token")
+        );
+    }
+
+    #[test]
+    fn payload_discovery_requires_all_runtime_files() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("dbgatlas.exe"), "").unwrap();
+        fs::write(temp.path().join("dbgatlas-worker.exe"), "").unwrap();
+
+        let error = discover_service_payload(temp.path(), &temp.path().join("bin")).unwrap_err();
+
+        assert!(matches!(error, ServiceError::IncompleteInstallPayload(_)));
+        assert!(error.to_string().contains("dbgatlas_dbgeng.dll"));
+    }
+
+    #[test]
+    fn payload_discovery_maps_sources_to_destinations() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("install-bin");
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(temp.path().join(file_name), "").unwrap();
+        }
+
+        let payload = discover_service_payload(temp.path(), &destination).unwrap();
+
+        assert_eq!(payload.len(), WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len());
+        assert!(payload.iter().any(|file| {
+            file.file_name == "dbgatlas-worker.exe"
+                && file.destination == destination.join("dbgatlas-worker.exe")
+        }));
+        assert!(payload.iter().any(|file| {
+            file.file_name == "dbgatlas_dbgeng.dll"
+                && file.destination == destination.join("dbgatlas_dbgeng.dll")
+        }));
+    }
+
+    #[test]
+    fn detects_installing_from_installed_bin_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+
+        assert!(source_is_installed_bin(&paths.bin_dir, &paths));
+    }
+
+    #[test]
+    fn installed_client_config_reads_runtime_config_and_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::write(&paths.installed_exe, "").unwrap();
+        fs::write(
+            &paths.config_path,
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
+        )
+        .unwrap();
+        fs::write(&paths.token_file, "installed-token\n").unwrap();
+
+        let config = installed_client_config_from_paths(&paths).unwrap().unwrap();
+
+        assert_eq!(config.bind, "127.0.0.1:7444".parse().unwrap());
+        assert_eq!(config.bearer_token, "installed-token");
+    }
+
+    #[test]
+    fn installed_client_config_ignores_stale_config_without_installed_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.root_dir).unwrap();
+        fs::write(
+            &paths.config_path,
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
+        )
+        .unwrap();
+        fs::write(&paths.token_file, "installed-token\n").unwrap();
+
+        assert!(
+            installed_client_config_from_paths(&paths)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_config_creation_rejects_non_loopback_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.root_dir).unwrap();
+
+        let error =
+            create_runtime_config_if_missing(&paths, "0.0.0.0:7331".parse().unwrap()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ServiceError::Runtime(dbgatlas_runtime::RuntimeConfigError::NonLoopbackBind(_))
+        ));
+        assert!(!paths.config_path.exists());
+    }
 
     #[test]
     fn health_rpc_returns_ok() {

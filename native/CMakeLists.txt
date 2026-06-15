@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
 
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+
 project(DbgAtlasNative LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -14,6 +18,10 @@ add_library(dbgatlas_dbgeng SHARED
     adapters/dbgeng/dbgatlas_dbgeng.cpp
 )
 
+if(WIN32)
+    set_target_properties(dbgatlas_dbgeng PROPERTIES PREFIX "")
+endif()
+
 target_compile_definitions(dbgatlas_dbgeng PRIVATE DBGATLAS_NATIVE_BUILD)
 target_include_directories(dbgatlas_dbgeng
     PUBLIC
@@ -25,6 +33,9 @@ if(WIN32)
 endif()
 
 if(MSVC)
+    set_property(TARGET dbgatlas_dbgeng PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
     target_compile_options(dbgatlas_dbgeng PRIVATE /W4 /permissive-)
 else()
     target_compile_options(dbgatlas_dbgeng PRIVATE -Wall -Wextra -Wpedantic)

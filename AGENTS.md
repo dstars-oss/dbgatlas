@@ -27,6 +27,7 @@ dbgatlas/
   schemas/                # 面向持久化、AI 输入和工具交换的 JSON / JSONL schema
   examples/               # 示例 session、输入文件、命令和最小可复现工作流
   tests/                  # 跨 crate / native adapter / 进程边界的集成测试与 fixtures
+  script/                 # 面向开发者的本机开发、构建和安装脚本
   xtask/                  # 构建、打包、binding 生成、schema 校验、发布整理等自动化
 ```
 
@@ -85,6 +86,8 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 修改前应先阅读相关目录的 `AGENTS.md`、相邻代码、测试和文档。改动应遵循最小必要变更原则，不做与任务无关的重构、格式化或目录迁移。
 
 新增模块时，先确认它属于 Rust、项目自有 C++、第三方依赖、文档、schema、示例、测试还是工程自动化，再放入对应目录。
+
+`script/` 用于放置开发者可直接运行的本机脚本，例如 release 构建、安装、服务 lifecycle 辅助脚本。跨平台、可组合、面向 CI/发布流水线的工程自动化优先放入 `xtask/`。
 
 `GOALS.md` 是项目的 milestone task list。完成一个 feature 后，应在同一个变更中更新对应 checkbox；只有实现、文档和验证都完成后才标记为已完成。如果 feature 改变了里程碑范围，应先同步调整 `GOALS.md`，再继续实现。
 

@@ -16,7 +16,21 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let native_dir = manifest_dir.join("..").join("..").join("native");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let build_dir = out_dir.join("cmake-build");
+    let is_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let windows_generator = if is_windows {
+        Some(visual_studio_generator())
+    } else {
+        None
+    };
+    let build_dir = if let Some(generator) = windows_generator {
+        out_dir.join(match generator {
+            "Visual Studio 18 2026" => "cmake-build-msvc-vs18",
+            "Visual Studio 17 2022" => "cmake-build-msvc-vs17",
+            _ => "cmake-build-msvc",
+        })
+    } else {
+        out_dir.join("cmake-build")
+    };
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let build_type = if profile == "release" {
         "Release"
@@ -31,10 +45,18 @@ fn main() {
         .arg("-S")
         .arg(&native_dir)
         .arg("-B")
-        .arg(&build_dir)
-        .arg(format!("-DCMAKE_BUILD_TYPE={build_type}"));
-    if env::var_os("CMAKE_GENERATOR").is_none() && command_exists("ninja") {
-        configure.arg("-G").arg("Ninja");
+        .arg(&build_dir);
+    if let Some(generator) = windows_generator {
+        configure
+            .arg("-G")
+            .arg(generator)
+            .arg("-A")
+            .arg(msvc_arch());
+    } else {
+        configure.arg(format!("-DCMAKE_BUILD_TYPE={build_type}"));
+        if env::var_os("CMAKE_GENERATOR").is_none() && command_exists("ninja") {
+            configure.arg("-G").arg("Ninja");
+        }
     }
     run(configure, "configure native CMake project");
 
@@ -96,6 +118,28 @@ fn command_exists(command: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+fn msvc_arch() -> &'static str {
+    match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86") => "Win32",
+        Ok("aarch64") => "ARM64",
+        _ => "x64",
+    }
+}
+
+fn visual_studio_generator() -> &'static str {
+    let help = Command::new("cmake")
+        .arg("--help")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .unwrap_or_default();
+    if help.contains("Visual Studio 18 2026") {
+        "Visual Studio 18 2026"
+    } else {
+        "Visual Studio 17 2022"
+    }
 }
 
 fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {

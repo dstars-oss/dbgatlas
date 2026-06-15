@@ -13,6 +13,7 @@ MVP 0 through MVP 1 contain:
 - Controlled artifact helpers for sessions, profiles, TTD recordings, and reverse sessions.
 - A C++20 DbgEng native DLL with adapter-specific C ABI for open dump, attach process, raw command execution, session symbol path append, and virtual memory reads.
 - CLI commands for workspace initialization, workspace inspection, service dev mode, and debug session workflows.
+- Windows Service lifecycle commands that install an isolated runtime payload under `%ProgramData%\DbgAtlas\bin\`.
 
 Useful commands:
 
@@ -23,6 +24,14 @@ cargo run -p dbgatlas-cli -- workspace init .\scratch-workspace --with-inputs
 cargo run -p dbgatlas-cli -- workspace info .\scratch-workspace
 cargo run -p dbgatlas-cli -- native version
 cargo run -p dbgatlas-cli -- service run --bind 127.0.0.1:7331 --token dev-token
+.\script\build-release-install.ps1
+.\script\build-release-install.ps1 -BuildOnly
+dbgatlas service install
+dbgatlas service start
+dbgatlas service health
+dbgatlas service status --json
+dbgatlas service stop
+dbgatlas service uninstall
 cargo run -p dbgatlas-cli -- debug session create --project-root .\scratch-project --dump .\sample.dmp
 cargo run -p dbgatlas-cli -- debug eval <session-id> ".echo hello"
 cargo run -p dbgatlas-cli -- debug modules <session-id>

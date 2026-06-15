@@ -2,7 +2,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dbgatlas_debug::DebugTarget;
 use dbgatlas_service::{
-    JsonRpcRequest, ServiceConfig, ServiceHost, invoke_http_json_rpc, run_http_service,
+    JsonRpcRequest, ServiceConfig, ServiceHost, WindowsServiceInstallOptions,
+    WindowsServiceRunOptions, WindowsServiceUninstallOptions, install_windows_service,
+    installed_client_config, invoke_http_json_rpc, run_http_service,
+    run_windows_service_dispatcher, start_windows_service, status_windows_service,
+    stop_windows_service, uninstall_windows_service,
 };
 use dbgatlas_workspace::{Workspace, WorkspaceInitOptions};
 use serde_json::json;
@@ -58,24 +62,38 @@ enum ServiceCommand {
         bind: SocketAddr,
         #[arg(long, default_value = "dev-token")]
         token: String,
+        #[arg(long, hide = true)]
+        windows_service: bool,
+        #[arg(long, hide = true)]
+        config: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        token_file: Option<PathBuf>,
     },
     Health {
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     Info {
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
-    Install,
+    Install {
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        bind: SocketAddr,
+        #[arg(long)]
+        force: bool,
+    },
     Start,
     Stop,
     Status,
-    Uninstall,
+    Uninstall {
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -87,31 +105,31 @@ enum DebugCommand {
     Eval {
         session_id: String,
         command: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     Modules {
         session_id: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     Threads {
         session_id: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     Stack {
         session_id: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     ReadMemory {
         session_id: String,
@@ -119,20 +137,20 @@ enum DebugCommand {
         address: String,
         #[arg(long)]
         length: u64,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     AddSymbols {
         session_id: String,
         symbol_path: String,
         #[arg(long)]
         reload: bool,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -145,24 +163,24 @@ enum DebugSessionCommand {
         dump: Option<PathBuf>,
         #[arg(long)]
         attach: Option<u32>,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     Close {
         session_id: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
     Kill {
         session_id: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        endpoint: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -228,7 +246,25 @@ fn run_workspace(command: WorkspaceCommand, as_json: bool) -> Result<()> {
 
 fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
     match command {
-        ServiceCommand::Run { bind, token } => {
+        ServiceCommand::Run {
+            bind,
+            token,
+            windows_service,
+            config,
+            token_file,
+        } => {
+            if windows_service {
+                let config_path = config.ok_or_else(|| {
+                    anyhow::anyhow!("--config is required with --windows-service")
+                })?;
+                let token_file = token_file.ok_or_else(|| {
+                    anyhow::anyhow!("--token-file is required with --windows-service")
+                })?;
+                return Ok(run_windows_service_dispatcher(WindowsServiceRunOptions {
+                    config_path,
+                    token_file,
+                })?);
+            }
             let config = ServiceConfig {
                 bind,
                 bearer_token: token,
@@ -239,21 +275,32 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
             run_http_service(config, ServiceHost::with_process_workers()?)?;
         }
         ServiceCommand::Health { endpoint, token } => {
-            let response = call_service(endpoint, &token, "service.health", json!({}))?;
+            let response = call_service(endpoint, token, "service.health", json!({}))?;
             print_rpc_response(response, as_json)?;
         }
         ServiceCommand::Info { endpoint, token } => {
-            let response = call_service(endpoint, &token, "service.info", json!({}))?;
+            let response = call_service(endpoint, token, "service.info", json!({}))?;
             print_rpc_response(response, as_json)?;
         }
-        ServiceCommand::Install
-        | ServiceCommand::Start
-        | ServiceCommand::Stop
-        | ServiceCommand::Status
-        | ServiceCommand::Uninstall => {
-            anyhow::bail!(
-                "Windows service control commands are reserved in the CLI surface but not implemented yet; use `dbgatlas service run` for MVP service dev mode"
-            );
+        ServiceCommand::Install { bind, force } => {
+            let result = install_windows_service(WindowsServiceInstallOptions { bind, force })?;
+            print_service_command_result(result, as_json)?;
+        }
+        ServiceCommand::Start => {
+            let result = start_windows_service()?;
+            print_service_command_result(result, as_json)?;
+        }
+        ServiceCommand::Stop => {
+            let result = stop_windows_service()?;
+            print_service_command_result(result, as_json)?;
+        }
+        ServiceCommand::Status => {
+            let result = status_windows_service()?;
+            print_service_command_result(result, as_json)?;
+        }
+        ServiceCommand::Uninstall { purge } => {
+            let result = uninstall_windows_service(WindowsServiceUninstallOptions { purge })?;
+            print_service_command_result(result, as_json)?;
         }
     }
     Ok(())
@@ -270,7 +317,7 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
         } => {
             let response = call_service(
                 endpoint,
-                &token,
+                token,
                 "debug.eval",
                 json!({
                     "session_id": { "id": session_id },
@@ -283,17 +330,17 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
             session_id,
             endpoint,
             token,
-        } => call_session_tool(endpoint, &token, "debug.modules", session_id, as_json),
+        } => call_session_tool(endpoint, token, "debug.modules", session_id, as_json),
         DebugCommand::Threads {
             session_id,
             endpoint,
             token,
-        } => call_session_tool(endpoint, &token, "debug.threads", session_id, as_json),
+        } => call_session_tool(endpoint, token, "debug.threads", session_id, as_json),
         DebugCommand::Stack {
             session_id,
             endpoint,
             token,
-        } => call_session_tool(endpoint, &token, "debug.stack", session_id, as_json),
+        } => call_session_tool(endpoint, token, "debug.stack", session_id, as_json),
         DebugCommand::ReadMemory {
             session_id,
             address,
@@ -303,7 +350,7 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
         } => {
             let response = call_service(
                 endpoint,
-                &token,
+                token,
                 "debug.read_memory",
                 json!({
                     "session_id": { "id": session_id },
@@ -322,7 +369,7 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
         } => {
             let response = call_service(
                 endpoint,
-                &token,
+                token,
                 "debug.add_symbols",
                 json!({
                     "session_id": { "id": session_id },
@@ -354,7 +401,7 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
             };
             let response = call_service(
                 endpoint,
-                &token,
+                token,
                 "debug.session.create",
                 json!({
                     "project_root": project_root,
@@ -367,18 +414,18 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
             session_id,
             endpoint,
             token,
-        } => call_session_tool(endpoint, &token, "debug.session.close", session_id, as_json),
+        } => call_session_tool(endpoint, token, "debug.session.close", session_id, as_json),
         DebugSessionCommand::Kill {
             session_id,
             endpoint,
             token,
-        } => call_session_tool(endpoint, &token, "debug.session.kill", session_id, as_json),
+        } => call_session_tool(endpoint, token, "debug.session.kill", session_id, as_json),
     }
 }
 
 fn call_session_tool(
-    endpoint: SocketAddr,
-    token: &str,
+    endpoint: Option<SocketAddr>,
+    token: Option<String>,
     method: &str,
     session_id: String,
     as_json: bool,
@@ -395,18 +442,23 @@ fn call_session_tool(
 }
 
 fn call_service(
-    endpoint: SocketAddr,
-    token: &str,
+    endpoint: Option<SocketAddr>,
+    token: Option<String>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<dbgatlas_service::JsonRpcResponse> {
+    let connection = resolve_client_connection(endpoint, token)?;
     let request = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(json!(1)),
         method: method.to_string(),
         params: Some(params),
     };
-    Ok(invoke_http_json_rpc(endpoint, token, &request)?)
+    Ok(invoke_http_json_rpc(
+        connection.endpoint,
+        &connection.token,
+        &request,
+    )?)
 }
 
 fn print_rpc_response(response: dbgatlas_service::JsonRpcResponse, as_json: bool) -> Result<()> {
@@ -419,6 +471,51 @@ fn print_rpc_response(response: dbgatlas_service::JsonRpcResponse, as_json: bool
         anyhow::bail!("{} ({})", error.message, error.code);
     }
     print_json(response.result.unwrap_or_else(|| json!(null)))
+}
+
+struct ClientConnection {
+    endpoint: SocketAddr,
+    token: String,
+}
+
+fn resolve_client_connection(
+    endpoint: Option<SocketAddr>,
+    token: Option<String>,
+) -> Result<ClientConnection> {
+    if let (Some(endpoint), Some(token)) = (endpoint.as_ref(), token.as_ref()) {
+        return Ok(ClientConnection {
+            endpoint: *endpoint,
+            token: token.clone(),
+        });
+    }
+    let installed = installed_client_config()?;
+    let dev = ServiceConfig::dev_default();
+    Ok(ClientConnection {
+        endpoint: endpoint
+            .or_else(|| installed.as_ref().map(|config| config.bind))
+            .unwrap_or(dev.bind),
+        token: token
+            .or_else(|| installed.map(|config| config.bearer_token))
+            .unwrap_or(dev.bearer_token),
+    })
+}
+
+fn print_service_command_result(
+    result: dbgatlas_service::WindowsServiceCommandResult,
+    as_json: bool,
+) -> Result<()> {
+    if as_json {
+        return print_json(serde_json::to_value(result)?);
+    }
+    println!("service: {}", result.service_name);
+    println!("status: {}", result.status);
+    if let Some(endpoint) = result.endpoint {
+        println!("endpoint: http://{endpoint}/rpc");
+    }
+    println!("binary: {}", result.installed_binary.display());
+    println!("config: {}", result.config_path.display());
+    println!("token file: {}", result.token_file.display());
+    Ok(())
 }
 
 fn run_native(command: NativeCommand, as_json: bool) -> Result<()> {

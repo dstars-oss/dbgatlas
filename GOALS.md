@@ -25,7 +25,7 @@ Tasks:
 - [x] 新增内部 `dbgatlas-worker-protocol` JSONL message skeleton。
 - [x] 实现 `project_root` -> `<project_root>/dbgatlas` 的内部懒创建规则。
 - [x] 实现 session create / close / kill skeleton，并与 mock worker 1:1 绑定。
-- [ ] 实现 Windows service install/start/stop/status/uninstall。
+- [x] 实现 Windows service install/start/stop/status/uninstall。
 - [x] 实现真实 named pipe worker transport。
 - [x] 实现 worker 子进程启动、Job Object 绑定和退出清理。
 - [x] 实现 per-session worker skeleton。
