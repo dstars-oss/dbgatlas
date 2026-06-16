@@ -291,6 +291,14 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    fn dbgeng_session_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static DBGENG_SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        DBGENG_SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(windows)]
     #[test]
     fn native_version_is_readable() {
         let version = native_version().unwrap();
@@ -386,6 +394,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn opening_missing_dump_reports_native_failure() {
+        let _guard = dbgeng_session_test_guard();
         let error = DbgEngSession::open_dump("dbgatlas-missing-sample.dmp").unwrap_err();
         assert!(matches!(error, DbgEngError::Native { .. }));
     }
@@ -393,6 +402,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn opens_minidump_executes_command_adds_symbols_and_reads_memory() {
+        let _guard = dbgeng_session_test_guard();
         let marker = Box::new(0x1122_3344_5566_7788u64);
         let marker_address = (&*marker as *const u64) as u64;
         let temp = tempfile::tempdir().unwrap();
@@ -415,6 +425,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn attach_close_does_not_terminate_target_process() {
+        let _guard = dbgeng_session_test_guard();
         let mut child = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
