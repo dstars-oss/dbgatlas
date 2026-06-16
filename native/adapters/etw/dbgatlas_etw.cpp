@@ -16,6 +16,10 @@
 #ifdef _WIN32
 DEFINE_GUID(IID_ITraceEventCallback, 0x3ed25501, 0x593f, 0x43e9, 0x8f, 0x38, 0x3a, 0xb4, 0x6f, 0x5a, 0x4a, 0x52);
 DEFINE_GUID(IID_ITraceRelogger, 0xf754ad43, 0x3bcc, 0x4286, 0x80, 0x09, 0x9c, 0x5d, 0xa2, 0x14, 0xe8, 0x4e);
+DEFINE_GUID(DA_KernelProcessProviderGuid, 0x22fb2cd6, 0x0e7b, 0x422b, 0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16);
+DEFINE_GUID(DA_KernelFileProviderGuid, 0xedd08927, 0x9cc4, 0x4e65, 0xb9, 0x70, 0xc2, 0x56, 0x0f, 0xb5, 0xc2, 0x89);
+DEFINE_GUID(DA_KernelRegistryProviderGuid, 0x70eb4f03, 0xc1de, 0x4f73, 0xa0, 0x51, 0x33, 0xd1, 0x3d, 0x54, 0x13, 0xbd);
+DEFINE_GUID(DA_KernelNetworkProviderGuid, 0x7dd42a49, 0x5329, 0x4832, 0x8d, 0xfd, 0x43, 0xd9, 0x79, 0x15, 0x3a, 0x88);
 #endif
 
 #include <algorithm>
@@ -425,14 +429,15 @@ EventMetadata event_metadata(PEVENT_RECORD record) {
 }
 
 const char* classify_event(const EventNames& names, uint32_t preset_flags) {
+    const std::string task_opcode = to_lower_ascii(names.task + " " + names.opcode);
     const std::string text = to_lower_ascii(names.provider + " " + names.task + " " + names.opcode);
     const char* category = nullptr;
-    if (contains_any(text, {"process"})) {
-        category = "process";
-    } else if (contains_any(text, {"thread"})) {
+    if (contains_any(task_opcode, {"thread"})) {
         category = "thread";
-    } else if (contains_any(text, {"image", "imageload"})) {
+    } else if (contains_any(task_opcode, {"image", "imageload"})) {
         category = "image";
+    } else if (contains_any(text, {"process"})) {
+        category = "process";
     } else if (contains_any(text, {"registry", "reg"})) {
         category = "registry";
     } else if (contains_any(text, {"tcp", "udp", "network"})) {
@@ -778,36 +783,73 @@ struct TraceProperties final {
     EVENT_TRACE_PROPERTIES* properties = nullptr;
 };
 
-ULONG kernel_enable_flags(uint32_t preset_flags) {
-    ULONG flags = 0;
+struct ProviderSpec final {
+    GUID id;
+    ULONGLONG match_any_keyword = 0;
+};
+
+std::vector<ProviderSpec> provider_specs(uint32_t preset_flags) {
+    std::vector<ProviderSpec> providers;
+    ULONGLONG process_keywords = 0;
     if ((preset_flags & DA_ETW_PRESET_PROCESS) != 0) {
-        flags |= EVENT_TRACE_FLAG_PROCESS;
+        process_keywords |= 0x10;
     }
     if ((preset_flags & DA_ETW_PRESET_THREAD) != 0) {
-        flags |= EVENT_TRACE_FLAG_THREAD;
+        process_keywords |= 0x20;
     }
     if ((preset_flags & DA_ETW_PRESET_IMAGE) != 0) {
-        flags |= EVENT_TRACE_FLAG_IMAGE_LOAD;
+        process_keywords |= 0x40;
+    }
+    if (process_keywords != 0) {
+        providers.push_back(ProviderSpec{DA_KernelProcessProviderGuid, process_keywords});
     }
     if ((preset_flags & DA_ETW_PRESET_FILE) != 0) {
-        flags |= EVENT_TRACE_FLAG_DISK_IO;
-        flags |= EVENT_TRACE_FLAG_DISK_FILE_IO;
-        flags |= EVENT_TRACE_FLAG_FILE_IO;
-        flags |= EVENT_TRACE_FLAG_FILE_IO_INIT;
+        providers.push_back(ProviderSpec{DA_KernelFileProviderGuid, 0x1ff0});
     }
     if ((preset_flags & DA_ETW_PRESET_REGISTRY) != 0) {
-        flags |= EVENT_TRACE_FLAG_REGISTRY;
+        providers.push_back(ProviderSpec{DA_KernelRegistryProviderGuid, 0xffff});
     }
     if ((preset_flags & DA_ETW_PRESET_NETWORK) != 0) {
-        flags |= EVENT_TRACE_FLAG_NETWORK_TCPIP;
+        providers.push_back(ProviderSpec{DA_KernelNetworkProviderGuid, 0x30});
     }
-    return flags;
+    return providers;
+}
+
+ULONG enable_providers(TRACEHANDLE handle, const std::vector<ProviderSpec>& providers) {
+    for (const auto& provider : providers) {
+        const ULONG status = EnableTraceEx2(
+            handle,
+            &provider.id,
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+            TRACE_LEVEL_VERBOSE,
+            provider.match_any_keyword,
+            0,
+            0,
+            nullptr);
+        if (status != ERROR_SUCCESS) {
+            return status;
+        }
+    }
+    return ERROR_SUCCESS;
+}
+
+void disable_providers(TRACEHANDLE handle, const std::vector<ProviderSpec>& providers) {
+    for (const auto& provider : providers) {
+        EnableTraceEx2(
+            handle,
+            &provider.id,
+            EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+            TRACE_LEVEL_VERBOSE,
+            0,
+            0,
+            0,
+            nullptr);
+    }
 }
 
 TraceProperties make_trace_properties(
     const char* session_name_utf8,
-    const char* trace_path_utf8,
-    uint32_t preset_flags) {
+    const char* trace_path_utf8) {
     const size_t logger_name_len = std::strlen(session_name_utf8) + 1;
     const size_t log_file_len = std::strlen(trace_path_utf8) + 1;
     const size_t properties_size =
@@ -819,7 +861,6 @@ TraceProperties make_trace_properties(
     trace.properties->Wnode.BufferSize = static_cast<ULONG>(properties_size);
     trace.properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
     trace.properties->LogFileMode = EVENT_TRACE_FILE_MODE_SEQUENTIAL | EVENT_TRACE_REAL_TIME_MODE;
-    trace.properties->EnableFlags = kernel_enable_flags(preset_flags);
     trace.properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     trace.properties->LogFileNameOffset =
         static_cast<ULONG>(sizeof(EVENT_TRACE_PROPERTIES) + logger_name_len);
@@ -836,6 +877,7 @@ struct DA_EtwSessionHandle {
     TRACEHANDLE handle = 0;
     std::string session_name;
     std::string trace_path;
+    std::vector<ProviderSpec> enabled_providers;
     std::unique_ptr<RealTimeConsumer> realtime_consumer;
 #endif
 };
@@ -900,7 +942,7 @@ int32_t da_etw_write_minimal_file_trace(
 #ifndef _WIN32
         return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW file trace is only available on Windows");
 #else
-        auto trace = make_trace_properties(session_name_utf8, trace_path_utf8, preset_flags);
+        auto trace = make_trace_properties(session_name_utf8, trace_path_utf8);
         TRACEHANDLE handle = 0;
         ULONG status = StartTraceA(&handle, session_name_utf8, trace.properties);
         if (status == ERROR_ALREADY_EXISTS) {
@@ -909,6 +951,13 @@ int32_t da_etw_write_minimal_file_trace(
         }
         if (status != ERROR_SUCCESS) {
             return fail_win32("StartTraceA", status);
+        }
+
+        const auto providers = provider_specs(preset_flags);
+        status = enable_providers(handle, providers);
+        if (status != ERROR_SUCCESS) {
+            ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
+            return fail_win32("EnableTraceEx2", status);
         }
 
         status = ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
@@ -940,7 +989,7 @@ int32_t da_etw_session_start_file_trace(
 #ifndef _WIN32
         return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW file trace is only available on Windows");
 #else
-        auto trace = make_trace_properties(session_name_utf8, trace_path_utf8, preset_flags);
+        auto trace = make_trace_properties(session_name_utf8, trace_path_utf8);
         TRACEHANDLE handle = 0;
         ULONG status = StartTraceA(&handle, session_name_utf8, trace.properties);
         if (status == ERROR_ALREADY_EXISTS) {
@@ -951,10 +1000,18 @@ int32_t da_etw_session_start_file_trace(
             return fail_win32("StartTraceA", status);
         }
 
+        auto providers = provider_specs(preset_flags);
+        status = enable_providers(handle, providers);
+        if (status != ERROR_SUCCESS) {
+            ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
+            return fail_win32("EnableTraceEx2", status);
+        }
+
         auto session = std::make_unique<DA_EtwSessionHandle>();
         session->handle = handle;
         session->session_name = session_name_utf8;
         session->trace_path = trace_path_utf8;
+        session->enabled_providers = std::move(providers);
         *out_handle = session.release();
         return DA_ETW_OK;
 #endif
@@ -1007,7 +1064,8 @@ int32_t da_etw_session_stop(DA_EtwSessionHandle* handle) {
         delete handle;
         return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW file trace is only available on Windows");
 #else
-        auto trace = make_trace_properties(handle->session_name.c_str(), handle->trace_path.c_str(), 0);
+        auto trace = make_trace_properties(handle->session_name.c_str(), handle->trace_path.c_str());
+        disable_providers(handle->handle, handle->enabled_providers);
         const ULONG status = ControlTraceA(
             handle->handle,
             handle->session_name.c_str(),
