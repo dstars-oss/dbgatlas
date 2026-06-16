@@ -88,34 +88,7 @@ Acceptance:
 - [x] AI agent 可以读取 workspace facts，引用 artifact 和 operation id 写 Markdown 报告。
 - [x] 工具事实层与 Markdown 解释层边界清晰。
 
-## MVP 3: IDA Bridge
-
-目标：把 debug session 中的 module、symbol、stack frame 与 IDA database 的函数、地址、注释工作流连接起来。
-
-Tasks:
-
-- [ ] 定义 IDA database target。
-- [ ] 明确 `ida-pro-mcp` supervisor/worker 集成方式。
-- [ ] 实现 stack frame -> module/symbol -> IDA function mapping。
-- [ ] 实现 IDA navigation API。
-- [ ] 实现 IDA comment API。
-- [ ] 将 reverse workflow 低层输出写入 `artifacts/reverse_sessions/<session_id>/`。
-- [ ] 登记 IDA 操作的 operation record 和 artifact metadata。
-- [ ] 增加 debug stack frame 到 IDA function 的端到端测试。
-
-Non-goals:
-
-- 不把 IDA 做成 C++ native adapter 主线。
-- 不把 IDA 数据库内容大块塞入 FFI。
-- 不在 DbgAtlas 内部重建完整反编译器模型。
-
-Acceptance:
-
-- [ ] 从 debug stack frame 可跳转或定位到 IDA function。
-- [ ] IDA 操作有 operation record 和 artifact metadata。
-- [ ] 人/模型可基于 workspace artifact 在 `analysis/` 写 reverse notes。
-
-## MVP 4: ETW/WPR Timeline
+## MVP 3: ETW/WPR Recording And Timeline
 
 目标：接入 ETW/WPR 记录与低层事件提取，形成可复现的事件材料和后续 timeline 输入。
 
@@ -139,6 +112,33 @@ Acceptance:
 - [ ] CLI 能启动一次受控 recording，停止后登记 trace artifact。
 - [ ] 可从 artifact 机械提取关键 ETW event records。
 - [ ] 事件材料可被 Markdown 报告引用。
+
+## MVP 4: IDA Bridge
+
+目标：在 recording 事实层和可复现 artifact 机制更稳定后，把 debug session 中的 module、symbol、stack frame 与 IDA database 的函数、地址、注释工作流连接起来。
+
+Tasks:
+
+- [ ] 定义 IDA database target。
+- [ ] 明确 `ida-pro-mcp` supervisor/worker 集成方式。
+- [ ] 实现 stack frame -> module/symbol -> IDA function mapping。
+- [ ] 实现 IDA navigation API。
+- [ ] 实现 IDA comment API。
+- [ ] 将 reverse workflow 低层输出写入 `artifacts/reverse_sessions/<session_id>/`。
+- [ ] 登记 IDA 操作的 operation record 和 artifact metadata。
+- [ ] 增加 debug stack frame 到 IDA function 的端到端测试。
+
+Non-goals:
+
+- 不把 IDA 做成 C++ native adapter 主线。
+- 不把 IDA 数据库内容大块塞入 FFI。
+- 不在 DbgAtlas 内部重建完整反编译器模型。
+
+Acceptance:
+
+- [ ] 从 debug stack frame 可跳转或定位到 IDA function。
+- [ ] IDA 操作有 operation record 和 artifact metadata。
+- [ ] 人/模型可基于 workspace artifact 在 `analysis/` 写 reverse notes。
 
 ## MVP 5: Report And AI Workflow
 

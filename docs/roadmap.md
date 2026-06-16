@@ -41,17 +41,17 @@
 - `--json` 输出覆盖主要 CLI 命令。
 - MCP server 作为 core 的入口层。
 
-## MVP 3: IDA Bridge
-
-- IDA database target。
-- stack frame -> module/symbol -> IDA function mapping。
-- IDA navigation/comment API。
-
-## MVP 4: ETW/WPR Timeline
+## MVP 3: ETW/WPR Recording And Timeline
 
 - ETW/WPR recording。
 - process/thread/image/file/registry/network event 提取。
 - 与 module/symbol/function 关联。
+
+## MVP 4: IDA Bridge
+
+- IDA database target。
+- stack frame -> module/symbol -> IDA function mapping。
+- IDA navigation/comment API。
 
 ## MVP 5: Report And AI Workflow
 
