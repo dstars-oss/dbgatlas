@@ -1,0 +1,14 @@
+[package]
+name = "dbgatlas-etw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dbgatlas-etw-sys.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile.workspace = true

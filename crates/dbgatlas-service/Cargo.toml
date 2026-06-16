@@ -8,7 +8,9 @@ license.workspace = true
 [dependencies]
 dbgatlas-debug.workspace = true
 dbgatlas-dbgeng.workspace = true
+dbgatlas-etw.workspace = true
 dbgatlas-model.workspace = true
+dbgatlas-recording.workspace = true
 dbgatlas-runtime.workspace = true
 dbgatlas-worker-protocol.workspace = true
 dbgatlas-workspace.workspace = true

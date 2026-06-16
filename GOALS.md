@@ -88,29 +88,36 @@ Acceptance:
 - [x] AI agent 可以读取 workspace facts，引用 artifact 和 operation id 写 Markdown 报告。
 - [x] 工具事实层与 Markdown 解释层边界清晰。
 
-## MVP 3: ETW/WPR Recording And Timeline
+## MVP 3: ETW Recording And Timeline
 
-目标：接入 ETW/WPR 记录与低层事件提取，形成可复现的事件材料和后续 timeline 输入。
+目标：以 ETW API 为主线实现独立 recording 能力，按 process tree 实时过滤和预处理低层事件，形成可复现的过滤后 ETL、recording metadata 和按 category 拆分的事件 JSONL，为后续 timeline/report/reverse workflow 提供事实材料。
 
 Tasks:
 
-- [ ] 设计 ETW/WPR runtime config 和 launch policy。
-- [ ] 实现 ETW/WPR recording 启停。
-- [ ] 将 WPAExport 或等价工具输出归档为 artifact。
-- [ ] 提取 process / thread / image / file / registry / network event。
-- [ ] 建立 event 与 module / symbol / function 的低层可机械提取关联。
-- [ ] 将 trace 输出写入 `artifacts/profiles/<profile_id>/` 或 `artifacts/ttd_recordings/<recording_id>/`。
-- [ ] 增加 trace artifact metadata 和 operation record 测试。
+- [ ] 明确 `recording.*` lifecycle：start / stop / status / cancel / kill。
+- [ ] 设计 ETW runtime config、launch policy 和 recording worker 边界。
+- [ ] 实现 C++ ETW adapter + Rust wrapper 的最小采集链路。
+- [ ] 支持 launch process 和 attach pid 两类 recording target。
+- [ ] 以 process tree 为主过滤维度，使用内置 process / thread / image / file / registry / network presets。
+- [ ] 实时消费 ETW event，预处理、过滤并合并为低层 event records。
+- [ ] 将 recording 输出写入 `artifacts/recordings/<recording_id>/`。
+- [ ] 生成 `recording.json`、过滤后的 `trace.etl` 和按 category 拆分的 `events/*.jsonl`。
+- [ ] 登记 recording 相关 artifact metadata 和 operation records。
+- [ ] 增加 launch、attach、stop、cancel、kill 和 artifact 登记测试。
 
 Non-goals:
 
+- 不以 WPR/WPAExport 作为 MVP 3 主采集链路；WPAExport 只作为后续诊断、比对或 fallback 方向。
+- 不生成全局 `timeline.jsonl`；按时间排序视图由读取方按 timestamp 合并 category 文件。
 - 不在此阶段承诺完整高层 Timeline/Evidence schema。
 - 不把推断、归因或根因结论写进工具事实 JSONL。
 
 Acceptance:
 
-- [ ] CLI 能启动一次受控 recording，停止后登记 trace artifact。
-- [ ] 可从 artifact 机械提取关键 ETW event records。
+- [ ] CLI 能以 launch 或 attach 启动一次受控 recording，并能 stop/status/cancel。
+- [ ] 停止后可定位 `recording.json`、过滤后 `trace.etl` 和 category event JSONL。
+- [ ] 可从 artifact 机械读取 process / thread / image / file / registry / network event records。
+- [ ] failed / canceled / killed recording operation 有可审计状态，已产生 artifact 不被丢弃。
 - [ ] 事件材料可被 Markdown 报告引用。
 
 ## MVP 4: IDA Bridge

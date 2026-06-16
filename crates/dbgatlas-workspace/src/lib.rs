@@ -14,6 +14,7 @@ pub const ARTIFACTS_LOG: &str = "artifacts/artifacts.jsonl";
 pub const OPERATIONS_LOG: &str = "artifacts/operations.jsonl";
 pub const COMMAND_AUDIT_LOG: &str = "artifacts/command_audit.jsonl";
 pub const SESSIONS_DIR: &str = "sessions";
+pub const RECORDINGS_DIR: &str = "recordings";
 pub const PROFILES_DIR: &str = "profiles";
 pub const TTD_RECORDINGS_DIR: &str = "ttd_recordings";
 pub const REVERSE_SESSIONS_DIR: &str = "reverse_sessions";
@@ -117,7 +118,7 @@ pub struct WorkspaceFacts {
     pub command_audit: Vec<CommandAuditRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStatus {
     #[serde(alias = "Running")]
@@ -220,6 +221,13 @@ impl Workspace {
 
     pub fn ensure_session_artifact_dir(&self, session_id: &Id) -> Result<PathBuf, WorkspaceError> {
         self.ensure_domain_artifact_dir(SESSIONS_DIR, session_id)
+    }
+
+    pub fn ensure_recording_artifact_dir(
+        &self,
+        recording_id: &Id,
+    ) -> Result<PathBuf, WorkspaceError> {
+        self.ensure_domain_artifact_dir(RECORDINGS_DIR, recording_id)
     }
 
     pub fn ensure_profile_artifact_dir(&self, profile_id: &Id) -> Result<PathBuf, WorkspaceError> {
@@ -570,6 +578,12 @@ mod tests {
                 .ends_with(Path::new("artifacts").join("sessions").join("session-001"))
         );
         assert!(workspace.ensure_profile_artifact_dir(&id).unwrap().is_dir());
+        assert!(
+            workspace
+                .ensure_recording_artifact_dir(&id)
+                .unwrap()
+                .is_dir()
+        );
         assert!(
             workspace
                 .ensure_ttd_recording_artifact_dir(&id)

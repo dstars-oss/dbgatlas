@@ -14,7 +14,7 @@ analysis-workspace/
   inputs/
 ```
 
-`dbgatlas-workspace.json` 只记录 workspace identity、schema version 和创建信息，不记录本机 DbgEng、IDA、proxy 或 service install root。
+`dbgatlas-workspace.json` 只记录 workspace identity、schema version 和创建信息，不记录本机 DbgEng、ETW、IDA、proxy 或 service install root。
 
 对外 service API 不暴露 workspace 资源。调用方在创建 session 时传入 `project_root`，service 内部固定使用 `<project_root>/dbgatlas` 作为 analysis workspace；该目录是可见目录，不使用隐藏 `.dbgatlas`。
 
@@ -24,6 +24,8 @@ analysis-workspace/
 
 - `tools.dbgeng_dir`
 - `tools.symbol_path`
+- `tools.etw.adapter_dir` 或等价 native ETW adapter 位置（MVP 3 规划）
+- `tools.etw.default_presets`（MVP 3 规划）
 - `tools.ttd_dir`
 - `tools.ida.install_dir`
 - `tools.ida.python_executable`
@@ -50,6 +52,20 @@ SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe
 
 开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。
 
+## Recording Runtime
+
+MVP 3 的 recording runtime config 只保存本机工具和进程策略，不进入 analysis workspace manifest。ETW recording 默认通过受控 worker 调用 C++ ETW adapter，adapter 负责 ETW session、provider enable、实时消费、过滤和 flush。
+
+recording policy 的文档目标：
+
+- 默认使用内置 process/thread/image/file/registry/network presets。
+- 以 process tree 作为主要过滤维度。
+- 支持 launch process 和 attach pid 两种 target。
+- attach 不回填历史，只记录 `recording.start` 之后的事件。
+- WPR/WPAExport 不作为主采集链路，只作为未来诊断、比对或 fallback 方向。
+
+安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
+
 ## 校验原则
 
 - 本地服务默认只绑定 loopback。
@@ -58,4 +74,5 @@ SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe
 - 对外 HTTP API 需要 bearer token，并校验来自浏览器类客户端的 `Origin`。
 - path、symbol path、proxy value 拒绝控制字符。
 - proxy env 只允许明确支持的 key。
+- recording provider/preset/filter 配置不得写入 workspace manifest；workspace 只保存实际 recording metadata 和 artifact 引用。
 - 运行时配置可随机器变化；workspace artifacts 必须保持可审计和可复现。

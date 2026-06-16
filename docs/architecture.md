@@ -11,6 +11,7 @@ flowchart LR
   UI["future UI"] --> SVC
   SVC --> CORE["dbgatlas-core"]
   SVC --> DEBUG["dbgatlas-debug"]
+  SVC --> REC["recording domain\nplanned MVP 3"]
   SVC --> RUNTIME["dbgatlas-runtime"]
   SVC --> WS["dbgatlas-workspace\ninternal storage"]
   SVC --> WORKER["per-session worker"]
@@ -18,10 +19,16 @@ flowchart LR
   DEBUG --> AD
   DEBUG --> RUNTIME
   DEBUG --> WS
+  REC --> AD
+  REC --> RUNTIME
+  REC --> WS
   WORKER --> DBG
+  WORKER --> ETW["planned ETW adapter"]
   AD --> DBG["dbgatlas-dbgeng"]
   DBG --> SYS["dbgatlas-dbgeng-sys"]
   SYS --> DLL["native dbgeng DLL"]
+  ETW --> ETWSYS["planned etw sys/wrapper"]
+  ETWSYS --> ETWDLL["native ETW DLL"]
 ```
 
 `dbgatlas service` 是产品运行时控制面。CLI、MCP 和后续 UI 都是 service client，不是架构核心。对外 API 使用 JSON-RPC 2.0 over loopback HTTP，默认要求 bearer token；长操作可以通过 HTTP streaming/SSE 返回 progress/output，但取消必须显式请求，断线不等于取消。
@@ -32,7 +39,9 @@ flowchart LR
 
 `dbgatlas-debug` 代表 debug domain manager 边界：它定义 target、session、command 和状态模型，但 MVP 0.5 不接真实 DbgEng session。后续 DbgEng、TTD、dump eval 等能力由这个 domain manager 编排 runtime、workspace 和具体 adapter/native wrapper。
 
-`dbgatlas-runtime` 代表运行时安装与进程策略边界：DbgEng/TTD/IDA 安装位置、symbol path、proxy、child process policy 属于 runtime config，不写入 analysis workspace manifest。
+`recording` 代表事件录制 domain 边界。MVP 3 先以 ETW API 为主线，公开 `recording.*` lifecycle，内部通过受控 worker 和 C++ ETW adapter 采集、过滤并归档低层事件材料。recording 独立于 debug session；debug、reverse 和 report workflow 可以引用 recording artifact。
+
+`dbgatlas-runtime` 代表运行时安装与进程策略边界：DbgEng/ETW/TTD/IDA 安装位置、symbol path、proxy、child process policy 属于 runtime config，不写入 analysis workspace manifest。
 
 ## MVP 0 边界
 
@@ -47,7 +56,7 @@ flowchart LR
 
 - `dbgatlas-debug` 定义 debug target、session state、session skeleton、command eval 请求/结果和 manager trait；它不是 DbgEng wrapper。
 - `dbgatlas-runtime` 定义 runtime config、tool path、symbol path、proxy 和 process launch policy；它不拥有 workspace 数据。
-- `dbgatlas-workspace` 增加受控 artifact layout helper，例如 `artifacts/sessions/<session_id>/`、`artifacts/profiles/<profile_id>/`、`artifacts/ttd_recordings/<recording_id>/`、`artifacts/reverse_sessions/<session_id>/`。
+- `dbgatlas-workspace` 增加受控 artifact layout helper，例如 `artifacts/sessions/<session_id>/`、`artifacts/profiles/<profile_id>/`、`artifacts/ttd_recordings/<recording_id>/`、`artifacts/reverse_sessions/<session_id>/`。MVP 3 的 recording 目标布局统一到 `artifacts/recordings/<recording_id>/`，旧的 profiles/ttd_recordings 预留布局需要在实现阶段决定迁移、兼容或保留策略。
 - `dbgatlas-core` 保持短调用 `invoke()`，并预留长任务 operation 状态：`running`、`success`、`failed`、`canceled`。
 - 同一 debug session 的请求必须串行化；不同 session 后续可并发。状态不能依赖命令文本解析。
 - `dbgatlas-adapter` 不是 session/backend 总接口；session 生命周期、worker 管理和 domain 语义由 domain manager 承担。
@@ -58,7 +67,7 @@ flowchart LR
 - Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。安装时复制 `dbgatlas.exe`、`dbgatlas-worker.exe` 和 `dbgatlas_dbgeng.dll` 到 `%ProgramData%\DbgAtlas\bin\`，SCM 只指向该安装目录，避免锁住开发构建产物。
 - `debug.session.create` 接收 `project_root` 和 target，返回 `session_id`；后续 `debug.eval`、`debug.modules`、`debug.threads`、`debug.stack`、`debug.session.close` 和 `debug.session.kill` 只需要 `session_id`。
 - 外部 service API 表达产品能力；内部 worker protocol 表达低层执行、状态、artifact 写入清单和进程控制。两者分层演进。
-- Worker identity 按 capability policy 选择：debug 默认 user session，ETW/WPR 默认 LocalSystem，IDA 默认 user session。权限不足时返回结构化错误，不自动提权。
+- Worker identity 按 capability policy 选择：debug 默认 user session，ETW recording 默认 LocalSystem 或显式配置的受控 identity，IDA 默认 user session。权限不足时返回结构化错误，不自动提权。
 
 ## 预留但不创建
 
@@ -67,6 +76,8 @@ flowchart LR
 MVP 2 引入 `dbgatlas-mcp` 作为薄入口层。它通过现有 service/domain workflow 暴露 MCP tools，不复制 debug/session/recording 业务逻辑。
 
 IDA 路线优先走 `ida-pro-mcp` supervisor/worker 模式，由 DbgAtlas 作为入口和 artifact/operation 记录方编排；它不走 C++ native adapter 主线。
+
+ETW recording 路线优先走 C++ adapter + Rust safe wrapper：ETW session、provider enable、实时消费、预处理和过滤留在 native adapter 内部，Rust 侧负责安全封装、worker 编排、artifact 登记和 service/CLI/MCP 入口。WPR/WPAExport 不作为 MVP 3 主线。
 
 ## 不做的事
 

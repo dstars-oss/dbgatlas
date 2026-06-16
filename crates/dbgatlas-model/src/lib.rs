@@ -109,6 +109,7 @@ macro_rules! define_ref {
 
 define_ref!(TargetRef);
 define_ref!(SessionRef);
+define_ref!(RecordingRef);
 define_ref!(ArtifactRef);
 define_ref!(OperationRef);
 

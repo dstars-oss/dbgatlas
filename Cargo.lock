@@ -134,6 +134,7 @@ dependencies = [
  "clap",
  "dbgatlas-dbgeng",
  "dbgatlas-debug",
+ "dbgatlas-recording",
  "dbgatlas-service",
  "dbgatlas-workspace",
  "serde_json",
@@ -178,6 +179,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbgatlas-etw"
+version = "0.1.0"
+dependencies = [
+ "dbgatlas-etw-sys",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "dbgatlas-etw-sys"
+version = "0.1.0"
+
+[[package]]
 name = "dbgatlas-mcp"
 version = "0.1.0"
 dependencies = [
@@ -198,6 +213,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbgatlas-recording"
+version = "0.1.0"
+dependencies = [
+ "dbgatlas-model",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "dbgatlas-runtime"
 version = "0.1.0"
 dependencies = [
@@ -212,7 +236,9 @@ version = "0.1.0"
 dependencies = [
  "dbgatlas-dbgeng",
  "dbgatlas-debug",
+ "dbgatlas-etw",
  "dbgatlas-model",
+ "dbgatlas-recording",
  "dbgatlas-runtime",
  "dbgatlas-worker-protocol",
  "dbgatlas-workspace",

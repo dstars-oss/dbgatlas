@@ -2,7 +2,8 @@ use dbgatlas_debug::{
     AddSymbolsRequest, CreateDebugSession, DebugCommandResult, DebugMemoryResult,
     DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
 };
-use dbgatlas_model::{ArtifactRef, Id, OperationRef, SessionRef, Timestamp};
+use dbgatlas_model::{ArtifactRef, Id, OperationRef, RecordingRef, SessionRef, Timestamp};
+use dbgatlas_recording::{RecordingPreset, RecordingState, RecordingTarget, StartRecording};
 use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
     WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError, WorkerRequest, WorkerResponse,
@@ -35,10 +36,15 @@ pub const WINDOWS_SERVICE_DIR: &str = "DbgAtlas";
 pub const WINDOWS_SERVICE_BIN_DIR: &str = "bin";
 pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
 pub const WINDOWS_SERVICE_TOKEN_FILE: &str = "token";
-pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] =
-    &["dbgatlas.exe", "dbgatlas-worker.exe", "dbgatlas_dbgeng.dll"];
+pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
+    "dbgatlas.exe",
+    "dbgatlas-worker.exe",
+    "dbgatlas_dbgeng.dll",
+    "dbgatlas_etw.dll",
+];
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static RECORDING_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(1);
 static WORKER_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -99,6 +105,10 @@ pub enum ServiceError {
     SessionNotReusable(String),
     #[error("session is already terminal: {0}")]
     SessionAlreadyTerminal(String),
+    #[error("recording not found: {0}")]
+    RecordingNotFound(String),
+    #[error("recording is already terminal: {0}")]
+    RecordingAlreadyTerminal(String),
     #[error("operation not found: {0}")]
     OperationNotFound(String),
     #[error("operation is not running and cannot be canceled: {0}")]
@@ -117,6 +127,8 @@ pub enum ServiceError {
     ServiceIsRunning,
     #[error(transparent)]
     Debug(#[from] dbgatlas_debug::DebugError),
+    #[error(transparent)]
+    Recording(#[from] dbgatlas_recording::RecordingError),
     #[error(transparent)]
     Runtime(#[from] dbgatlas_runtime::RuntimeConfigError),
     #[error(transparent)]
@@ -168,6 +180,11 @@ impl ServiceHost {
             "debug.stack" => self.debug_builtin_eval(request.params, "debug.stack", "k"),
             "debug.add_symbols" => self.debug_add_symbols(request.params),
             "debug.read_memory" => self.debug_read_memory(request.params),
+            "recording.start" => self.recording_start(request.params),
+            "recording.status" => self.recording_status(request.params),
+            "recording.stop" => self.recording_stop(request.params),
+            "recording.cancel" => self.recording_cancel(request.params),
+            "recording.kill" => self.recording_kill(request.params),
             other => Err(ServiceError::Rpc(format!("unknown method `{other}`"))),
         };
 
@@ -275,6 +292,259 @@ impl ServiceHost {
             "operation_id": operation.operation_id,
             "events": operation.events,
         }))
+    }
+
+    fn recording_start(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: RecordingStartParams = parse_params(params)?;
+        let request = StartRecording {
+            target: params.target,
+            presets: params.presets,
+        }
+        .validate()?;
+        let recording_id = next_recording_ref();
+        let operation_id = next_operation_ref();
+        let workspace = ensure_project_workspace(&params.project_root)?;
+        let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
+        let now = Timestamp::now();
+        let trace_path = artifact_dir.join("trace.etl");
+        let trace_session_name = etw_session_name(&recording_id);
+        let trace_preset_flags = etw_preset_flags(&request.presets);
+        let (mut trace_session, trace_start_error) = match dbgatlas_etw::EtwFileSession::start(
+            &trace_session_name,
+            &trace_path,
+            trace_preset_flags,
+        ) {
+            Ok(session) => (Some(session), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let prepared_target = match prepare_recording_target(&request.target) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(session) = trace_session {
+                    let _ = session.stop();
+                }
+                return Err(error);
+            }
+        };
+        let root_pid = Some(prepared_target.root_pid());
+        let trace_consumer_error = match trace_session.as_mut() {
+            Some(session) => match session.start_realtime_consumer(
+                artifact_dir.join("events"),
+                trace_preset_flags,
+                root_pid,
+            ) {
+                Ok(()) => None,
+                Err(error) => Some(error.to_string()),
+            },
+            None => None,
+        };
+        if let Err(error) = prepared_target.resume() {
+            if let Some(session) = trace_session {
+                let _ = session.stop();
+            }
+            return Err(error);
+        }
+        let trace_session = Arc::new(Mutex::new(trace_session));
+        let writes = write_recording_start_artifacts(
+            &artifact_dir,
+            &recording_id,
+            &operation_id,
+            &request,
+            root_pid,
+            now,
+            trace_start_error.as_deref(),
+            trace_consumer_error.as_deref(),
+        )?;
+        let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
+
+        workspace.append_operation(&OperationRecord {
+            operation_id: operation_id.clone(),
+            adapter_id: "service".to_string(),
+            capability: "recording.start".to_string(),
+            status: OperationStatus::Success,
+            created_at: now,
+            summary: "recording started".to_string(),
+            artifacts: registered.artifacts.clone(),
+            raw_output: registered.raw_output.clone(),
+        })?;
+
+        let recording = ManagedRecording {
+            recording_id: recording_id.clone(),
+            project_root: params.project_root,
+            internal_workspace_root: workspace.root().to_path_buf(),
+            artifact_dir,
+            target: request.target,
+            presets: request.presets,
+            root_pid,
+            state: RecordingState::Running,
+            created_at: now,
+            updated_at: now,
+            last_operation: Some(operation_id.clone()),
+            artifacts: registered.artifacts.clone(),
+            trace_session,
+            trace_start_error,
+            trace_consumer_error,
+        };
+
+        let mut operation = ServiceOperation::success(
+            operation_id.clone(),
+            "recording.start",
+            None,
+            "recording started",
+        );
+        operation.artifacts = registered.artifacts.clone();
+        operation.raw_output = registered.raw_output.clone();
+
+        let mut state = self.lock_state()?;
+        state
+            .operations
+            .insert(operation_id.id.as_str().to_string(), operation);
+        state
+            .recordings
+            .insert(recording_id.id.as_str().to_string(), recording.clone());
+
+        Ok(recording_response(
+            &recording,
+            &operation_id,
+            OperationStatus::Success,
+            &registered,
+        )?)
+    }
+
+    fn recording_status(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: RecordingParams = parse_params(params)?;
+        let state = self.lock_state()?;
+        let recording = state
+            .recordings
+            .get(params.recording_id.id.as_str())
+            .cloned()
+            .ok_or_else(|| ServiceError::RecordingNotFound(params.recording_id.to_string()))?;
+        Ok(recording_status_response(&recording))
+    }
+
+    fn recording_stop(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        self.finish_recording(params, RecordingFinishMode::Stop)
+    }
+
+    fn recording_cancel(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        self.finish_recording(params, RecordingFinishMode::Cancel)
+    }
+
+    fn recording_kill(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        self.finish_recording(params, RecordingFinishMode::Kill)
+    }
+
+    fn finish_recording(
+        &self,
+        params: Option<Value>,
+        mode: RecordingFinishMode,
+    ) -> Result<Value, ServiceError> {
+        let params: RecordingParams = parse_params(params)?;
+        let mut recording = {
+            let mut state = self.lock_state()?;
+            let recording = state
+                .recordings
+                .get_mut(params.recording_id.id.as_str())
+                .ok_or_else(|| ServiceError::RecordingNotFound(params.recording_id.to_string()))?;
+            if recording.state != RecordingState::Running {
+                return Err(ServiceError::RecordingAlreadyTerminal(
+                    recording.recording_id.to_string(),
+                ));
+            }
+            recording.state = RecordingState::Stopping;
+            recording.updated_at = Timestamp::now();
+            recording.clone()
+        };
+
+        let operation_id = next_operation_ref();
+        let workspace = Workspace::open(&recording.internal_workspace_root)?;
+        let now = Timestamp::now();
+        let (state, status, capability, summary, writes) = match mode {
+            RecordingFinishMode::Stop => {
+                let writes = write_recording_stop_artifacts(
+                    &recording.artifact_dir,
+                    &recording,
+                    &operation_id,
+                    now,
+                )?;
+                (
+                    RecordingState::Stopped,
+                    OperationStatus::Success,
+                    "recording.stop",
+                    "recording stopped",
+                    writes,
+                )
+            }
+            RecordingFinishMode::Cancel => (
+                RecordingState::Canceled,
+                OperationStatus::Canceled,
+                "recording.cancel",
+                "recording canceled",
+                write_recording_terminal_trace_artifacts(
+                    &recording.artifact_dir,
+                    &recording,
+                    &operation_id,
+                    now,
+                    "canceled",
+                )?,
+            ),
+            RecordingFinishMode::Kill => (
+                RecordingState::Killed,
+                OperationStatus::Failed,
+                "recording.kill",
+                "recording killed",
+                write_recording_terminal_trace_artifacts(
+                    &recording.artifact_dir,
+                    &recording,
+                    &operation_id,
+                    now,
+                    "killed",
+                )?,
+            ),
+        };
+        let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
+        workspace.append_operation(&OperationRecord {
+            operation_id: operation_id.clone(),
+            adapter_id: "service".to_string(),
+            capability: capability.to_string(),
+            status: status.clone(),
+            created_at: now,
+            summary: summary.to_string(),
+            artifacts: registered.artifacts.clone(),
+            raw_output: registered.raw_output.clone(),
+        })?;
+
+        recording.state = state;
+        recording.updated_at = now;
+        recording.last_operation = Some(operation_id.clone());
+        recording.artifacts = registered.artifacts.clone();
+
+        let mut operation =
+            ServiceOperation::success(operation_id.clone(), capability, None, summary);
+        if status == OperationStatus::Canceled {
+            operation.status = ServiceOperationStatus::Canceled;
+        }
+        if status == OperationStatus::Failed {
+            operation.status = ServiceOperationStatus::Failed;
+        }
+        operation.artifacts = registered.artifacts.clone();
+        operation.raw_output = registered.raw_output.clone();
+
+        let mut state = self.lock_state()?;
+        state.recordings.insert(
+            recording.recording_id.id.as_str().to_string(),
+            recording.clone(),
+        );
+        state
+            .operations
+            .insert(operation_id.id.as_str().to_string(), operation);
+
+        Ok(recording_response(
+            &recording,
+            &operation_id,
+            status,
+            &registered,
+        )?)
     }
 
     fn debug_session_create(&self, params: Option<Value>) -> Result<Value, ServiceError> {
@@ -1175,7 +1445,28 @@ impl ServiceHost {
 #[derive(Default)]
 struct ServiceState {
     sessions: HashMap<String, ManagedSession>,
+    recordings: HashMap<String, ManagedRecording>,
     operations: HashMap<String, ServiceOperation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ManagedRecording {
+    recording_id: RecordingRef,
+    project_root: PathBuf,
+    internal_workspace_root: PathBuf,
+    artifact_dir: PathBuf,
+    target: RecordingTarget,
+    presets: Vec<RecordingPreset>,
+    root_pid: Option<u32>,
+    state: RecordingState,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    last_operation: Option<OperationRef>,
+    artifacts: Vec<ArtifactRef>,
+    #[serde(skip)]
+    trace_session: Arc<Mutex<Option<dbgatlas_etw::EtwFileSession>>>,
+    trace_start_error: Option<String>,
+    trace_consumer_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1464,6 +1755,516 @@ impl Drop for ProcessWorkerSupervisor {
             }
         }
     }
+}
+
+fn write_recording_start_artifacts(
+    artifact_dir: &Path,
+    recording_id: &RecordingRef,
+    operation_id: &OperationRef,
+    request: &StartRecording,
+    root_pid: Option<u32>,
+    now: Timestamp,
+    trace_start_error: Option<&str>,
+    trace_consumer_error: Option<&str>,
+) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
+    fs::create_dir_all(artifact_dir.join("events"))?;
+    let metadata = recording_metadata_json(
+        recording_id,
+        operation_id,
+        &request.target,
+        &request.presets,
+        root_pid,
+        "running",
+        now,
+        None,
+        etw_adapter_metadata(),
+        trace_start_error,
+        trace_consumer_error,
+    );
+    let metadata_snapshot = format!("metadata/{}.json", operation_id.id.as_str());
+    let metadata_len = write_json_file(&artifact_dir.join(&metadata_snapshot), &metadata)?;
+    let _ = write_json_file(&artifact_dir.join("recording.json"), &metadata)?;
+    let process_event = normalized_recording_event(
+        recording_id,
+        operation_id,
+        "process",
+        "recording_started",
+        root_pid,
+        now,
+    );
+    let process_len = write_jsonl_file(
+        &artifact_dir.join("events").join("process.jsonl"),
+        &process_event,
+    )?;
+
+    Ok(vec![
+        WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, &metadata_snapshot),
+            kind: "recording.metadata".to_string(),
+            byte_len: metadata_len,
+            description: Some("recording start metadata snapshot".to_string()),
+        },
+        WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, "events/process.jsonl"),
+            kind: "recording.events.process".to_string(),
+            byte_len: process_len,
+            description: Some("recording process events".to_string()),
+        },
+    ])
+}
+
+fn write_recording_stop_artifacts(
+    artifact_dir: &Path,
+    recording: &ManagedRecording,
+    operation_id: &OperationRef,
+    now: Timestamp,
+) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
+    fs::create_dir_all(artifact_dir.join("events"))?;
+    let mut writes = write_recording_terminal_trace_artifacts(
+        artifact_dir,
+        recording,
+        operation_id,
+        now,
+        "stopped",
+    )?;
+
+    for preset in &recording.presets {
+        let suffix = format!("events/{}", preset.artifact_file_name());
+        let path = artifact_dir.join(&suffix);
+        if path.is_file() && fs::metadata(&path)?.len() > 0 {
+            continue;
+        }
+        let event = normalized_recording_event(
+            &recording.recording_id,
+            operation_id,
+            preset.category(),
+            "recording_stopped",
+            recording.root_pid,
+            now,
+        );
+        let byte_len = write_jsonl_file(&path, &event)?;
+        writes.push(WorkerArtifactWrite {
+            relative_path: recording_relative_path(&recording.recording_id, &suffix),
+            kind: format!("recording.events.{}", preset.category()),
+            byte_len,
+            description: Some(format!("recording {} events", preset.category())),
+        });
+    }
+
+    Ok(writes)
+}
+
+struct TraceArtifactOutcome {
+    byte_len: u64,
+    description: String,
+}
+
+fn write_recording_terminal_trace_artifacts(
+    artifact_dir: &Path,
+    recording: &ManagedRecording,
+    operation_id: &OperationRef,
+    now: Timestamp,
+    state: &str,
+) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
+    let mut writes =
+        write_recording_terminal_metadata(artifact_dir, recording, operation_id, now, state)?;
+    let trace_path = artifact_dir.join("trace.etl");
+    let trace_outcome = write_recording_trace_artifact(recording, &trace_path)?;
+    writes.push(WorkerArtifactWrite {
+        relative_path: recording_relative_path(&recording.recording_id, "trace.etl"),
+        kind: "recording.trace".to_string(),
+        byte_len: trace_outcome.byte_len,
+        description: Some(trace_outcome.description),
+    });
+    register_recording_event_writes(artifact_dir, recording, &mut writes)?;
+    Ok(writes)
+}
+
+fn write_recording_trace_artifact(
+    recording: &ManagedRecording,
+    trace_path: &Path,
+) -> Result<TraceArtifactOutcome, ServiceError> {
+    let mut session = recording
+        .trace_session
+        .lock()
+        .map_err(|_| ServiceError::Worker("recording trace session lock poisoned".to_string()))?;
+    if let Some(session) = session.take() {
+        match session.stop() {
+            Ok(()) => {
+                let filter_note = filter_recording_trace(recording, trace_path);
+                let extraction_note = extract_recording_events(recording, trace_path);
+                let byte_len = fs::metadata(trace_path)?.len();
+                return Ok(TraceArtifactOutcome {
+                    byte_len,
+                    description: format!("ETW file trace; {filter_note}; {extraction_note}"),
+                });
+            }
+            Err(error) => {
+                let trace_text =
+                    format!("DbgAtlas fallback trace artifact.\nNative ETW stop failed: {error}\n");
+                fs::write(trace_path, trace_text.as_bytes())?;
+                return Ok(TraceArtifactOutcome {
+                    byte_len: trace_text.len() as u64,
+                    description: "fallback trace artifact with native ETW stop error".to_string(),
+                });
+            }
+        }
+    }
+
+    let reason = recording
+        .trace_start_error
+        .as_deref()
+        .unwrap_or("native ETW trace session was not started");
+    let trace_text =
+        format!("DbgAtlas fallback trace artifact.\nNative ETW start failed: {reason}\n");
+    fs::write(trace_path, trace_text.as_bytes())?;
+    Ok(TraceArtifactOutcome {
+        byte_len: trace_text.len() as u64,
+        description: "fallback trace artifact with native ETW start error".to_string(),
+    })
+}
+
+fn register_recording_event_writes(
+    artifact_dir: &Path,
+    recording: &ManagedRecording,
+    writes: &mut Vec<WorkerArtifactWrite>,
+) -> Result<(), ServiceError> {
+    for preset in &recording.presets {
+        let suffix = format!("events/{}", preset.artifact_file_name());
+        let path = artifact_dir.join(&suffix);
+        let size_after = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if size_after == 0 {
+            continue;
+        }
+        writes.push(WorkerArtifactWrite {
+            relative_path: recording_relative_path(&recording.recording_id, &suffix),
+            kind: format!("recording.events.{}", preset.category()),
+            byte_len: size_after,
+            description: Some(format!("recording {} events", preset.category())),
+        });
+    }
+    Ok(())
+}
+
+fn filter_recording_trace(recording: &ManagedRecording, trace_path: &Path) -> String {
+    let filtered_path = recording.artifact_dir.join("trace.filtered.etl");
+    match dbgatlas_etw::filter_trace_file(
+        trace_path,
+        &filtered_path,
+        etw_preset_flags(&recording.presets),
+        recording.root_pid,
+    ) {
+        Ok(result) => match fs::copy(&filtered_path, trace_path) {
+            Ok(_) => {
+                let _ = fs::remove_file(&filtered_path);
+                format!(
+                    "filtered ETL wrote {} events across {} categories and skipped {}",
+                    result.events_written, result.files_written, result.skipped_events
+                )
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&filtered_path);
+                format!("filtered ETL copy failed: {error}")
+            }
+        },
+        Err(error) => {
+            let _ = fs::remove_file(&filtered_path);
+            format!("filtered ETL fallback to original trace: {error}")
+        }
+    }
+}
+
+fn extract_recording_events(recording: &ManagedRecording, trace_path: &Path) -> String {
+    let events_dir = recording.artifact_dir.join("events");
+    match dbgatlas_etw::extract_file_events(
+        trace_path,
+        &events_dir,
+        etw_preset_flags(&recording.presets),
+        recording.root_pid,
+    ) {
+        Ok(result) => format!(
+            "event extraction wrote {} events to {} files and skipped {}",
+            result.events_written, result.files_written, result.skipped_events
+        ),
+        Err(error) => format!("event extraction skipped: {error}"),
+    }
+}
+
+fn write_recording_terminal_metadata(
+    artifact_dir: &Path,
+    recording: &ManagedRecording,
+    operation_id: &OperationRef,
+    now: Timestamp,
+    state: &str,
+) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
+    let metadata = recording_metadata_json(
+        &recording.recording_id,
+        operation_id,
+        &recording.target,
+        &recording.presets,
+        recording.root_pid,
+        state,
+        recording.created_at,
+        Some(now),
+        etw_adapter_metadata(),
+        recording.trace_start_error.as_deref(),
+        recording.trace_consumer_error.as_deref(),
+    );
+    let metadata_len = write_json_file(&artifact_dir.join("recording.json"), &metadata)?;
+    Ok(vec![WorkerArtifactWrite {
+        relative_path: recording_relative_path(&recording.recording_id, "recording.json"),
+        kind: "recording.metadata".to_string(),
+        byte_len: metadata_len,
+        description: Some("recording metadata".to_string()),
+    }])
+}
+
+fn recording_metadata_json(
+    recording_id: &RecordingRef,
+    operation_id: &OperationRef,
+    target: &RecordingTarget,
+    presets: &[RecordingPreset],
+    root_pid: Option<u32>,
+    state: &str,
+    started_at: Timestamp,
+    stopped_at: Option<Timestamp>,
+    adapter: EtwAdapterMetadata,
+    trace_start_error: Option<&str>,
+    trace_consumer_error: Option<&str>,
+) -> Value {
+    json!({
+        "recording_id": recording_id,
+        "target": target,
+        "mode": target.mode(),
+        "root_pid": root_pid,
+        "process_tree_filter": {
+            "root_pid": root_pid,
+            "mode": "process_tree"
+        },
+        "presets": presets,
+        "etw_preset_flags": etw_preset_flags(presets).bits(),
+        "state": state,
+        "started_at": started_at,
+        "stopped_at": stopped_at,
+        "adapter": adapter,
+        "trace_start_error": trace_start_error,
+        "trace_consumer_error": trace_consumer_error,
+        "operation_id": operation_id,
+    })
+}
+
+fn etw_preset_flags(presets: &[RecordingPreset]) -> dbgatlas_etw::EtwPresetFlags {
+    let mut flags = dbgatlas_etw::EtwPresetFlags::empty();
+    for preset in presets {
+        flags.insert(match preset {
+            RecordingPreset::Process => dbgatlas_etw::EtwPresetFlags::PROCESS,
+            RecordingPreset::Thread => dbgatlas_etw::EtwPresetFlags::THREAD,
+            RecordingPreset::Image => dbgatlas_etw::EtwPresetFlags::IMAGE,
+            RecordingPreset::File => dbgatlas_etw::EtwPresetFlags::FILE,
+            RecordingPreset::Registry => dbgatlas_etw::EtwPresetFlags::REGISTRY,
+            RecordingPreset::Network => dbgatlas_etw::EtwPresetFlags::NETWORK,
+        });
+    }
+    flags
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EtwAdapterMetadata {
+    id: &'static str,
+    native: &'static str,
+    version: Option<dbgatlas_etw::NativeVersion>,
+    capabilities: Option<dbgatlas_etw::EtwCapabilities>,
+    note: String,
+}
+
+fn etw_adapter_metadata() -> EtwAdapterMetadata {
+    match dbgatlas_etw::adapter_info() {
+        Ok(info) => EtwAdapterMetadata {
+            id: "etw",
+            native: "available",
+            version: Some(info.version),
+            capabilities: Some(info.capabilities),
+            note:
+                "native ETW adapter ABI is available; file trace and ETL event extraction are wired"
+                    .to_string(),
+        },
+        Err(error) => EtwAdapterMetadata {
+            id: "etw",
+            native: "unavailable",
+            version: None,
+            capabilities: None,
+            note: error.to_string(),
+        },
+    }
+}
+
+fn normalized_recording_event(
+    recording_id: &RecordingRef,
+    operation_id: &OperationRef,
+    category: &str,
+    event_type: &str,
+    pid: Option<u32>,
+    timestamp: Timestamp,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "recording_id": recording_id,
+        "timestamp": timestamp,
+        "category": category,
+        "event_type": event_type,
+        "pid": pid,
+        "tid": null,
+        "process": {
+            "pid": pid,
+            "parent_pid": null,
+            "image_path": null,
+            "command_line": null
+        },
+        "operation_id": operation_id,
+        "artifact_id": null,
+        "etw": {
+            "provider": "dbg_atlas_placeholder",
+            "event_id": 0,
+            "version": 1,
+            "opcode": event_type,
+            "keywords": [category],
+            "raw": {}
+        }
+    })
+}
+
+enum PreparedRecordingTarget {
+    Attach { pid: u32 },
+    Launch(PreparedLaunch),
+}
+
+impl PreparedRecordingTarget {
+    fn root_pid(&self) -> u32 {
+        match self {
+            Self::Attach { pid } => *pid,
+            Self::Launch(launch) => launch.pid(),
+        }
+    }
+
+    fn resume(self) -> Result<(), ServiceError> {
+        match self {
+            Self::Attach { .. } => Ok(()),
+            Self::Launch(launch) => launch.resume(),
+        }
+    }
+}
+
+fn prepare_recording_target(
+    target: &RecordingTarget,
+) -> Result<PreparedRecordingTarget, ServiceError> {
+    match target {
+        RecordingTarget::Launch { executable, args } => Ok(PreparedRecordingTarget::Launch(
+            PreparedLaunch::create(executable, args)?,
+        )),
+        RecordingTarget::Attach { pid } => Ok(PreparedRecordingTarget::Attach { pid: *pid }),
+    }
+}
+
+enum PreparedLaunch {
+    #[cfg(windows)]
+    Suspended(suspended_process::SuspendedProcess),
+    #[cfg(not(windows))]
+    Direct { pid: u32 },
+}
+
+impl PreparedLaunch {
+    fn create(executable: &Path, args: &[String]) -> Result<Self, ServiceError> {
+        #[cfg(windows)]
+        {
+            return suspended_process::SuspendedProcess::create(executable, args)
+                .map(Self::Suspended)
+                .map_err(ServiceError::Io);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let child = Command::new(executable).args(args).spawn()?;
+            Ok(Self::Direct { pid: child.id() })
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        match self {
+            #[cfg(windows)]
+            Self::Suspended(process) => process.pid(),
+            #[cfg(not(windows))]
+            Self::Direct { pid } => *pid,
+        }
+    }
+
+    fn resume(self) -> Result<(), ServiceError> {
+        match self {
+            #[cfg(windows)]
+            Self::Suspended(process) => process.resume().map_err(ServiceError::Io),
+            #[cfg(not(windows))]
+            Self::Direct { .. } => Ok(()),
+        }
+    }
+}
+
+fn write_json_file(path: &Path, value: &Value) -> Result<u64, ServiceError> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+fn write_jsonl_file(path: &Path, value: &Value) -> Result<u64, ServiceError> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+fn recording_response(
+    recording: &ManagedRecording,
+    operation_id: &OperationRef,
+    status: OperationStatus,
+    writes: &RegisteredWorkerWrites,
+) -> Result<Value, ServiceError> {
+    Ok(json!({
+        "recording_id": recording.recording_id,
+        "state": recording.state,
+        "target": recording.target,
+        "root_pid": recording.root_pid,
+        "presets": recording.presets,
+        "operation_id": operation_id,
+        "operation_status": status,
+        "artifact_refs": writes.artifacts,
+        "raw_output_ref": writes.raw_output,
+        "operation": {
+            "status": status,
+            "artifact_refs": writes.artifacts,
+            "raw_output_ref": writes.raw_output,
+        }
+    }))
+}
+
+fn recording_status_response(recording: &ManagedRecording) -> Value {
+    json!({
+        "recording_id": recording.recording_id,
+        "state": recording.state,
+        "target": recording.target,
+        "root_pid": recording.root_pid,
+        "presets": recording.presets,
+        "created_at": recording.created_at,
+        "updated_at": recording.updated_at,
+        "last_operation": recording.last_operation,
+        "artifact_refs": recording.artifacts,
+    })
 }
 
 fn mock_worker_response(request: WorkerRequest) -> Result<WorkerResponse, ServiceError> {
@@ -2811,6 +3612,19 @@ struct SessionParams {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct RecordingStartParams {
+    project_root: PathBuf,
+    target: RecordingTarget,
+    #[serde(default = "dbgatlas_recording::default_presets")]
+    presets: Vec<RecordingPreset>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RecordingParams {
+    recording_id: RecordingRef,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct DebugEvalParams {
     session_id: SessionRef,
     command: String,
@@ -2841,6 +3655,13 @@ struct OperationGetParams {
 #[derive(Clone, Copy)]
 enum SessionFinishMode {
     Close,
+    Kill,
+}
+
+#[derive(Clone, Copy)]
+enum RecordingFinishMode {
+    Stop,
+    Cancel,
     Kill,
 }
 
@@ -3098,11 +3919,33 @@ fn session_relative_path(session_id: &SessionRef, suffix: &str) -> PathBuf {
         .join(suffix)
 }
 
+fn recording_relative_path(recording_id: &RecordingRef, suffix: &str) -> PathBuf {
+    PathBuf::from("artifacts")
+        .join("recordings")
+        .join(recording_id.id.as_str())
+        .join(suffix)
+}
+
+fn etw_session_name(recording_id: &RecordingRef) -> String {
+    format!("DbgAtlas-{}", recording_id.id.as_str())
+}
+
 fn next_session_ref() -> SessionRef {
     let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     SessionRef::new(
         Id::new(format!("session-{}-{count}", Timestamp::now().unix_millis))
             .expect("generated session ids are valid"),
+    )
+}
+
+fn next_recording_ref() -> RecordingRef {
+    let count = RECORDING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    RecordingRef::new(
+        Id::new(format!(
+            "recording-{}-{count}",
+            Timestamp::now().unix_millis
+        ))
+        .expect("generated recording ids are valid"),
     )
 }
 
@@ -3131,6 +3974,8 @@ fn rpc_error_for(error: ServiceError) -> JsonRpcError {
         ServiceError::SessionNotReusable(_) => -32012,
         ServiceError::SessionAlreadyTerminal(_) => -32013,
         ServiceError::OperationNotCancelable(_) => -32014,
+        ServiceError::RecordingNotFound(_) => -32015,
+        ServiceError::RecordingAlreadyTerminal(_) => -32016,
         ServiceError::UnsupportedHttpMethod(_) => -32600,
         ServiceError::Rpc(_) | ServiceError::Json(_) => -32602,
         _ => -32000,
@@ -3277,6 +4122,131 @@ mod job {
         pub fn assign_child(&self, _child: &std::process::Child) -> Result<(), std::io::Error> {
             Ok(())
         }
+    }
+}
+
+#[cfg(windows)]
+mod suspended_process {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
+        TerminateProcess,
+    };
+
+    pub struct SuspendedProcess {
+        process_handle: HANDLE,
+        thread_handle: HANDLE,
+        pid: u32,
+        resumed: bool,
+    }
+
+    impl SuspendedProcess {
+        pub fn create(executable: &Path, args: &[String]) -> Result<Self, io::Error> {
+            let mut command_line = command_line(executable.as_os_str(), args);
+            let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+            startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                CreateProcessW(
+                    std::ptr::null(),
+                    command_line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    CREATE_SUSPENDED,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut startup,
+                    &mut process_info,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                process_handle: process_info.hProcess,
+                thread_handle: process_info.hThread,
+                pid: process_info.dwProcessId,
+                resumed: false,
+            })
+        }
+
+        pub fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        pub fn resume(mut self) -> Result<(), io::Error> {
+            let previous = unsafe { ResumeThread(self.thread_handle) };
+            if previous == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            self.resumed = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for SuspendedProcess {
+        fn drop(&mut self) {
+            if !self.resumed && !self.process_handle.is_null() {
+                unsafe {
+                    TerminateProcess(self.process_handle, 1);
+                }
+            }
+            unsafe {
+                if !self.thread_handle.is_null() {
+                    CloseHandle(self.thread_handle);
+                }
+                if !self.process_handle.is_null() {
+                    CloseHandle(self.process_handle);
+                }
+            }
+        }
+    }
+
+    fn command_line(executable: &OsStr, args: &[String]) -> Vec<u16> {
+        let mut parts = Vec::with_capacity(args.len() + 1);
+        parts.push(quote_arg(&executable.to_string_lossy()));
+        parts.extend(args.iter().map(|arg| quote_arg(arg)));
+        OsStr::new(&parts.join(" "))
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    fn quote_arg(arg: &str) -> String {
+        if arg.is_empty() {
+            return "\"\"".to_string();
+        }
+        let needs_quotes = arg
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'));
+        if !needs_quotes {
+            return arg.to_string();
+        }
+
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0;
+        for ch in arg.chars() {
+            if ch == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            if ch == '"' {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+            } else {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.push(ch);
+            }
+            backslashes = 0;
+        }
+        quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+        quoted.push('"');
+        quoted
     }
 }
 
@@ -3854,6 +4824,326 @@ mod tests {
     }
 
     #[test]
+    fn recording_start_creates_recording_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let response = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.as_ref().unwrap();
+        assert!(result.get("recording_id").is_some());
+        assert_eq!(result["state"], "running");
+        assert_eq!(result["operation_status"], "success");
+        assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 2);
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "recording.metadata")
+        );
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "recording.events.process")
+        );
+        let recording_id = result["recording_id"]["id"].as_str().unwrap();
+        assert!(
+            workspace
+                .root()
+                .join("artifacts")
+                .join("recordings")
+                .join(recording_id)
+                .join("recording.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn recording_start_records_selected_etw_preset_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "recording.start".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "type": "attach", "pid": 42 },
+                "presets": ["process", "network"]
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.as_ref().unwrap();
+        let recording_id = result["recording_id"]["id"].as_str().unwrap();
+        let recording_json = fs::read_to_string(
+            temp.path()
+                .join(INTERNAL_WORKSPACE_DIR)
+                .join("artifacts")
+                .join("recordings")
+                .join(recording_id)
+                .join("recording.json"),
+        )
+        .unwrap();
+        let metadata: Value = serde_json::from_str(&recording_json).unwrap();
+        let expected_flags = dbgatlas_etw::EtwPresetFlags::PROCESS.bits()
+            | dbgatlas_etw::EtwPresetFlags::NETWORK.bits();
+
+        assert_eq!(metadata["presets"], json!(["process", "network"]));
+        assert_eq!(metadata["etw_preset_flags"], json!(expected_flags));
+        assert!(metadata.get("trace_consumer_error").is_some());
+        assert_eq!(
+            metadata["adapter"]["capabilities"]["realtime_consume"],
+            true
+        );
+    }
+
+    #[test]
+    fn recording_launch_starts_target_and_records_root_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let (executable, args) = trivial_recording_command();
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "recording.start".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": {
+                    "type": "launch",
+                    "executable": executable,
+                    "args": args
+                },
+                "presets": ["process"]
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.as_ref().unwrap();
+        let root_pid = result["root_pid"].as_u64().unwrap();
+        assert!(root_pid > 0);
+
+        let recording_id = result["recording_id"]["id"].as_str().unwrap();
+        let recording_json = fs::read_to_string(
+            temp.path()
+                .join(INTERNAL_WORKSPACE_DIR)
+                .join("artifacts")
+                .join("recordings")
+                .join(recording_id)
+                .join("recording.json"),
+        )
+        .unwrap();
+        let metadata: Value = serde_json::from_str(&recording_json).unwrap();
+        assert_eq!(metadata["mode"], "launch");
+        assert_eq!(metadata["root_pid"], json!(root_pid));
+    }
+
+    #[test]
+    fn recording_stop_registers_trace_and_category_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let start = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+        let recording_id = start.result.unwrap()["recording_id"].clone();
+
+        let stop = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "recording.stop".to_string(),
+            params: Some(json!({ "recording_id": recording_id.clone() })),
+        });
+
+        assert!(stop.error.is_none(), "{:?}", stop.error);
+        let result = stop.result.as_ref().unwrap();
+        assert_eq!(result["state"], "stopped");
+        assert_eq!(result["operation_status"], "success");
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "recording.trace")
+        );
+        for category in ["process", "thread", "image", "file", "registry", "network"] {
+            let kind = format!("recording.events.{category}");
+            assert!(
+                artifacts.iter().any(|artifact| artifact.kind == kind),
+                "missing artifact kind {kind}"
+            );
+        }
+        let operations = workspace.list_operations().unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.capability == "recording.stop"
+                    && matches!(operation.status, OperationStatus::Success))
+        );
+        let recording_dir = workspace
+            .root()
+            .join("artifacts")
+            .join("recordings")
+            .join(recording_id["id"].as_str().unwrap());
+        assert!(recording_dir.join("trace.etl").is_file());
+        assert!(recording_dir.join("events").join("network.jsonl").is_file());
+        for category in ["process", "thread", "image", "file", "registry", "network"] {
+            let path = recording_dir
+                .join("events")
+                .join(format!("{category}.jsonl"));
+            let text = fs::read_to_string(path).unwrap();
+            let first_line = text.lines().next().unwrap();
+            let event: Value = serde_json::from_str(first_line).unwrap();
+            assert_eq!(event["schema_version"], 1);
+            assert_eq!(event["category"], category);
+            assert!(event.get("timestamp").is_some());
+            assert!(event.get("event_type").is_some());
+            assert!(event.get("pid").is_some());
+            assert!(event.get("tid").is_some());
+            assert!(event.get("process").is_some());
+            assert!(event.get("etw").is_some());
+        }
+    }
+
+    #[test]
+    fn recording_cancel_is_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let start = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+        let recording_id = start.result.unwrap()["recording_id"].clone();
+
+        let cancel = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "recording.cancel".to_string(),
+            params: Some(json!({ "recording_id": recording_id.clone() })),
+        });
+        assert!(cancel.error.is_none(), "{:?}", cancel.error);
+        assert_eq!(cancel.result.unwrap()["operation_status"], "canceled");
+
+        let stop = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "recording.stop".to_string(),
+            params: Some(json!({ "recording_id": recording_id })),
+        });
+        assert_eq!(stop.error.unwrap().code, -32016);
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let operations = workspace.list_operations().unwrap();
+        let cancel_operation = operations
+            .iter()
+            .find(|operation| operation.capability == "recording.cancel")
+            .unwrap();
+        assert!(matches!(cancel_operation.status, OperationStatus::Canceled));
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "recording.trace")
+        );
+    }
+
+    #[test]
+    fn recording_status_uses_public_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let start = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+        let recording_id = start.result.unwrap()["recording_id"].clone();
+
+        let status = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "recording.status".to_string(),
+            params: Some(json!({ "recording_id": recording_id })),
+        });
+
+        assert!(status.error.is_none(), "{:?}", status.error);
+        let result = status.result.unwrap();
+        assert_eq!(result["state"], "running");
+        assert!(result.get("artifact_refs").is_some());
+        assert!(result.get("last_operation").is_some());
+        assert!(result.get("project_root").is_none());
+        assert!(result.get("internal_workspace_root").is_none());
+        assert!(result.get("artifact_dir").is_none());
+    }
+
+    #[test]
+    fn repeated_recording_stop_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let start = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+        let recording_id = start.result.unwrap()["recording_id"].clone();
+
+        let first = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "recording.stop".to_string(),
+            params: Some(json!({ "recording_id": recording_id.clone() })),
+        });
+        assert!(first.error.is_none(), "{:?}", first.error);
+
+        let second = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "recording.stop".to_string(),
+            params: Some(json!({ "recording_id": recording_id })),
+        });
+        assert_eq!(second.error.unwrap().code, -32016);
+    }
+
+    #[test]
+    fn concurrent_recording_finish_allows_one_terminal_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let start = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+        let recording_id = start.result.unwrap()["recording_id"].clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let stop_host = host.clone();
+        let cancel_host = host.clone();
+        let stop_recording = recording_id.clone();
+        let cancel_recording = recording_id;
+        let stop_barrier = barrier.clone();
+        let cancel_barrier = barrier;
+
+        let stop = std::thread::spawn(move || {
+            stop_barrier.wait();
+            stop_host.handle_rpc(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(2)),
+                method: "recording.stop".to_string(),
+                params: Some(json!({ "recording_id": stop_recording })),
+            })
+        });
+        let cancel = std::thread::spawn(move || {
+            cancel_barrier.wait();
+            cancel_host.handle_rpc(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(3)),
+                method: "recording.cancel".to_string(),
+                params: Some(json!({ "recording_id": cancel_recording })),
+            })
+        });
+        let responses = vec![stop.join().unwrap(), cancel.join().unwrap()];
+        let success_count = responses
+            .iter()
+            .filter(|response| response.error.is_none())
+            .count();
+        let terminal_reject_count = responses
+            .iter()
+            .filter(|response| {
+                response
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.code == -32016)
+            })
+            .count();
+
+        assert_eq!(success_count, 1);
+        assert_eq!(terminal_reject_count, 1);
+    }
+
+    #[test]
     fn rejects_missing_bearer_token() {
         let request = HttpRequest {
             method: "POST".to_string(),
@@ -3898,6 +5188,34 @@ mod tests {
                 "target": { "kind": "dump", "path": "sample.dmp" }
             })),
         })
+    }
+
+    fn create_recording(host: &ServiceHost, project_root: &Path, target: Value) -> JsonRpcResponse {
+        host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "recording.start".to_string(),
+            params: Some(json!({
+                "project_root": project_root,
+                "target": target
+            })),
+        })
+    }
+
+    #[cfg(windows)]
+    fn trivial_recording_command() -> (PathBuf, Vec<String>) {
+        (
+            PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            vec!["/C".to_string(), "exit 0".to_string()],
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn trivial_recording_command() -> (PathBuf, Vec<String>) {
+        (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), "exit 0".to_string()],
+        )
     }
 
     fn eval_request(host: &ServiceHost, session_id: Value, command: &str) -> JsonRpcResponse {

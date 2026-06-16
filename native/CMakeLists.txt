@@ -18,8 +18,13 @@ add_library(dbgatlas_dbgeng SHARED
     adapters/dbgeng/dbgatlas_dbgeng.cpp
 )
 
+add_library(dbgatlas_etw SHARED
+    adapters/etw/dbgatlas_etw.cpp
+)
+
 if(WIN32)
     set_target_properties(dbgatlas_dbgeng PROPERTIES PREFIX "")
+    set_target_properties(dbgatlas_etw PROPERTIES PREFIX "")
 endif()
 
 target_compile_definitions(dbgatlas_dbgeng PRIVATE DBGATLAS_NATIVE_BUILD)
@@ -28,15 +33,27 @@ target_include_directories(dbgatlas_dbgeng
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+target_compile_definitions(dbgatlas_etw PRIVATE DBGATLAS_NATIVE_BUILD)
+target_include_directories(dbgatlas_etw
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
 if(WIN32)
     target_link_libraries(dbgatlas_dbgeng PRIVATE DbgEng)
+    target_link_libraries(dbgatlas_etw PRIVATE Advapi32 Tdh Ole32 OleAut32 uuid)
 endif()
 
 if(MSVC)
     set_property(TARGET dbgatlas_dbgeng PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
+    set_property(TARGET dbgatlas_etw PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
     target_compile_options(dbgatlas_dbgeng PRIVATE /W4 /permissive-)
+    target_compile_options(dbgatlas_etw PRIVATE /W4 /permissive-)
 else()
     target_compile_options(dbgatlas_dbgeng PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(dbgatlas_etw PRIVATE -Wall -Wextra -Wpedantic)
 endif()

@@ -1,6 +1,6 @@
 # Worker Model
 
-DbgAtlas 接入 DbgEng/ETW/IDA 等长生命周期能力前，先按 service-managed per-session worker 子进程设计。worker 是隔离边界和进程运行时细节，不是外部业务 API。
+DbgAtlas 接入 DbgEng/ETW/IDA 等长生命周期能力前，先按 service-managed worker 子进程设计。worker 是隔离边界和进程运行时细节，不是外部业务 API。
 
 ## 目标
 
@@ -44,9 +44,21 @@ stateDiagram-v2
 - cancel 是协作式优先；超时或卡死时主进程可以 kill worker。
 - worker protocol 使用内部 JSONL message；外部 service API 使用 JSON-RPC over HTTP。两者分层，不让 worker 细节泄漏到 CLI/MCP/UI。
 
+## Recording Worker
+
+MVP 3 增加 recording worker 概念，但仍不向外暴露 worker API。外部只看到 `recording.*` lifecycle 和 `recording_id`。
+
+- `recording.start` 创建受控 worker，分配 `artifacts/recordings/<recording_id>/`，并启动 ETW API 采集。
+- recording worker 持有 ETW session、provider enable 状态、process tree filter 和 category event writers。
+- launch target 由 recording worker 或其子进程策略启动，并以 root pid 建立 process tree filter。
+- attach target 从 `recording.start` 时间点开始观察，不回填历史事件。
+- stop 是协作式 flush：worker 停止 ETW session，写出过滤后 `trace.etl`、`recording.json` 和 `events/*.jsonl`。
+- cancel 优先协作式停止当前 operation；卡死或无法 flush 时 service 可以 kill worker，并登记 failed 或 canceled operation。
+- recording worker 的 artifact 写入清单由 service 登记到全局 `artifacts.jsonl` 和 `operations.jsonl`。
+
 ## 安全约束
 
 - worker 启动策略和 identity policy 来自 runtime config，不来自 analysis workspace manifest。
-- 安装态 service 默认 LocalSystem；debug/IDA 等 user-session worker 第一版使用 active interactive session，开发态 `service run` 使用当前用户。
+- 安装态 service 默认 LocalSystem；ETW recording 默认 LocalSystem 或 runtime config 指定的受控 identity；debug/IDA 等 user-session worker 第一版使用 active interactive session；开发态 `service run` 使用当前用户。
 - dump、trace、command transcript、memory output 都按敏感 artifact 处理。
 - worker 不把高层判断写成工具事实；解释层仍由人或模型在 `analysis/` 写 Markdown。

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dbgatlas_debug::DebugTarget;
+use dbgatlas_recording::RecordingTarget;
 use dbgatlas_service::{
     JsonRpcRequest, ServiceConfig, ServiceHost, WindowsServiceInstallOptions,
     WindowsServiceRunOptions, WindowsServiceUninstallOptions, install_windows_service,
@@ -36,6 +37,10 @@ enum Commands {
     Debug {
         #[command(subcommand)]
         command: DebugCommand,
+    },
+    Recording {
+        #[command(subcommand)]
+        command: RecordingCommand,
     },
     Native {
         #[command(subcommand)]
@@ -188,6 +193,52 @@ enum DebugSessionCommand {
 }
 
 #[derive(Subcommand)]
+enum RecordingCommand {
+    Start {
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        launch: Option<PathBuf>,
+        #[arg(long)]
+        attach: Option<u32>,
+        #[arg(last = true)]
+        args: Vec<String>,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Status {
+        recording_id: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Stop {
+        recording_id: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Cancel {
+        recording_id: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Kill {
+        recording_id: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum NativeCommand {
     Version,
 }
@@ -205,6 +256,7 @@ fn run() -> Result<()> {
         Commands::Workspace { command } => run_workspace(command, cli.json),
         Commands::Service { command } => run_service(command, cli.json),
         Commands::Debug { command } => run_debug(command, cli.json),
+        Commands::Recording { command } => run_recording(command, cli.json),
         Commands::Native { command } => run_native(command, cli.json),
     }
 }
@@ -438,6 +490,64 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
     }
 }
 
+fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
+    match command {
+        RecordingCommand::Start {
+            project_root,
+            launch,
+            attach,
+            args,
+            endpoint,
+            token,
+        } => {
+            let project_root = absolute_path(project_root)?;
+            let target = match (launch, attach) {
+                (Some(executable), None) => serde_json::to_value(RecordingTarget::Launch {
+                    executable: absolute_path(executable)?,
+                    args,
+                })?,
+                (None, Some(pid)) => {
+                    if !args.is_empty() {
+                        anyhow::bail!("--attach does not accept launch args");
+                    }
+                    serde_json::to_value(RecordingTarget::Attach { pid })?
+                }
+                _ => anyhow::bail!("provide exactly one of --launch or --attach"),
+            };
+            let response = call_service(
+                endpoint,
+                token,
+                "recording.start",
+                json!({
+                    "project_root": project_root,
+                    "target": target,
+                }),
+            )?;
+            print_rpc_response(response, as_json)
+        }
+        RecordingCommand::Status {
+            recording_id,
+            endpoint,
+            token,
+        } => call_recording_tool(endpoint, token, "recording.status", recording_id, as_json),
+        RecordingCommand::Stop {
+            recording_id,
+            endpoint,
+            token,
+        } => call_recording_tool(endpoint, token, "recording.stop", recording_id, as_json),
+        RecordingCommand::Cancel {
+            recording_id,
+            endpoint,
+            token,
+        } => call_recording_tool(endpoint, token, "recording.cancel", recording_id, as_json),
+        RecordingCommand::Kill {
+            recording_id,
+            endpoint,
+            token,
+        } => call_recording_tool(endpoint, token, "recording.kill", recording_id, as_json),
+    }
+}
+
 fn call_session_tool(
     endpoint: Option<SocketAddr>,
     token: Option<String>,
@@ -451,6 +561,24 @@ fn call_session_tool(
         method,
         json!({
             "session_id": { "id": session_id },
+        }),
+    )?;
+    print_rpc_response(response, as_json)
+}
+
+fn call_recording_tool(
+    endpoint: Option<SocketAddr>,
+    token: Option<String>,
+    method: &str,
+    recording_id: String,
+    as_json: bool,
+) -> Result<()> {
+    let response = call_service(
+        endpoint,
+        token,
+        method,
+        json!({
+            "recording_id": { "id": recording_id },
         }),
     )?;
     print_rpc_response(response, as_json)

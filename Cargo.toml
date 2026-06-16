@@ -6,8 +6,11 @@ members = [
     "crates/dbgatlas-debug",
     "crates/dbgatlas-dbgeng",
     "crates/dbgatlas-dbgeng-sys",
+    "crates/dbgatlas-etw",
+    "crates/dbgatlas-etw-sys",
     "crates/dbgatlas-model",
     "crates/dbgatlas-mcp",
+    "crates/dbgatlas-recording",
     "crates/dbgatlas-runtime",
     "crates/dbgatlas-service",
     "crates/dbgatlas-worker-protocol",
@@ -36,8 +39,11 @@ dbgatlas-core = { path = "crates/dbgatlas-core" }
 dbgatlas-debug = { path = "crates/dbgatlas-debug" }
 dbgatlas-dbgeng = { path = "crates/dbgatlas-dbgeng" }
 dbgatlas-dbgeng-sys = { path = "crates/dbgatlas-dbgeng-sys" }
+dbgatlas-etw = { path = "crates/dbgatlas-etw" }
+dbgatlas-etw-sys = { path = "crates/dbgatlas-etw-sys" }
 dbgatlas-model = { path = "crates/dbgatlas-model" }
 dbgatlas-mcp = { path = "crates/dbgatlas-mcp" }
+dbgatlas-recording = { path = "crates/dbgatlas-recording" }
 dbgatlas-runtime = { path = "crates/dbgatlas-runtime" }
 dbgatlas-service = { path = "crates/dbgatlas-service" }
 dbgatlas-worker-protocol = { path = "crates/dbgatlas-worker-protocol" }
