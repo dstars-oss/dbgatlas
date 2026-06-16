@@ -818,7 +818,7 @@ TraceProperties make_trace_properties(
     trace.properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(trace.storage.get());
     trace.properties->Wnode.BufferSize = static_cast<ULONG>(properties_size);
     trace.properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    trace.properties->LogFileMode = EVENT_TRACE_FILE_MODE_SEQUENTIAL;
+    trace.properties->LogFileMode = EVENT_TRACE_FILE_MODE_SEQUENTIAL | EVENT_TRACE_REAL_TIME_MODE;
     trace.properties->EnableFlags = kernel_enable_flags(preset_flags);
     trace.properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     trace.properties->LogFileNameOffset =
