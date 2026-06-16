@@ -68,14 +68,14 @@ Acceptance:
 
 Tasks:
 
-- [ ] 完善 artifact registry。
-- [ ] 完善 command audit log。
-- [ ] 稳定 CLI JSON 输出中的 operation status、artifact ref、raw output ref。
-- [ ] 让 `--json` 输出覆盖主要 CLI 命令。
-- [ ] 新增 `dbgatlas-mcp` 入口 crate。
-- [ ] MCP server 只调用 core / domain manager，不复制 debug/recording 业务逻辑。
-- [ ] 为 CLI 与 MCP 共享 workflow 增加测试。
-- [ ] 文档说明 AI agent 如何读取 workspace facts 并引用 artifact / operation id。
+- [x] 完善 artifact registry。
+- [x] 完善 command audit log。
+- [x] 稳定 CLI JSON 输出中的 operation status、artifact ref、raw output ref。
+- [x] 让 `--json` 输出覆盖主要 CLI 命令。
+- [x] 新增 `dbgatlas-mcp` 入口 crate。
+- [x] MCP server 只调用 core / domain manager，不复制 debug/recording 业务逻辑。
+- [x] 为 CLI 与 MCP 共享 workflow 增加测试。
+- [x] 文档说明 AI agent 如何读取 workspace facts 并引用 artifact / operation id。
 
 Non-goals:
 
@@ -84,9 +84,9 @@ Non-goals:
 
 Acceptance:
 
-- [ ] 同一 debug workflow 可通过 CLI 和 MCP 调用 core 完成。
-- [ ] AI agent 可以读取 workspace facts，引用 artifact 和 operation id 写 Markdown 报告。
-- [ ] 工具事实层与 Markdown 解释层边界清晰。
+- [x] 同一 debug workflow 可通过 CLI 和 MCP 调用 core 完成。
+- [x] AI agent 可以读取 workspace facts，引用 artifact 和 operation id 写 Markdown 报告。
+- [x] 工具事实层与 Markdown 解释层边界清晰。
 
 ## MVP 3: IDA Bridge
 

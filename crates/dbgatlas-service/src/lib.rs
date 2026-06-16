@@ -9,7 +9,8 @@ use dbgatlas_worker_protocol::{
     decode_jsonl, encode_jsonl,
 };
 use dbgatlas_workspace::{
-    ArtifactMetadata, OperationRecord, OperationStatus, Workspace, WorkspaceError,
+    ArtifactMetadata, CommandAuditRecord, OperationRecord, OperationStatus, Workspace,
+    WorkspaceError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -256,6 +257,7 @@ impl ServiceHost {
                 created_at: Timestamp::now(),
                 summary: "operation canceled".to_string(),
                 artifacts: operation.artifacts.clone(),
+                raw_output: operation.raw_output.clone(),
             })?;
         }
 
@@ -371,6 +373,7 @@ impl ServiceHost {
             created_at: now,
             summary: "debug session created".to_string(),
             artifacts: registered_start_writes.artifacts.clone(),
+            raw_output: registered_start_writes.raw_output.clone(),
         })?;
 
         let mut state = self.lock_state()?;
@@ -385,6 +388,14 @@ impl ServiceHost {
             "session_id": session_id,
             "state": session.state,
             "operation_id": operation_id,
+            "operation_status": "success",
+            "artifact_refs": registered_start_writes.artifacts,
+            "raw_output_ref": registered_start_writes.raw_output,
+            "operation": {
+                "status": "success",
+                "artifact_refs": registered_start_writes.artifacts,
+                "raw_output_ref": registered_start_writes.raw_output,
+            },
         }))
     }
 
@@ -475,6 +486,7 @@ impl ServiceHost {
             created_at: Timestamp::now(),
             summary: format!("{capability} complete"),
             artifacts: Vec::new(),
+            raw_output: None,
         })?;
 
         let operation = ServiceOperation::success(
@@ -495,6 +507,14 @@ impl ServiceHost {
             "session_id": session.session_id,
             "state": session.state,
             "operation_id": operation_id,
+            "operation_status": "success",
+            "artifact_refs": [],
+            "raw_output_ref": null,
+            "operation": {
+                "status": "success",
+                "artifact_refs": [],
+                "raw_output_ref": null,
+            },
         }))
     }
 
@@ -612,6 +632,7 @@ impl ServiceHost {
             &workspace,
             operation_id,
             capability,
+            request.command,
             worker_response,
         )
     }
@@ -626,6 +647,11 @@ impl ServiceHost {
 
         let operation_id = next_operation_ref();
         let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let audit_command = if request.reload {
+            format!(".sympath+ {}; .reload", request.symbol_path)
+        } else {
+            format!(".sympath+ {}", request.symbol_path)
+        };
         let operation = ServiceOperation::running(
             operation_id.clone(),
             "debug.add_symbols",
@@ -655,6 +681,7 @@ impl ServiceHost {
             &workspace,
             operation_id,
             "debug.add_symbols",
+            audit_command,
             worker_response,
         )
     }
@@ -669,6 +696,10 @@ impl ServiceHost {
 
         let operation_id = next_operation_ref();
         let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let audit_command = format!(
+            "read_memory address={} length={}",
+            request.address, request.length
+        );
         let operation = ServiceOperation::running(
             operation_id.clone(),
             "debug.read_memory",
@@ -693,7 +724,13 @@ impl ServiceHost {
             },
         );
 
-        self.finish_memory_worker_response(&session, &workspace, operation_id, worker_response)
+        self.finish_memory_worker_response(
+            &session,
+            &workspace,
+            operation_id,
+            audit_command,
+            worker_response,
+        )
     }
 
     fn finish_command_worker_response(
@@ -702,13 +739,13 @@ impl ServiceHost {
         workspace: &Workspace,
         operation_id: OperationRef,
         capability: &'static str,
+        audit_command: String,
         worker_response: Result<WorkerResponse, ServiceError>,
     ) -> Result<Value, ServiceError> {
         match worker_response {
             Ok(WorkerResponse::DebugCommand { mut result, writes }) => {
                 let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
                 result.operation_id = Some(operation_id.clone());
-                result.raw_output = registered.raw_output.clone();
                 let was_canceled =
                     self.operation_status(&operation_id)? == Some(ServiceOperationStatus::Canceled);
                 if was_canceled {
@@ -728,11 +765,24 @@ impl ServiceHost {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
                     capability: capability.to_string(),
-                    status: workspace_status,
+                    status: workspace_status.clone(),
                     created_at: Timestamp::now(),
                     summary: summary.clone(),
                     artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
                 })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: capability.to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status: workspace_status.clone(),
+                    artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
+                })?;
+                result.raw_output = registered.raw_output.clone();
+                let response = command_result_response(&result, workspace_status, &registered)?;
 
                 let mut state = self.lock_state()?;
                 if let Some(operation) = state.operations.get_mut(operation_id.id.as_str()) {
@@ -741,6 +791,7 @@ impl ServiceHost {
                     }
                     operation.summary = summary;
                     operation.artifacts = registered.artifacts;
+                    operation.raw_output = registered.raw_output;
                     operation.updated_at = Timestamp::now();
                     operation.events.push(ServiceEvent {
                         timestamp: Timestamp::now(),
@@ -753,7 +804,7 @@ impl ServiceHost {
                     session.updated_at = Timestamp::now();
                 }
 
-                Ok(serde_json::to_value(result)?)
+                Ok(response)
             }
             Ok(WorkerResponse::Failed {
                 code,
@@ -769,12 +820,24 @@ impl ServiceHost {
                     created_at: Timestamp::now(),
                     summary: message.clone(),
                     artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
+                })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: capability.to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status: OperationStatus::Failed,
+                    artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
                 })?;
                 self.finish_operation_in_memory(
                     &operation_id,
                     ServiceOperationStatus::Failed,
                     message.clone(),
                     registered.artifacts,
+                    registered.raw_output,
                 )?;
                 Err(ServiceError::Worker(format!("{code}: {message}")))
             }
@@ -788,30 +851,54 @@ impl ServiceHost {
                     created_at: Timestamp::now(),
                     summary: message.clone(),
                     artifacts: Vec::new(),
+                    raw_output: None,
+                })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: capability.to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status: OperationStatus::Failed,
+                    artifacts: Vec::new(),
+                    raw_output: None,
                 })?;
                 self.finish_operation_in_memory(
                     &operation_id,
                     ServiceOperationStatus::Failed,
                     message.clone(),
                     Vec::new(),
+                    None,
                 )?;
                 Err(ServiceError::Worker(message))
             }
             Err(error) => {
                 let was_canceled =
                     self.operation_status(&operation_id)? == Some(ServiceOperationStatus::Canceled);
+                let status = if was_canceled {
+                    OperationStatus::Canceled
+                } else {
+                    OperationStatus::Failed
+                };
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
                     capability: capability.to_string(),
-                    status: if was_canceled {
-                        OperationStatus::Canceled
-                    } else {
-                        OperationStatus::Failed
-                    },
+                    status: status.clone(),
                     created_at: Timestamp::now(),
                     summary: error.to_string(),
                     artifacts: Vec::new(),
+                    raw_output: None,
+                })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: capability.to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status,
+                    artifacts: Vec::new(),
+                    raw_output: None,
                 })?;
                 if !was_canceled {
                     self.finish_operation_in_memory(
@@ -819,6 +906,7 @@ impl ServiceHost {
                         ServiceOperationStatus::Failed,
                         error.to_string(),
                         Vec::new(),
+                        None,
                     )?;
                 }
                 Err(error)
@@ -831,6 +919,7 @@ impl ServiceHost {
         session: &ManagedSession,
         workspace: &Workspace,
         operation_id: OperationRef,
+        audit_command: String,
         worker_response: Result<WorkerResponse, ServiceError>,
     ) -> Result<Value, ServiceError> {
         match worker_response {
@@ -857,11 +946,23 @@ impl ServiceHost {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
                     capability: "debug.read_memory".to_string(),
-                    status,
+                    status: status.clone(),
                     created_at: Timestamp::now(),
                     summary: summary.to_string(),
                     artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
                 })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: "debug.read_memory".to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status: status.clone(),
+                    artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
+                })?;
+                let response = memory_result_response(&result, status, &registered)?;
 
                 let mut state = self.lock_state()?;
                 if let Some(operation) = state.operations.get_mut(operation_id.id.as_str()) {
@@ -870,6 +971,7 @@ impl ServiceHost {
                     }
                     operation.summary = summary.to_string();
                     operation.artifacts = registered.artifacts;
+                    operation.raw_output = registered.raw_output;
                     operation.updated_at = Timestamp::now();
                 }
                 if let Some(session) = state.sessions.get_mut(session.session_id.id.as_str()) {
@@ -877,7 +979,7 @@ impl ServiceHost {
                     session.updated_at = Timestamp::now();
                 }
 
-                Ok(serde_json::to_value(result)?)
+                Ok(response)
             }
             Ok(WorkerResponse::Failed {
                 code,
@@ -893,12 +995,24 @@ impl ServiceHost {
                     created_at: Timestamp::now(),
                     summary: message.clone(),
                     artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
+                })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: "debug.read_memory".to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status: OperationStatus::Failed,
+                    artifacts: registered.artifacts.clone(),
+                    raw_output: registered.raw_output.clone(),
                 })?;
                 self.finish_operation_in_memory(
                     &operation_id,
                     ServiceOperationStatus::Failed,
                     message.clone(),
                     registered.artifacts,
+                    registered.raw_output,
                 )?;
                 Err(ServiceError::Worker(format!("{code}: {message}")))
             }
@@ -912,30 +1026,54 @@ impl ServiceHost {
                     created_at: Timestamp::now(),
                     summary: message.clone(),
                     artifacts: Vec::new(),
+                    raw_output: None,
+                })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: "debug.read_memory".to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status: OperationStatus::Failed,
+                    artifacts: Vec::new(),
+                    raw_output: None,
                 })?;
                 self.finish_operation_in_memory(
                     &operation_id,
                     ServiceOperationStatus::Failed,
                     message.clone(),
                     Vec::new(),
+                    None,
                 )?;
                 Err(ServiceError::Worker(message))
             }
             Err(error) => {
                 let was_canceled =
                     self.operation_status(&operation_id)? == Some(ServiceOperationStatus::Canceled);
+                let status = if was_canceled {
+                    OperationStatus::Canceled
+                } else {
+                    OperationStatus::Failed
+                };
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
                     capability: "debug.read_memory".to_string(),
-                    status: if was_canceled {
-                        OperationStatus::Canceled
-                    } else {
-                        OperationStatus::Failed
-                    },
+                    status: status.clone(),
                     created_at: Timestamp::now(),
                     summary: error.to_string(),
                     artifacts: Vec::new(),
+                    raw_output: None,
+                })?;
+                workspace.append_command_audit(&CommandAuditRecord {
+                    operation_id: operation_id.clone(),
+                    session_id: Some(session.session_id.clone()),
+                    capability: "debug.read_memory".to_string(),
+                    command: audit_command,
+                    created_at: Timestamp::now(),
+                    status,
+                    artifacts: Vec::new(),
+                    raw_output: None,
                 })?;
                 if !was_canceled {
                     self.finish_operation_in_memory(
@@ -943,6 +1081,7 @@ impl ServiceHost {
                         ServiceOperationStatus::Failed,
                         error.to_string(),
                         Vec::new(),
+                        None,
                     )?;
                 }
                 Err(error)
@@ -973,12 +1112,14 @@ impl ServiceHost {
         status: ServiceOperationStatus,
         summary: String,
         artifacts: Vec<ArtifactRef>,
+        raw_output: Option<ArtifactRef>,
     ) -> Result<(), ServiceError> {
         let mut state = self.lock_state()?;
         if let Some(operation) = state.operations.get_mut(operation_id.id.as_str()) {
             operation.status = status;
             operation.summary = summary;
             operation.artifacts = artifacts;
+            operation.raw_output = raw_output;
             operation.updated_at = Timestamp::now();
         }
         Ok(())
@@ -1000,6 +1141,7 @@ impl ServiceHost {
             created_at: Timestamp::now(),
             summary: summary.clone(),
             artifacts: Vec::new(),
+            raw_output: None,
         })?;
 
         let mut operation = ServiceOperation::failed(
@@ -1502,6 +1644,61 @@ struct RegisteredWorkerWrites {
     memory: Option<ArtifactRef>,
 }
 
+fn command_result_response(
+    result: &DebugCommandResult,
+    status: OperationStatus,
+    writes: &RegisteredWorkerWrites,
+) -> Result<Value, ServiceError> {
+    let mut value = serde_json::to_value(result)?;
+    add_operation_refs(&mut value, status, writes, None)?;
+    Ok(value)
+}
+
+fn memory_result_response(
+    result: &DebugMemoryResult,
+    status: OperationStatus,
+    writes: &RegisteredWorkerWrites,
+) -> Result<Value, ServiceError> {
+    let mut value = serde_json::to_value(result)?;
+    add_operation_refs(&mut value, status, writes, writes.memory.as_ref())?;
+    Ok(value)
+}
+
+fn add_operation_refs(
+    value: &mut Value,
+    status: OperationStatus,
+    writes: &RegisteredWorkerWrites,
+    memory_ref: Option<&ArtifactRef>,
+) -> Result<(), ServiceError> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    object.insert(
+        "operation_status".to_string(),
+        serde_json::to_value(&status)?,
+    );
+    object.insert(
+        "artifact_refs".to_string(),
+        serde_json::to_value(&writes.artifacts)?,
+    );
+    object.insert(
+        "raw_output_ref".to_string(),
+        serde_json::to_value(&writes.raw_output)?,
+    );
+    object.insert(
+        "operation".to_string(),
+        json!({
+            "status": status,
+            "artifact_refs": writes.artifacts,
+            "raw_output_ref": writes.raw_output,
+        }),
+    );
+    if let Some(memory_ref) = memory_ref {
+        object.insert("memory_ref".to_string(), serde_json::to_value(memory_ref)?);
+    }
+    Ok(())
+}
+
 fn register_worker_writes(
     workspace: &Workspace,
     operation_id: &OperationRef,
@@ -1524,6 +1721,7 @@ fn register_worker_writes(
             relative_path: write.relative_path.clone(),
             created_at: Timestamp::now(),
             operation_id: Some(operation_id.clone()),
+            byte_len: Some(write.byte_len),
             description: write.description.clone(),
         })?;
         artifacts.push(artifact_id);
@@ -2465,6 +2663,8 @@ pub struct ServiceOperation {
     pub status: ServiceOperationStatus,
     pub summary: String,
     pub artifacts: Vec<ArtifactRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<ArtifactRef>,
     pub events: Vec<ServiceEvent>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -2485,6 +2685,7 @@ impl ServiceOperation {
             status: ServiceOperationStatus::Running,
             summary: summary.into(),
             artifacts: Vec::new(),
+            raw_output: None,
             events: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -2505,6 +2706,7 @@ impl ServiceOperation {
             status: ServiceOperationStatus::Success,
             summary: summary.into(),
             artifacts: Vec::new(),
+            raw_output: None,
             events: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -2525,6 +2727,7 @@ impl ServiceOperation {
             status: ServiceOperationStatus::Failed,
             summary: summary.into(),
             artifacts: Vec::new(),
+            raw_output: None,
             events: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -3232,6 +3435,9 @@ mod tests {
         let result = response.result.unwrap();
         assert!(result.get("session_id").is_some());
         assert!(result.get("worker_binding").is_none());
+        assert_eq!(result["operation_status"], "success");
+        assert!(result["artifact_refs"].as_array().unwrap().is_empty());
+        assert!(result["raw_output_ref"].is_null());
     }
 
     #[test]
@@ -3334,6 +3540,10 @@ mod tests {
             })),
         });
         assert!(eval.error.is_none(), "{:?}", eval.error);
+        let result = eval.result.as_ref().unwrap();
+        assert_eq!(result["operation_status"], "success");
+        assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 3);
+        assert!(result["raw_output_ref"].get("id").is_some());
 
         let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
         let artifacts = workspace.list_artifacts().unwrap();
@@ -3353,6 +3563,33 @@ mod tests {
             .find(|operation| operation.capability == "debug.eval")
             .unwrap();
         assert_eq!(eval_operation.artifacts.len(), 3);
+        assert!(eval_operation.raw_output.is_some());
+        assert_eq!(workspace.list_command_audit().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_eval_is_recorded_in_command_audit() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::new(Arc::new(FailingEvalSupervisor));
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let eval = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "debug.eval".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "command": ".echo fails"
+            })),
+        });
+        assert!(eval.error.is_some());
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let audit = workspace.list_command_audit().unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].command, ".echo fails");
+        assert!(matches!(audit[0].status, OperationStatus::Failed));
     }
 
     #[test]
@@ -3596,7 +3833,10 @@ mod tests {
         });
 
         assert!(response.error.is_none(), "{:?}", response.error);
-        assert_eq!(response.result.as_ref().unwrap()["bytes_read"], 16);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["bytes_read"], 16);
+        assert_eq!(result["operation_status"], "success");
+        assert!(result["memory_ref"].get("id").is_some());
 
         let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
         let artifacts = workspace.list_artifacts().unwrap();
@@ -3692,6 +3932,8 @@ mod tests {
 
     struct FailingStartSupervisor;
 
+    struct FailingEvalSupervisor;
+
     impl WorkerSupervisor for FailingStartSupervisor {
         fn create_debug_worker(
             &self,
@@ -3715,6 +3957,53 @@ mod tests {
                 WorkerRequest::StartDebugSession { .. } => Ok(WorkerResponse::Failed {
                     code: "start_failed".to_string(),
                     message: "native open failed".to_string(),
+                    writes: Vec::new(),
+                }),
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for FailingEvalSupervisor {
+        fn create_debug_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Ok(WorkerHandle {
+                worker_id: Id::new(format!("test-worker-{}", request.session_id.id.as_str()))
+                    .unwrap(),
+                session_id: request.session_id,
+                pipe_name: "test-pipe".to_string(),
+                identity: WorkerIdentity::CurrentUserDevMode,
+            })
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::EvalDebugCommand { .. } => Ok(WorkerResponse::Failed {
+                    code: "eval_failed".to_string(),
+                    message: "mock eval failed".to_string(),
                     writes: Vec::new(),
                 }),
                 other => mock_worker_response(other),

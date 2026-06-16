@@ -12,6 +12,7 @@ pub const ANALYSIS_DIR: &str = "analysis";
 pub const INPUTS_DIR: &str = "inputs";
 pub const ARTIFACTS_LOG: &str = "artifacts/artifacts.jsonl";
 pub const OPERATIONS_LOG: &str = "artifacts/operations.jsonl";
+pub const COMMAND_AUDIT_LOG: &str = "artifacts/command_audit.jsonl";
 pub const SESSIONS_DIR: &str = "sessions";
 pub const PROFILES_DIR: &str = "profiles";
 pub const TTD_RECORDINGS_DIR: &str = "ttd_recordings";
@@ -78,6 +79,8 @@ pub struct ArtifactMetadata {
     pub relative_path: PathBuf,
     pub created_at: Timestamp,
     pub operation_id: Option<OperationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
     pub description: Option<String>,
 }
 
@@ -90,6 +93,28 @@ pub struct OperationRecord {
     pub created_at: Timestamp,
     pub summary: String,
     pub artifacts: Vec<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<ArtifactRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommandAuditRecord {
+    pub operation_id: OperationRef,
+    pub session_id: Option<dbgatlas_model::SessionRef>,
+    pub capability: String,
+    pub command: String,
+    pub created_at: Timestamp,
+    pub status: OperationStatus,
+    pub artifacts: Vec<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<ArtifactRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceFacts {
+    pub artifacts: Vec<ArtifactMetadata>,
+    pub operations: Vec<OperationRecord>,
+    pub command_audit: Vec<CommandAuditRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,12 +260,49 @@ impl Workspace {
         read_json_lines(self.root.join(ARTIFACTS_LOG))
     }
 
+    pub fn get_artifact(
+        &self,
+        artifact_id: &ArtifactRef,
+    ) -> Result<Option<ArtifactMetadata>, WorkspaceError> {
+        Ok(self
+            .list_artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.artifact_id == *artifact_id))
+    }
+
     pub fn append_operation(&self, record: &OperationRecord) -> Result<(), WorkspaceError> {
         append_json_line(self.root.join(OPERATIONS_LOG), record)
     }
 
     pub fn list_operations(&self) -> Result<Vec<OperationRecord>, WorkspaceError> {
         read_json_lines(self.root.join(OPERATIONS_LOG))
+    }
+
+    pub fn get_operation(
+        &self,
+        operation_id: &OperationRef,
+    ) -> Result<Option<OperationRecord>, WorkspaceError> {
+        Ok(self
+            .list_operations()?
+            .into_iter()
+            .rev()
+            .find(|operation| operation.operation_id == *operation_id))
+    }
+
+    pub fn append_command_audit(&self, record: &CommandAuditRecord) -> Result<(), WorkspaceError> {
+        append_json_line(self.root.join(COMMAND_AUDIT_LOG), record)
+    }
+
+    pub fn list_command_audit(&self) -> Result<Vec<CommandAuditRecord>, WorkspaceError> {
+        read_json_lines(self.root.join(COMMAND_AUDIT_LOG))
+    }
+
+    pub fn facts(&self) -> Result<WorkspaceFacts, WorkspaceError> {
+        Ok(WorkspaceFacts {
+            artifacts: self.list_artifacts()?,
+            operations: self.list_operations()?,
+            command_audit: self.list_command_audit()?,
+        })
     }
 
     pub fn append_event_jsonl<T: Serialize>(
@@ -479,6 +541,7 @@ mod tests {
                 .to_path_buf(),
             created_at: Timestamp::now(),
             operation_id: None,
+            byte_len: Some(0),
             description: Some("raw command output".to_string()),
         };
 
@@ -486,6 +549,11 @@ mod tests {
         let artifacts = workspace.list_artifacts().unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].artifact_id.id.as_str(), "artifact-001");
+        let artifact = workspace
+            .get_artifact(&ArtifactRef::new(Id::new("artifact-001").unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifact.kind, "raw");
     }
 
     #[test]
@@ -602,6 +670,33 @@ mod tests {
         let operations = workspace.list_operations().unwrap();
         assert_eq!(operations.len(), 1);
         assert!(matches!(operations[0].status, OperationStatus::Success));
+        assert!(operations[0].raw_output.is_none());
+    }
+
+    #[test]
+    fn command_audit_round_trips_and_facts_include_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace =
+            Workspace::init(temp.path().join("case-audit"), Default::default()).unwrap();
+        let operation_id = OperationRef::new(Id::new("op-audit").unwrap());
+        let record = CommandAuditRecord {
+            operation_id: operation_id.clone(),
+            session_id: None,
+            capability: "debug.eval".to_string(),
+            command: ".echo hello".to_string(),
+            created_at: Timestamp::now(),
+            status: OperationStatus::Success,
+            artifacts: Vec::new(),
+            raw_output: None,
+        };
+
+        workspace.append_command_audit(&record).unwrap();
+
+        let audit = workspace.list_command_audit().unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].operation_id, operation_id);
+        let facts = workspace.facts().unwrap();
+        assert_eq!(facts.command_audit.len(), 1);
     }
 
     #[cfg(windows)]

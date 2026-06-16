@@ -137,6 +137,7 @@ dependencies = [
  "dbgatlas-service",
  "dbgatlas-workspace",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -173,6 +174,18 @@ dependencies = [
  "dbgatlas-model",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "dbgatlas-mcp"
+version = "0.1.0"
+dependencies = [
+ "dbgatlas-service",
+ "dbgatlas-workspace",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

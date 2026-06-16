@@ -55,6 +55,34 @@ runtime config 不属于 manifest。DbgEng/TTD/IDA 安装路径、symbol path、
 
 `artifacts/artifacts.jsonl` 记录 artifact id、kind、相对路径、创建时间、可选 operation id 和描述。
 
-`artifacts/operations.jsonl` 记录 operation id、adapter id、capability、状态、摘要和产生的 artifact 引用。operation 状态包括 `running`、`success`、`failed`、`canceled`。
+`artifacts/operations.jsonl` 记录 operation id、adapter id、capability、状态、摘要、产生的 artifact 引用和可选 raw output 引用。operation 状态包括 `running`、`success`、`failed`、`canceled`。
+
+`artifacts/command_audit.jsonl` 记录面向 agent 和人工审计的命令级索引，包括 operation id、可选 session id、capability、命令文本、状态、artifact 引用和 raw output 引用。它是低层工具事实，不存放推断、归因或结论。
 
 `analysis/` 仍只放 Markdown 解释层。高层语义、假设、结论和报告不应写入 `artifacts.jsonl` 或 `operations.jsonl` 伪装成工具事实。
+
+## Agent Facts
+
+AI agent 应优先通过稳定入口读取 workspace facts，而不是猜测目录结构：
+
+```powershell
+dbgatlas --json workspace facts <project_root>\dbgatlas
+```
+
+MCP 场景下使用 `workspace.facts` tool，参数为内部 workspace 路径：
+
+```json
+{
+  "path": "D:\\case-001\\dbgatlas"
+}
+```
+
+debug workflow 的 CLI 和 MCP 调用都返回同一组引用字段：
+
+- `operation_id`：本次操作的稳定引用。
+- `operation_status`：`success`、`failed`、`canceled` 或 `running`。
+- `artifact_refs`：本次操作产生或更新的 artifact id 列表。
+- `raw_output_ref`：若存在，指向原始工具输出 artifact。
+- `memory_ref`：`debug.read_memory` 成功时指向 memory artifact。
+
+报告或分析笔记应在 `analysis/` 下用 Markdown 引用这些 id，例如 `operation_id=op-...`、`artifact_id=artifact-...`、`session_id=session-...`。解释、假设和结论只写入 Markdown，不写入 facts JSONL。

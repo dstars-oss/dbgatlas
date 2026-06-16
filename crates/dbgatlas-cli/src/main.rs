@@ -53,6 +53,9 @@ enum WorkspaceCommand {
     Info {
         path: PathBuf,
     },
+    Facts {
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -238,6 +241,18 @@ fn run_workspace(command: WorkspaceCommand, as_json: bool) -> Result<()> {
                 println!("artifacts dir: {}", info.has_artifacts_dir);
                 println!("analysis dir: {}", info.has_analysis_dir);
                 println!("inputs dir: {}", info.has_inputs_dir);
+            }
+        }
+        WorkspaceCommand::Facts { path } => {
+            let workspace = Workspace::open(path)?;
+            let facts = workspace.facts()?;
+            if as_json {
+                print_json(serde_json::to_value(&facts)?)?;
+            } else {
+                println!("workspace: {}", workspace.root().display());
+                println!("artifacts: {}", facts.artifacts.len());
+                println!("operations: {}", facts.operations.len());
+                println!("command audit records: {}", facts.command_audit.len());
             }
         }
     }

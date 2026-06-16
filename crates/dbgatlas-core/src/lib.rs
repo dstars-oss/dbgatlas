@@ -221,6 +221,7 @@ impl Core {
             relative_path: artifact.relative_path.clone(),
             created_at: Timestamp::now(),
             operation_id: Some(operation_id),
+            byte_len: None,
             description: artifact.description.clone(),
         };
         self.workspace.register_artifact(&metadata)?;
@@ -244,6 +245,7 @@ impl Core {
             created_at: Timestamp::now(),
             summary,
             artifacts,
+            raw_output: None,
         };
         self.workspace.append_operation(&record)?;
         Ok(())
