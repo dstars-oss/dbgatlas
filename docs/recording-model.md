@@ -95,6 +95,8 @@ artifacts/
 
 `events/*.jsonl` 是按 category 拆分的低层事件流。每一行是一条规范化事件，同时保留 ETW provenance 和 raw payload，方便后续审计和重新解释。
 
+若 native ETW session 启动或停止失败，`trace.etl` 可以退化为文本 fallback artifact，用于保留失败原因和审计线索。此时 `recording.json` 必须显式记录 `trace.valid_etl=false` 和 `trace.fallback_reason`，读取方不能把该文件当作可由 ETW/WPA/DbgEng 打开的有效 ETL。真实 ETL artifact 应记录 `trace.valid_etl=true`。
+
 现有 `artifacts/profiles/` 与 `artifacts/ttd_recordings/` 是早期预留布局。MVP 3 文档目标以 `artifacts/recordings/<recording_id>/` 为准；实现阶段需要决定旧 helper 的迁移、兼容或保留策略。
 
 ## Event Schema
@@ -149,7 +151,11 @@ Category-specific normalized fields:
 - `registry.jsonl`：key/value create/open/query/set/delete、key path、value name、value type、status。
 - `network.jsonl`：connect/accept/send/receive/close、protocol、local/remote endpoint、status、byte count。
 
-ETW recording 默认尽力为写入 `events/*.jsonl` 的事件补充调用堆栈。`stack.frames` 是字符串数组，顺序保持 ETW/debug 消费语义，不额外排序或反转。frame 格式优先使用 `module_name+0xoffset`；模块归属仅来自 ETW image load/unload 事件维护的进程内模块表，不读取 PDB、不调用 DIA/DbgHelp、不解析函数名。若某帧找不到模块归属，则保留原始指令地址字符串。若系统、provider 或事件本身不提供 stack extended data，则省略 `stack` 字段，并在 `recording.json` 的 `stack_trace` metadata 中以 best-effort 状态和 warnings 说明降级。
+FileIo 事件使用 best-effort completion 合并。read/write/create 等 begin-side 事件如果带有 `IrpPtr`，adapter 可暂存该事件，直到匹配的 `OpEnd` 到达后把 `nt_status`、`extra_info` 和 `completion_*` 字段合并到同一行；未匹配的 `OpEnd` 不作为独立低层事实输出，而是在 `recording.json.event_extraction` 的 counters/warnings 中说明。文件路径优先来自事件直接 path 字段；若缺失，可通过 `FileObject` / `FileKey` 路径缓存恢复，并在 `file.path_source` 中标明来源。无法恢复时保留 raw pointer 字段，不推断 path。
+
+ETW recording 默认尽力为写入 `events/*.jsonl` 的事件补充调用堆栈。`stack.frames` 是字符串数组，输出为常见调用栈展示顺序：当前执行点/叶子帧在前，调用者在后。frame 格式优先使用 `module_name+0xoffset`；模块归属仅来自 ETW image load/unload 事件维护的进程内模块表，不读取 PDB、不调用 DIA/DbgHelp、不解析函数名。若某帧找不到模块归属，则保留原始指令地址字符串。adapter 可以同时使用 event extended data 和独立 StackWalk event，并按 timestamp、pid、thread 做 best-effort 关联；未匹配或因 bounded cache 丢弃的 StackWalk 只进入 `recording.json.event_extraction` counters/warnings。若系统、provider 或事件本身不提供 stack 数据，则省略 `stack` 字段，并在 `recording.json` 的 `stack_trace` / `event_extraction` metadata 中以 best-effort 状态和 warnings 说明降级。
+
+`recording.json.event_extraction` 记录 adapter 对过滤后 ETL 抽取 JSONL 的质量摘要，包括写出事件数、文件数、跳过数、stack frame resolved/unresolved 计数、FileIo path resolved/unresolved 计数、OpEnd 匹配/未匹配计数、未完成 IO、IRP 复用和 dropped StackWalk。它是审计和降级说明，不替代 `events/*.jsonl` 中的事实行。
 
 字段缺失时应显式省略或使用 `null`，不能用推断值伪装为 ETW 事实。解释、假设和结论仍写入 `analysis/` Markdown。
 

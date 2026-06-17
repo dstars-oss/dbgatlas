@@ -28,6 +28,16 @@ pub struct EtwEventExtractionResult {
     pub events_written: u32,
     pub files_written: u32,
     pub skipped_events: u32,
+    pub stack_frames_total: u32,
+    pub stack_frames_resolved: u32,
+    pub stack_frames_unresolved: u32,
+    pub file_path_resolved: u32,
+    pub file_path_unresolved: u32,
+    pub matched_op_end: u32,
+    pub unmatched_op_end: u32,
+    pub incomplete_io: u32,
+    pub reused_irp: u32,
+    pub dropped_stack_walk: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,11 +327,7 @@ pub fn extract_file_events(
         )
     };
     status_to_result(status)?;
-    Ok(EtwEventExtractionResult {
-        events_written: result.events_written,
-        files_written: result.files_written,
-        skipped_events: result.skipped_events,
-    })
+    Ok(extraction_result_from_native(result))
 }
 
 #[cfg(not(windows))]
@@ -360,11 +366,7 @@ pub fn filter_trace_file(
         )
     };
     status_to_result(status)?;
-    Ok(EtwEventExtractionResult {
-        events_written: result.events_written,
-        files_written: result.files_written,
-        skipped_events: result.skipped_events,
-    })
+    Ok(extraction_result_from_native(result))
 }
 
 #[cfg(not(windows))]
@@ -403,6 +405,26 @@ fn stack_trace_status_from_native(
         provider_stack_warning_count: status.provider_stack_warning_count,
         kernel_stack_enabled: status.kernel_stack_enabled != 0,
         kernel_stack_warning_count: status.kernel_stack_warning_count,
+    }
+}
+
+fn extraction_result_from_native(
+    result: dbgatlas_etw_sys::DA_EtwEventExtractionResult,
+) -> EtwEventExtractionResult {
+    EtwEventExtractionResult {
+        events_written: result.events_written,
+        files_written: result.files_written,
+        skipped_events: result.skipped_events,
+        stack_frames_total: result.stack_frames_total,
+        stack_frames_resolved: result.stack_frames_resolved,
+        stack_frames_unresolved: result.stack_frames_unresolved,
+        file_path_resolved: result.file_path_resolved,
+        file_path_unresolved: result.file_path_unresolved,
+        matched_op_end: result.matched_op_end,
+        unmatched_op_end: result.unmatched_op_end,
+        incomplete_io: result.incomplete_io,
+        reused_irp: result.reused_irp,
+        dropped_stack_walk: result.dropped_stack_walk,
     }
 }
 
@@ -515,6 +537,31 @@ mod tests {
         assert_eq!(status.provider_stack_warning_count, 2);
         assert!(!status.kernel_stack_enabled);
         assert_eq!(status.kernel_stack_warning_count, 1);
+    }
+
+    #[test]
+    fn decodes_extended_extraction_result() {
+        let result = extraction_result_from_native(dbgatlas_etw_sys::DA_EtwEventExtractionResult {
+            events_written: 1,
+            files_written: 2,
+            skipped_events: 3,
+            stack_frames_total: 4,
+            stack_frames_resolved: 5,
+            stack_frames_unresolved: 6,
+            file_path_resolved: 7,
+            file_path_unresolved: 8,
+            matched_op_end: 9,
+            unmatched_op_end: 10,
+            incomplete_io: 11,
+            reused_irp: 12,
+            dropped_stack_walk: 13,
+            ..Default::default()
+        });
+        assert_eq!(result.events_written, 1);
+        assert_eq!(result.stack_frames_total, 4);
+        assert_eq!(result.file_path_resolved, 7);
+        assert_eq!(result.matched_op_end, 9);
+        assert_eq!(result.dropped_stack_walk, 13);
     }
 
     #[test]

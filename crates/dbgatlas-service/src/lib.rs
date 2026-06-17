@@ -1797,6 +1797,7 @@ fn write_recording_start_artifacts(
         trace_consumer_error,
         trace_stack_status,
         trace_stack_status_error,
+        None,
     );
     let metadata_snapshot = format!("metadata/{}.json", operation_id.id.as_str());
     let metadata_len = write_json_file(&artifact_dir.join(&metadata_snapshot), &metadata)?;
@@ -1874,6 +1875,17 @@ fn write_recording_stop_artifacts(
 struct TraceArtifactOutcome {
     byte_len: u64,
     description: String,
+    valid_etl: bool,
+    fallback_reason: Option<String>,
+    filter: EtwProcessingOutcome,
+    extraction: EtwProcessingOutcome,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EtwProcessingOutcome {
+    description: String,
+    result: Option<dbgatlas_etw::EtwEventExtractionResult>,
+    error: Option<String>,
 }
 
 fn write_recording_terminal_trace_artifacts(
@@ -1883,10 +1895,16 @@ fn write_recording_terminal_trace_artifacts(
     now: Timestamp,
     state: &str,
 ) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
-    let mut writes =
-        write_recording_terminal_metadata(artifact_dir, recording, operation_id, now, state)?;
     let trace_path = artifact_dir.join("trace.etl");
     let trace_outcome = write_recording_trace_artifact(recording, &trace_path)?;
+    let mut writes = write_recording_terminal_metadata(
+        artifact_dir,
+        recording,
+        operation_id,
+        now,
+        state,
+        Some(&trace_outcome),
+    )?;
     writes.push(WorkerArtifactWrite {
         relative_path: recording_relative_path(&recording.recording_id, "trace.etl"),
         kind: "recording.trace".to_string(),
@@ -1911,9 +1929,17 @@ fn write_recording_trace_artifact(
                 let filter_note = filter_recording_trace(recording, trace_path);
                 let extraction_note = extract_recording_events(recording, trace_path);
                 let byte_len = fs::metadata(trace_path)?.len();
+                let description = format!(
+                    "ETW file trace; {}; {}",
+                    filter_note.description, extraction_note.description
+                );
                 return Ok(TraceArtifactOutcome {
                     byte_len,
-                    description: format!("ETW file trace; {filter_note}; {extraction_note}"),
+                    description,
+                    valid_etl: true,
+                    fallback_reason: None,
+                    filter: filter_note,
+                    extraction: extraction_note,
                 });
             }
             Err(error) => {
@@ -1923,6 +1949,10 @@ fn write_recording_trace_artifact(
                 return Ok(TraceArtifactOutcome {
                     byte_len: trace_text.len() as u64,
                     description: "fallback trace artifact with native ETW stop error".to_string(),
+                    valid_etl: false,
+                    fallback_reason: Some(format!("Native ETW stop failed: {error}")),
+                    filter: EtwProcessingOutcome::default(),
+                    extraction: EtwProcessingOutcome::default(),
                 });
             }
         }
@@ -1938,6 +1968,10 @@ fn write_recording_trace_artifact(
     Ok(TraceArtifactOutcome {
         byte_len: trace_text.len() as u64,
         description: "fallback trace artifact with native ETW start error".to_string(),
+        valid_etl: false,
+        fallback_reason: Some(format!("Native ETW start failed: {reason}")),
+        filter: EtwProcessingOutcome::default(),
+        extraction: EtwProcessingOutcome::default(),
     })
 }
 
@@ -1965,7 +1999,7 @@ fn register_recording_event_writes(
     Ok(())
 }
 
-fn filter_recording_trace(recording: &ManagedRecording, trace_path: &Path) -> String {
+fn filter_recording_trace(recording: &ManagedRecording, trace_path: &Path) -> EtwProcessingOutcome {
     let filtered_path = recording.artifact_dir.join("trace.filtered.etl");
     match dbgatlas_etw::filter_trace_file(
         trace_path,
@@ -1976,24 +2010,39 @@ fn filter_recording_trace(recording: &ManagedRecording, trace_path: &Path) -> St
         Ok(result) => match fs::copy(&filtered_path, trace_path) {
             Ok(_) => {
                 let _ = fs::remove_file(&filtered_path);
-                format!(
-                    "filtered ETL wrote {} events across {} categories and skipped {}",
-                    result.events_written, result.files_written, result.skipped_events
-                )
+                EtwProcessingOutcome {
+                    description: format!(
+                        "filtered ETL wrote {} events across {} categories and skipped {}",
+                        result.events_written, result.files_written, result.skipped_events
+                    ),
+                    result: Some(result),
+                    error: None,
+                }
             }
             Err(error) => {
                 let _ = fs::remove_file(&filtered_path);
-                format!("filtered ETL copy failed: {error}")
+                EtwProcessingOutcome {
+                    description: format!("filtered ETL copy failed: {error}"),
+                    result: Some(result),
+                    error: Some(error.to_string()),
+                }
             }
         },
         Err(error) => {
             let _ = fs::remove_file(&filtered_path);
-            format!("filtered ETL fallback to original trace: {error}")
+            EtwProcessingOutcome {
+                description: format!("filtered ETL fallback to original trace: {error}"),
+                result: None,
+                error: Some(error.to_string()),
+            }
         }
     }
 }
 
-fn extract_recording_events(recording: &ManagedRecording, trace_path: &Path) -> String {
+fn extract_recording_events(
+    recording: &ManagedRecording,
+    trace_path: &Path,
+) -> EtwProcessingOutcome {
     let events_dir = recording.artifact_dir.join("events");
     match dbgatlas_etw::extract_file_events(
         trace_path,
@@ -2001,11 +2050,19 @@ fn extract_recording_events(recording: &ManagedRecording, trace_path: &Path) -> 
         etw_preset_flags(&recording.presets),
         recording.root_pid,
     ) {
-        Ok(result) => format!(
-            "event extraction wrote {} events to {} files and skipped {}",
-            result.events_written, result.files_written, result.skipped_events
-        ),
-        Err(error) => format!("event extraction skipped: {error}"),
+        Ok(result) => EtwProcessingOutcome {
+            description: format!(
+                "event extraction wrote {} events to {} files and skipped {}",
+                result.events_written, result.files_written, result.skipped_events
+            ),
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => EtwProcessingOutcome {
+            description: format!("event extraction skipped: {error}"),
+            result: None,
+            error: Some(error.to_string()),
+        },
     }
 }
 
@@ -2015,6 +2072,7 @@ fn write_recording_terminal_metadata(
     operation_id: &OperationRef,
     now: Timestamp,
     state: &str,
+    trace_outcome: Option<&TraceArtifactOutcome>,
 ) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
     let metadata = recording_metadata_json(
         &recording.recording_id,
@@ -2030,6 +2088,7 @@ fn write_recording_terminal_metadata(
         recording.trace_consumer_error.as_deref(),
         recording.trace_stack_status,
         recording.trace_stack_status_error.as_deref(),
+        trace_outcome,
     );
     let metadata_len = write_json_file(&artifact_dir.join("recording.json"), &metadata)?;
     Ok(vec![WorkerArtifactWrite {
@@ -2054,6 +2113,7 @@ fn recording_metadata_json(
     trace_consumer_error: Option<&str>,
     trace_stack_status: Option<dbgatlas_etw::EtwStackTraceStatus>,
     trace_stack_status_error: Option<&str>,
+    trace_outcome: Option<&TraceArtifactOutcome>,
 ) -> Value {
     json!({
         "recording_id": recording_id,
@@ -2077,8 +2137,77 @@ fn recording_metadata_json(
         ),
         "trace_start_error": trace_start_error,
         "trace_consumer_error": trace_consumer_error,
+        "trace": trace_metadata(trace_outcome),
+        "event_extraction": event_extraction_metadata(trace_outcome),
         "operation_id": operation_id,
     })
+}
+
+fn trace_metadata(outcome: Option<&TraceArtifactOutcome>) -> Value {
+    match outcome {
+        Some(outcome) => json!({
+            "valid_etl": outcome.valid_etl,
+            "fallback_reason": outcome.fallback_reason,
+            "filter": processing_metadata(&outcome.filter),
+        }),
+        None => json!({
+            "valid_etl": null,
+            "fallback_reason": null,
+            "filter": null,
+        }),
+    }
+}
+
+fn event_extraction_metadata(outcome: Option<&TraceArtifactOutcome>) -> Value {
+    match outcome {
+        Some(outcome) => processing_metadata(&outcome.extraction),
+        None => json!(null),
+    }
+}
+
+fn processing_metadata(outcome: &EtwProcessingOutcome) -> Value {
+    let warnings = outcome.result.map(extraction_warnings).unwrap_or_default();
+    json!({
+        "description": outcome.description,
+        "error": outcome.error,
+        "result": outcome.result,
+        "warnings": warnings,
+    })
+}
+
+fn extraction_warnings(result: dbgatlas_etw::EtwEventExtractionResult) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if result.unmatched_op_end > 0 {
+        warnings.push(format!(
+            "native ETW file_io saw {} OpEnd events without a matching begin event",
+            result.unmatched_op_end
+        ));
+    }
+    if result.reused_irp > 0 {
+        warnings.push(format!(
+            "native ETW file_io saw {} reused IrpPtr values before a matching OpEnd",
+            result.reused_irp
+        ));
+    }
+    if result.incomplete_io > 0 {
+        warnings.push(format!(
+            "native ETW file_io left {} begin events without a matching OpEnd",
+            result.incomplete_io
+        ));
+    }
+    if result.file_path_unresolved > 0 {
+        warnings.push(format!(
+            "native ETW file_io left {} target file events without a resolved path",
+            result.file_path_unresolved
+        ));
+    }
+    if result.dropped_stack_walk > 0 {
+        warnings.push(format!(
+            "native ETW dropped {} unmatched StackWalk events while bounding the pending stack cache",
+            result.dropped_stack_walk
+        ));
+    }
+    warnings
 }
 
 fn stack_trace_metadata(
@@ -5061,6 +5190,17 @@ mod tests {
             .join("artifacts")
             .join("recordings")
             .join(recording_id["id"].as_str().unwrap());
+        let recording_metadata: Value = serde_json::from_str(
+            &fs::read_to_string(recording_dir.join("recording.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(recording_metadata["trace"]["valid_etl"].is_boolean());
+        assert!(recording_metadata["trace"].get("fallback_reason").is_some());
+        assert!(recording_metadata.get("event_extraction").is_some());
+        assert!(
+            recording_metadata["event_extraction"].is_null()
+                || recording_metadata["event_extraction"]["warnings"].is_array()
+        );
         assert!(recording_dir.join("trace.etl").is_file());
         assert!(recording_dir.join("events").join("network.jsonl").is_file());
         for category in ["process", "thread", "image", "file", "registry", "network"] {

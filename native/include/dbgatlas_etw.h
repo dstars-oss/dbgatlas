@@ -62,6 +62,16 @@ typedef struct DA_EtwEventExtractionResult {
     uint32_t events_written;
     uint32_t files_written;
     uint32_t skipped_events;
+    uint32_t stack_frames_total;
+    uint32_t stack_frames_resolved;
+    uint32_t stack_frames_unresolved;
+    uint32_t file_path_resolved;
+    uint32_t file_path_unresolved;
+    uint32_t matched_op_end;
+    uint32_t unmatched_op_end;
+    uint32_t incomplete_io;
+    uint32_t reused_irp;
+    uint32_t dropped_stack_walk;
 } DA_EtwEventExtractionResult;
 
 typedef struct DA_EtwStackTraceStatus {

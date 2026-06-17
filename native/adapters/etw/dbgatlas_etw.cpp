@@ -27,13 +27,16 @@ DEFINE_GUID(DA_ClassicTcpIpGuid, 0x9a280ac0, 0xc8e0, 0x11d1, 0x84, 0xe2, 0x00, 0
 DEFINE_GUID(DA_ClassicUdpIpGuid, 0xbf3a50c5, 0xa9c9, 0x4988, 0xa0, 0x05, 0x2d, 0xf0, 0xb7, 0xc8, 0x0f, 0x80);
 DEFINE_GUID(DA_ClassicImageLoadGuid, 0x2cb15d1d, 0x5fc1, 0x11d2, 0xab, 0xe1, 0x00, 0xa0, 0xc9, 0x11, 0xf5, 0x18);
 DEFINE_GUID(DA_ClassicRegistryGuid, 0xae53722e, 0xc863, 0x11d2, 0x86, 0x59, 0x00, 0xc0, 0x4f, 0xa3, 0x21, 0xa1);
+DEFINE_GUID(DA_StackWalkGuid, 0xdef2fe46, 0x7bd6, 0x4b80, 0xbd, 0x94, 0xf5, 0x7f, 0xe2, 0x0d, 0x0c, 0xe3);
 #endif
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -514,6 +517,86 @@ long long unix_millis_from_etw_timestamp(LARGE_INTEGER timestamp) {
     return (timestamp.QuadPart - windows_epoch_delta) / 10000;
 }
 
+long long unix_millis_from_etw_timestamp_value(long long timestamp) {
+    LARGE_INTEGER value = {};
+    value.QuadPart = timestamp;
+    return unix_millis_from_etw_timestamp(value);
+}
+
+constexpr uint32_t DA_FILE_IO_NAME = 0;
+constexpr uint32_t DA_FILE_IO_FILE_CREATE_NAME = 32;
+constexpr uint32_t DA_FILE_IO_FILE_DELETE_NAME = 35;
+constexpr uint32_t DA_FILE_IO_RUNDOWN = 36;
+constexpr uint32_t DA_FILE_IO_CREATE = 64;
+constexpr uint32_t DA_FILE_IO_CLEANUP = 65;
+constexpr uint32_t DA_FILE_IO_CLOSE = 66;
+constexpr uint32_t DA_FILE_IO_READ = 67;
+constexpr uint32_t DA_FILE_IO_WRITE = 68;
+constexpr uint32_t DA_FILE_IO_SET_INFO = 69;
+constexpr uint32_t DA_FILE_IO_DELETE = 70;
+constexpr uint32_t DA_FILE_IO_RENAME = 71;
+constexpr uint32_t DA_FILE_IO_DIR_ENUM = 72;
+constexpr uint32_t DA_FILE_IO_FLUSH = 73;
+constexpr uint32_t DA_FILE_IO_QUERY_INFO = 74;
+constexpr uint32_t DA_FILE_IO_FS_CONTROL = 75;
+constexpr uint32_t DA_FILE_IO_OP_END = 76;
+constexpr uint32_t DA_FILE_IO_DIR_NOTIFY = 77;
+constexpr uint32_t DA_STACK_WALK_OPCODE = 32;
+constexpr size_t DA_MAX_PENDING_STACK_TIMESTAMPS = 4096;
+constexpr size_t DA_MAX_PENDING_STACKS_PER_TIMESTAMP = 32;
+
+struct ExtractionQuality final {
+    uint32_t stack_frames_total = 0;
+    uint32_t stack_frames_resolved = 0;
+    uint32_t stack_frames_unresolved = 0;
+    uint32_t file_path_resolved = 0;
+    uint32_t file_path_unresolved = 0;
+    uint32_t matched_op_end = 0;
+    uint32_t unmatched_op_end = 0;
+    uint32_t incomplete_io = 0;
+    uint32_t reused_irp = 0;
+    uint32_t dropped_stack_walk = 0;
+};
+
+struct DecodedStackWalkEvent final {
+    long long event_timestamp = 0;
+    uint32_t stack_process = 0;
+    uint32_t stack_thread = 0;
+    std::vector<uint64_t> addresses;
+};
+
+struct FileEventRecord final {
+    EventMetadata metadata;
+    GUID provider = {};
+    uint16_t event_id = 0;
+    uint8_t version = 0;
+    uint8_t opcode = 0;
+    uint64_t keywords = 0;
+    uint16_t user_data_length = 0;
+    long long event_timestamp = 0;
+    uint32_t pid = 0;
+    uint32_t tid = 0;
+    std::string event_type;
+    std::optional<std::string> path;
+    std::optional<std::string> path_source;
+    std::optional<uint64_t> file_object;
+    std::optional<uint64_t> file_key;
+    std::optional<uint64_t> irp_ptr;
+    std::optional<uint64_t> offset;
+    std::optional<uint64_t> io_size;
+    std::optional<uint32_t> io_flags;
+    std::optional<uint32_t> create_options;
+    std::optional<uint32_t> file_attributes;
+    std::optional<uint32_t> share_access;
+    std::optional<uint32_t> info_class;
+    std::optional<uint64_t> extra_info;
+    std::optional<uint32_t> nt_status;
+    std::vector<uint64_t> stack_addresses;
+    std::optional<uint32_t> completion_pid;
+    std::optional<uint32_t> completion_tid;
+    std::optional<uint32_t> completion_sequence;
+};
+
 struct ExtractionContext final {
     std::filesystem::path events_dir;
     uint32_t preset_flags = 0;
@@ -524,6 +607,14 @@ struct ExtractionContext final {
     std::unordered_set<std::string> files_written;
     std::unordered_set<uint32_t> process_tree_pids;
     std::unordered_map<uint32_t, std::vector<ModuleInfo>> modules_by_pid;
+    ExtractionQuality quality;
+    uint32_t file_io_raw_sequence = 0;
+    std::unordered_map<uint64_t, FileEventRecord> pending_file_irps;
+    std::unordered_set<uint64_t> ignored_file_irps;
+    std::unordered_map<uint64_t, std::string> file_paths_by_object;
+    std::unordered_map<uint64_t, std::string> file_paths_by_key;
+    std::unordered_map<long long, std::vector<DecodedStackWalkEvent>> pending_stacks_by_timestamp;
+    std::deque<long long> pending_stack_timestamp_order;
 };
 
 void initialize_process_tree(ExtractionContext& context) {
@@ -615,6 +706,20 @@ const ModuleInfo* find_module(const ExtractionContext& context, uint32_t pid, ui
     return nullptr;
 }
 
+std::optional<uint64_t> exact_number_field(const EventMetadata& metadata, const std::string& name) {
+    if (auto it = metadata.numeric_fields.find(name); it != metadata.numeric_fields.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
+std::optional<uint32_t> number_to_u32(std::optional<uint64_t> value) {
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(*value);
+}
+
 std::vector<uint64_t> stack_addresses(PEVENT_RECORD record) {
     std::vector<uint64_t> addresses;
     if (record == nullptr || record->ExtendedData == nullptr || record->ExtendedDataCount == 0) {
@@ -651,14 +756,162 @@ std::vector<uint64_t> stack_addresses(PEVENT_RECORD record) {
     return addresses;
 }
 
-std::vector<std::string> stack_frames(const ExtractionContext& context, PEVENT_RECORD record, uint32_t pid) {
-    std::vector<std::string> frames;
-    for (const uint64_t address : stack_addresses(record)) {
-        if (const auto* module = find_module(context, pid, address); module != nullptr && address >= module->base) {
-            frames.push_back(module->name + "+" + hex_u64(address - module->base));
-        } else {
-            frames.push_back(format_address(address));
+std::optional<DecodedStackWalkEvent> decode_stack_walk_raw_data(PEVENT_RECORD record) {
+    if (record == nullptr || record->UserData == nullptr || record->UserDataLength < 16) {
+        return std::nullopt;
+    }
+    const auto* data = static_cast<const unsigned char*>(record->UserData);
+    DecodedStackWalkEvent stack;
+    std::memcpy(&stack.event_timestamp, data, sizeof(int64_t));
+    std::memcpy(&stack.stack_process, data + 8, sizeof(uint32_t));
+    std::memcpy(&stack.stack_thread, data + 12, sizeof(uint32_t));
+    const size_t remaining = record->UserDataLength - 16;
+    const auto* frames = data + 16;
+    const size_t pointer_size = remaining % sizeof(uint64_t) == 0 ? sizeof(uint64_t) : sizeof(uint32_t);
+    if (pointer_size == sizeof(uint64_t)) {
+        for (size_t offset = 0; offset + sizeof(uint64_t) <= remaining; offset += sizeof(uint64_t)) {
+            uint64_t address = 0;
+            std::memcpy(&address, frames + offset, sizeof(uint64_t));
+            if (address != 0) {
+                stack.addresses.push_back(address);
+            }
         }
+    } else {
+        for (size_t offset = 0; offset + sizeof(uint32_t) <= remaining; offset += sizeof(uint32_t)) {
+            uint32_t address = 0;
+            std::memcpy(&address, frames + offset, sizeof(uint32_t));
+            if (address != 0) {
+                stack.addresses.push_back(address);
+            }
+        }
+    }
+    return stack;
+}
+
+std::optional<DecodedStackWalkEvent> decode_stack_walk_event(PEVENT_RECORD record, const EventMetadata& metadata) {
+    if (record == nullptr || !IsEqualGUID(record->EventHeader.ProviderId, DA_StackWalkGuid) ||
+        record->EventHeader.EventDescriptor.Opcode != DA_STACK_WALK_OPCODE) {
+        return std::nullopt;
+    }
+
+    DecodedStackWalkEvent stack;
+    const auto event_timestamp = first_matching_number(metadata, {"eventtimestamp", "event time stamp"});
+    const auto stack_process = first_matching_number(metadata, {"stackprocess"});
+    const auto stack_thread = first_matching_number(metadata, {"stackthread"});
+    if (event_timestamp.has_value() && stack_process.has_value() && stack_thread.has_value()) {
+        stack.event_timestamp = static_cast<long long>(*event_timestamp);
+        stack.stack_process = static_cast<uint32_t>(*stack_process);
+        stack.stack_thread = static_cast<uint32_t>(*stack_thread);
+        for (uint32_t index = 1; index <= 192; ++index) {
+            const std::string field = "Stack" + std::to_string(index);
+            auto address = exact_number_field(metadata, field);
+            if (!address.has_value()) {
+                break;
+            }
+            if (*address != 0) {
+                stack.addresses.push_back(*address);
+            }
+        }
+        return stack;
+    }
+    return decode_stack_walk_raw_data(record);
+}
+
+void append_stack_addresses(std::vector<uint64_t>& target, const std::vector<uint64_t>& source) {
+    for (const uint64_t address : source) {
+        if (address != 0 && std::find(target.begin(), target.end(), address) == target.end()) {
+            target.push_back(address);
+        }
+    }
+}
+
+std::vector<uint64_t> take_matching_pending_stack(ExtractionContext& context, long long timestamp, uint32_t pid, uint32_t tid) {
+    auto it = context.pending_stacks_by_timestamp.find(timestamp);
+    if (it == context.pending_stacks_by_timestamp.end()) {
+        return {};
+    }
+    auto& pending = it->second;
+    auto exact = std::find_if(pending.begin(), pending.end(), [pid, tid](const DecodedStackWalkEvent& stack) {
+        return stack.stack_process == pid && stack.stack_thread == tid;
+    });
+    auto selected = exact != pending.end()
+                        ? exact
+                        : std::find_if(pending.begin(), pending.end(), [pid](const DecodedStackWalkEvent& stack) {
+                              return stack.stack_process == pid;
+                          });
+    if (selected == pending.end()) {
+        return {};
+    }
+    auto addresses = selected->addresses;
+    pending.erase(selected);
+    if (pending.empty()) {
+        context.pending_stacks_by_timestamp.erase(it);
+    }
+    return addresses;
+}
+
+void cache_pending_stack(ExtractionContext& context, DecodedStackWalkEvent stack) {
+    if (context.has_root_pid && context.process_tree_pids.find(stack.stack_process) == context.process_tree_pids.end()) {
+        context.quality.dropped_stack_walk += 1;
+        return;
+    }
+    if (context.pending_stacks_by_timestamp.find(stack.event_timestamp) == context.pending_stacks_by_timestamp.end()) {
+        if (context.pending_stack_timestamp_order.size() >= DA_MAX_PENDING_STACK_TIMESTAMPS) {
+            const long long oldest = context.pending_stack_timestamp_order.front();
+            context.pending_stack_timestamp_order.pop_front();
+            if (auto removed = context.pending_stacks_by_timestamp.find(oldest);
+                removed != context.pending_stacks_by_timestamp.end()) {
+                context.quality.dropped_stack_walk += static_cast<uint32_t>(removed->second.size());
+                context.pending_stacks_by_timestamp.erase(removed);
+            }
+        }
+        context.pending_stack_timestamp_order.push_back(stack.event_timestamp);
+    }
+    auto& pending = context.pending_stacks_by_timestamp[stack.event_timestamp];
+    if (pending.size() >= DA_MAX_PENDING_STACKS_PER_TIMESTAMP) {
+        context.quality.dropped_stack_walk += 1;
+        return;
+    }
+    pending.push_back(std::move(stack));
+}
+
+struct StackFrameInfo final {
+    std::string text;
+    bool resolved = false;
+};
+
+std::vector<StackFrameInfo> stack_frames_from_addresses(
+    ExtractionContext& context,
+    const std::vector<uint64_t>& addresses,
+    uint32_t pid) {
+    std::vector<StackFrameInfo> frames;
+    for (const uint64_t address : addresses) {
+        if (const auto* module = find_module(context, pid, address); module != nullptr && address >= module->base) {
+            frames.push_back(StackFrameInfo{module->name + "+" + hex_u64(address - module->base), true});
+            context.quality.stack_frames_resolved += 1;
+        } else {
+            frames.push_back(StackFrameInfo{format_address(address), false});
+            context.quality.stack_frames_unresolved += 1;
+        }
+        context.quality.stack_frames_total += 1;
+    }
+    std::reverse(frames.begin(), frames.end());
+    return frames;
+}
+
+std::vector<StackFrameInfo> stack_frames(ExtractionContext& context, PEVENT_RECORD record, uint32_t pid) {
+    std::vector<uint64_t> addresses = stack_addresses(record);
+    append_stack_addresses(
+        addresses,
+        take_matching_pending_stack(context, record->EventHeader.TimeStamp.QuadPart, pid, record->EventHeader.ThreadId));
+    return stack_frames_from_addresses(context, addresses, pid);
+}
+
+std::vector<std::string> stack_frame_text(const std::vector<StackFrameInfo>& frame_infos) {
+    std::vector<std::string> frames;
+    frames.reserve(frame_infos.size());
+    for (const auto& frame : frame_infos) {
+        frames.push_back(frame.text);
     }
     return frames;
 }
@@ -675,6 +928,400 @@ std::string json_number_or_null(const std::optional<uint64_t>& value) {
         return "null";
     }
     return std::to_string(*value);
+}
+
+std::string json_u32_or_null(const std::optional<uint32_t>& value) {
+    if (!value.has_value()) {
+        return "null";
+    }
+    return std::to_string(*value);
+}
+
+std::optional<const char*> known_file_io_event_type(uint32_t opcode) {
+    switch (opcode) {
+    case DA_FILE_IO_NAME:
+        return "file_name";
+    case DA_FILE_IO_FILE_CREATE_NAME:
+        return "file_create_name";
+    case DA_FILE_IO_FILE_DELETE_NAME:
+        return "file_delete_name";
+    case DA_FILE_IO_RUNDOWN:
+        return "file_rundown";
+    case DA_FILE_IO_CREATE:
+        return "create";
+    case DA_FILE_IO_CLEANUP:
+        return "cleanup";
+    case DA_FILE_IO_CLOSE:
+        return "close";
+    case DA_FILE_IO_READ:
+        return "read";
+    case DA_FILE_IO_WRITE:
+        return "write";
+    case DA_FILE_IO_SET_INFO:
+        return "set_info";
+    case DA_FILE_IO_DELETE:
+        return "delete";
+    case DA_FILE_IO_RENAME:
+        return "rename";
+    case DA_FILE_IO_DIR_ENUM:
+        return "dir_enum";
+    case DA_FILE_IO_FLUSH:
+        return "flush";
+    case DA_FILE_IO_QUERY_INFO:
+        return "query_info";
+    case DA_FILE_IO_FS_CONTROL:
+        return "fs_control";
+    case DA_FILE_IO_OP_END:
+        return "op_end";
+    case DA_FILE_IO_DIR_NOTIFY:
+        return "dir_notify";
+    default:
+        return std::nullopt;
+    }
+}
+
+bool is_known_file_io_event(PEVENT_RECORD record, const char* raw_category) {
+    if (record == nullptr || raw_category == nullptr || std::strcmp(raw_category, "file") != 0) {
+        return false;
+    }
+    const uint32_t opcode = record->EventHeader.EventDescriptor.Opcode;
+    return known_file_io_event_type(opcode).has_value() &&
+           (IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicFileIoGuid) ||
+            IsEqualGUID(record->EventHeader.ProviderId, DA_KernelFileProviderGuid));
+}
+
+void write_stack_json(std::ofstream& out, const std::vector<StackFrameInfo>& frames) {
+    if (frames.empty()) {
+        return;
+    }
+    out << ",\"stack\":{\"frames\":[";
+    for (size_t index = 0; index < frames.size(); ++index) {
+        if (index != 0) {
+            out << ",";
+        }
+        out << "\"" << json_escape(frames[index].text) << "\"";
+    }
+    out << "]}";
+}
+
+std::optional<std::string> direct_file_path(const EventMetadata& metadata, uint32_t opcode) {
+    if (opcode == DA_FILE_IO_CREATE) {
+        return first_matching_string(metadata, {"openpath", "file name", "filename", "path"});
+    }
+    if (opcode == DA_FILE_IO_NAME || opcode == DA_FILE_IO_FILE_CREATE_NAME ||
+        opcode == DA_FILE_IO_FILE_DELETE_NAME || opcode == DA_FILE_IO_RUNDOWN ||
+        opcode == DA_FILE_IO_DIR_ENUM || opcode == DA_FILE_IO_DIR_NOTIFY) {
+        return first_matching_string(metadata, {"filename", "file name", "openpath", "path"});
+    }
+    return first_matching_string(metadata, {"filename", "file name", "path"});
+}
+
+std::optional<std::string> direct_file_path_source(uint32_t opcode, const std::optional<std::string>& path) {
+    if (!path.has_value()) {
+        return std::nullopt;
+    }
+    if (opcode == DA_FILE_IO_CREATE) {
+        return "open_path";
+    }
+    return "file_name";
+}
+
+void cache_file_path(ExtractionContext& context, const FileEventRecord& event) {
+    if (!event.path.has_value() || event.path->empty()) {
+        return;
+    }
+    if (event.file_object.has_value()) {
+        context.file_paths_by_object[*event.file_object] = *event.path;
+    }
+    if (event.file_key.has_value()) {
+        context.file_paths_by_key[*event.file_key] = *event.path;
+    }
+}
+
+void remove_file_path(ExtractionContext& context, const FileEventRecord& event) {
+    if (event.file_object.has_value()) {
+        context.file_paths_by_object.erase(*event.file_object);
+    }
+    if (event.file_key.has_value()) {
+        context.file_paths_by_key.erase(*event.file_key);
+    }
+}
+
+void resolve_file_path(ExtractionContext& context, FileEventRecord& event) {
+    if (event.path.has_value() && !event.path->empty()) {
+        context.quality.file_path_resolved += 1;
+        return;
+    }
+    if (event.file_object.has_value()) {
+        if (auto found = context.file_paths_by_object.find(*event.file_object);
+            found != context.file_paths_by_object.end()) {
+            event.path = found->second;
+            event.path_source = "file_object_cache";
+            context.quality.file_path_resolved += 1;
+            return;
+        }
+    }
+    if (event.file_key.has_value()) {
+        if (auto found = context.file_paths_by_key.find(*event.file_key);
+            found != context.file_paths_by_key.end()) {
+            event.path = found->second;
+            event.path_source = "file_key_cache";
+            context.quality.file_path_resolved += 1;
+            return;
+        }
+    }
+    context.quality.file_path_unresolved += 1;
+}
+
+FileEventRecord decoded_file_event(ExtractionContext& context, PEVENT_RECORD record, const EventMetadata& metadata) {
+    const uint32_t opcode = record->EventHeader.EventDescriptor.Opcode;
+    FileEventRecord event;
+    event.metadata = metadata;
+    event.provider = record->EventHeader.ProviderId;
+    event.event_id = record->EventHeader.EventDescriptor.Id;
+    event.version = record->EventHeader.EventDescriptor.Version;
+    event.opcode = record->EventHeader.EventDescriptor.Opcode;
+    event.keywords = record->EventHeader.EventDescriptor.Keyword;
+    event.user_data_length = record->UserDataLength;
+    event.event_timestamp = record->EventHeader.TimeStamp.QuadPart;
+    event.pid = metadata.process_pid.value_or(record->EventHeader.ProcessId);
+    event.tid = record->EventHeader.ThreadId;
+    event.event_type = known_file_io_event_type(opcode).value_or("file_event");
+    event.path = direct_file_path(metadata, opcode);
+    event.path_source = direct_file_path_source(opcode, event.path);
+    event.file_object = first_matching_number(metadata, {"fileobject", "fileobj"});
+    event.file_key = first_matching_number(metadata, {"filekey", "fileobjectkey"});
+    event.irp_ptr = first_matching_number(metadata, {"irpptr", "irp", "irppointer"});
+    event.offset = first_matching_number(metadata, {"offset", "byteoffset"});
+    event.io_size = first_matching_number(metadata, {"iosize", "size", "transfersize"});
+    event.io_flags = number_to_u32(first_matching_number(metadata, {"ioflags", "flags"}));
+    event.create_options = number_to_u32(first_matching_number(metadata, {"createoptions"}));
+    event.file_attributes = number_to_u32(first_matching_number(metadata, {"fileattributes"}));
+    event.share_access = number_to_u32(first_matching_number(metadata, {"shareaccess"}));
+    event.info_class = number_to_u32(first_matching_number(metadata, {"infoclass"}));
+    event.extra_info = first_matching_number(metadata, {"extrainfo"});
+    event.nt_status = number_to_u32(first_matching_number(metadata, {"ntstatus", "status"}));
+    if (opcode != DA_FILE_IO_OP_END) {
+        event.stack_addresses = stack_addresses(record);
+        append_stack_addresses(
+            event.stack_addresses,
+            take_matching_pending_stack(context, event.event_timestamp, event.pid, event.tid));
+    }
+    return event;
+}
+
+bool file_event_allowed(ExtractionContext& context, const FileEventRecord& event) {
+    if (!context.has_root_pid) {
+        return true;
+    }
+    return context.process_tree_pids.find(event.pid) != context.process_tree_pids.end();
+}
+
+void write_file_event(ExtractionContext& context, FileEventRecord event) {
+    const std::filesystem::path path = context.events_dir / "file.jsonl";
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out) {
+        context.skipped_events += 1;
+        return;
+    }
+    const auto frames = stack_frames_from_addresses(context, event.stack_addresses, event.pid);
+    out << "{\"schema_version\":1"
+        << ",\"timestamp\":{\"unix_millis\":" << unix_millis_from_etw_timestamp_value(event.event_timestamp) << "}"
+        << ",\"category\":\"file\""
+        << ",\"event_type\":\"" << json_escape(event.event_type) << "\""
+        << ",\"pid\":" << event.pid
+        << ",\"tid\":" << event.tid
+        << ",\"process\":{\"pid\":" << event.pid << ",\"parent_pid\":";
+    if (event.metadata.parent_pid.has_value()) {
+        out << *event.metadata.parent_pid;
+    } else {
+        out << "null";
+    }
+    out << ",\"image_path\":"
+        << json_string_or_null(first_matching_string(event.metadata, {"image", "filename", "processname"}))
+        << ",\"command_line\":"
+        << json_string_or_null(first_matching_string(event.metadata, {"commandline", "command line"}))
+        << "}"
+        << ",\"file\":{"
+        << "\"path\":" << json_string_or_null(event.path)
+        << ",\"path_source\":" << json_string_or_null(event.path_source)
+        << ",\"operation\":\"" << json_escape(event.event_type) << "\""
+        << ",\"status\":" << json_u32_or_null(event.nt_status)
+        << ",\"byte_count\":" << json_number_or_null(event.io_size)
+        << ",\"file_object\":" << json_number_or_null(event.file_object)
+        << ",\"file_key\":" << json_number_or_null(event.file_key)
+        << ",\"irp_ptr\":" << json_number_or_null(event.irp_ptr)
+        << ",\"offset\":" << json_number_or_null(event.offset)
+        << ",\"io_flags\":" << json_u32_or_null(event.io_flags)
+        << ",\"create_options\":" << json_u32_or_null(event.create_options)
+        << ",\"file_attributes\":" << json_u32_or_null(event.file_attributes)
+        << ",\"share_access\":" << json_u32_or_null(event.share_access)
+        << ",\"info_class\":" << json_u32_or_null(event.info_class)
+        << ",\"extra_info\":" << json_number_or_null(event.extra_info)
+        << ",\"completion_pid\":" << json_u32_or_null(event.completion_pid)
+        << ",\"completion_tid\":" << json_u32_or_null(event.completion_tid)
+        << ",\"completion_sequence\":" << json_u32_or_null(event.completion_sequence)
+        << "}";
+    write_stack_json(out, frames);
+    out
+        << ",\"operation_id\":null"
+        << ",\"artifact_id\":null"
+        << ",\"etw\":{"
+        << "\"provider\":\"" << guid_to_string(event.provider) << "\""
+        << ",\"provider_name\":\"" << json_escape(event.metadata.names.provider) << "\""
+        << ",\"task\":\"" << json_escape(event.metadata.names.task) << "\""
+        << ",\"event_id\":" << event.event_id
+        << ",\"version\":" << static_cast<unsigned int>(event.version)
+        << ",\"opcode\":" << static_cast<unsigned int>(event.opcode)
+        << ",\"opcode_name\":\"" << json_escape(event.metadata.names.opcode) << "\""
+        << ",\"keywords\":" << event.keywords
+        << ",\"raw\":{\"user_data_length\":" << event.user_data_length << ",\"numeric_fields\":{";
+    bool first = true;
+    for (const auto& [name, value] : event.metadata.numeric_fields) {
+        if (!first) {
+            out << ",";
+        }
+        first = false;
+        out << "\"" << json_escape(name) << "\":" << value;
+    }
+    out << "},\"string_fields\":{";
+    first = true;
+    for (const auto& [name, value] : event.metadata.string_fields) {
+        if (!first) {
+            out << ",";
+        }
+        first = false;
+        out << "\"" << json_escape(name) << "\":\"" << json_escape(value) << "\"";
+    }
+    out << "}}}}\n";
+    context.files_written.insert("file");
+    context.events_written += 1;
+}
+
+bool attach_stack_to_pending_file(ExtractionContext& context, const DecodedStackWalkEvent& stack) {
+    FileEventRecord* fallback = nullptr;
+    for (auto& [_, event] : context.pending_file_irps) {
+        if (event.event_timestamp != stack.event_timestamp || event.pid != stack.stack_process) {
+            continue;
+        }
+        if (event.tid == stack.stack_thread) {
+            append_stack_addresses(event.stack_addresses, stack.addresses);
+            return true;
+        }
+        fallback = &event;
+    }
+    if (fallback != nullptr) {
+        append_stack_addresses(fallback->stack_addresses, stack.addresses);
+        return true;
+    }
+    return false;
+}
+
+void process_stack_walk_event(ExtractionContext& context, DecodedStackWalkEvent stack) {
+    if (!attach_stack_to_pending_file(context, stack)) {
+        cache_pending_stack(context, std::move(stack));
+    }
+}
+
+void process_file_io_event(ExtractionContext& context, PEVENT_RECORD record, const EventMetadata& metadata) {
+    if (!preset_enabled(context.preset_flags, "file")) {
+        context.skipped_events += 1;
+        return;
+    }
+    FileEventRecord event = decoded_file_event(context, record, metadata);
+    const uint32_t opcode = record->EventHeader.EventDescriptor.Opcode;
+    context.file_io_raw_sequence += 1;
+
+    if (opcode == DA_FILE_IO_OP_END) {
+        const auto irp = event.irp_ptr;
+        if (!irp.has_value()) {
+            context.quality.unmatched_op_end += 1;
+            return;
+        }
+        auto pending = context.pending_file_irps.find(*irp);
+        if (pending == context.pending_file_irps.end()) {
+            if (context.ignored_file_irps.erase(*irp) == 0) {
+                context.quality.unmatched_op_end += 1;
+            }
+            return;
+        }
+        FileEventRecord merged = std::move(pending->second);
+        context.pending_file_irps.erase(pending);
+        if (event.extra_info.has_value()) {
+            merged.extra_info = event.extra_info;
+        }
+        if (event.nt_status.has_value()) {
+            merged.nt_status = event.nt_status;
+        }
+        merged.completion_pid = event.pid;
+        merged.completion_tid = event.tid;
+        merged.completion_sequence = context.file_io_raw_sequence;
+        context.quality.matched_op_end += 1;
+        write_file_event(context, std::move(merged));
+        return;
+    }
+
+    if (!file_event_allowed(context, event)) {
+        context.skipped_events += 1;
+        return;
+    }
+    cache_file_path(context, event);
+    resolve_file_path(context, event);
+
+    if (opcode == DA_FILE_IO_CLOSE) {
+        if (event.irp_ptr.has_value()) {
+            if (context.pending_file_irps.erase(*event.irp_ptr) > 0) {
+                context.quality.reused_irp += 1;
+            }
+            context.ignored_file_irps.insert(*event.irp_ptr);
+        }
+        write_file_event(context, event);
+        remove_file_path(context, event);
+        return;
+    }
+
+    const bool invalidates_file_object = opcode == DA_FILE_IO_CLEANUP;
+    const std::optional<uint64_t> pending_irp = event.irp_ptr;
+    const std::optional<uint64_t> cleanup_file_object = event.file_object;
+    const std::optional<uint64_t> cleanup_file_key = event.file_key;
+    if (event.irp_ptr.has_value()) {
+        if (auto existing = context.pending_file_irps.find(*event.irp_ptr);
+            existing != context.pending_file_irps.end()) {
+            context.quality.reused_irp += 1;
+            write_file_event(context, std::move(existing->second));
+            context.pending_file_irps.erase(existing);
+        }
+        context.pending_file_irps.emplace(*event.irp_ptr, std::move(event));
+    } else {
+        write_file_event(context, std::move(event));
+    }
+    if (invalidates_file_object) {
+        if (pending_irp.has_value()) {
+            if (auto pending = context.pending_file_irps.find(*pending_irp);
+                pending != context.pending_file_irps.end()) {
+                remove_file_path(context, pending->second);
+            }
+        }
+        if (cleanup_file_object.has_value()) {
+            context.file_paths_by_object.erase(*cleanup_file_object);
+        }
+        if (cleanup_file_key.has_value()) {
+            context.file_paths_by_key.erase(*cleanup_file_key);
+        }
+    }
+}
+
+void flush_pending_file_events(ExtractionContext& context) {
+    context.quality.incomplete_io += static_cast<uint32_t>(context.pending_file_irps.size());
+    std::vector<FileEventRecord> pending;
+    pending.reserve(context.pending_file_irps.size());
+    for (auto& [_, event] : context.pending_file_irps) {
+        pending.push_back(std::move(event));
+    }
+    context.pending_file_irps.clear();
+    for (auto& event : pending) {
+        write_file_event(context, std::move(event));
+    }
 }
 
 void write_category_fields(
@@ -776,16 +1423,7 @@ void write_extracted_event(ExtractionContext& context, PEVENT_RECORD record, con
         << json_string_or_null(first_matching_string(metadata, {"commandline", "command line"}))
         << "}";
     write_category_fields(out, metadata, category, event_type);
-    if (!frames.empty()) {
-        out << ",\"stack\":{\"frames\":[";
-        for (size_t index = 0; index < frames.size(); ++index) {
-            if (index != 0) {
-                out << ",";
-            }
-            out << "\"" << json_escape(frames[index]) << "\"";
-        }
-        out << "]}";
-    }
+    write_stack_json(out, frames);
     out
         << ",\"operation_id\":null"
         << ",\"artifact_id\":null"
@@ -828,6 +1466,10 @@ void WINAPI event_record_callback(PEVENT_RECORD record) {
         return;
     }
     const EventMetadata metadata = event_metadata(record);
+    if (auto stack = decode_stack_walk_event(record, metadata); stack.has_value()) {
+        process_stack_walk_event(*context, std::move(*stack));
+        return;
+    }
     const char* raw_category = event_category(metadata.names);
     if (raw_category == nullptr) {
         context->skipped_events += 1;
@@ -840,6 +1482,10 @@ void WINAPI event_record_callback(PEVENT_RECORD record) {
         process_tree_allows_event(*context, metadata, raw_category, record->EventHeader.ProcessId)) {
         const uint32_t image_pid = metadata.process_pid.value_or(record->EventHeader.ProcessId);
         update_module_map(*context, metadata, event_type, image_pid);
+    }
+    if (is_known_file_io_event(record, raw_category)) {
+        process_file_io_event(*context, record, metadata);
+        return;
     }
     const char* category = preset_enabled(context->preset_flags, raw_category) ? raw_category : nullptr;
     if (category == nullptr) {
@@ -863,6 +1509,44 @@ ULONG process_trace_logfile(EVENT_TRACE_LOGFILEA& logfile) {
     return close_status;
 }
 
+bool result_has_field(uint32_t caller_size, size_t offset, size_t field_size) {
+    return caller_size >= offset + field_size;
+}
+
+uint32_t initialize_extraction_result(DA_EtwEventExtractionResult* out) {
+    const uint32_t caller_size = out->struct_size == 0
+                                     ? static_cast<uint32_t>(offsetof(DA_EtwEventExtractionResult, stack_frames_total))
+                                     : out->struct_size;
+    const size_t clear_size = std::min<size_t>(caller_size, sizeof(DA_EtwEventExtractionResult));
+    std::memset(out, 0, clear_size);
+    out->struct_size = sizeof(DA_EtwEventExtractionResult);
+    return caller_size;
+}
+
+void copy_extraction_result(DA_EtwEventExtractionResult* out, uint32_t caller_size, const ExtractionContext& context) {
+    out->struct_size = sizeof(DA_EtwEventExtractionResult);
+#define DA_SET_ETW_RESULT_FIELD(field, value)                                      \
+    do {                                                                          \
+        if (result_has_field(caller_size, offsetof(DA_EtwEventExtractionResult, field), sizeof(out->field))) { \
+            out->field = (value);                                                 \
+        }                                                                         \
+    } while (0)
+    DA_SET_ETW_RESULT_FIELD(events_written, context.events_written);
+    DA_SET_ETW_RESULT_FIELD(files_written, static_cast<uint32_t>(context.files_written.size()));
+    DA_SET_ETW_RESULT_FIELD(skipped_events, context.skipped_events);
+    DA_SET_ETW_RESULT_FIELD(stack_frames_total, context.quality.stack_frames_total);
+    DA_SET_ETW_RESULT_FIELD(stack_frames_resolved, context.quality.stack_frames_resolved);
+    DA_SET_ETW_RESULT_FIELD(stack_frames_unresolved, context.quality.stack_frames_unresolved);
+    DA_SET_ETW_RESULT_FIELD(file_path_resolved, context.quality.file_path_resolved);
+    DA_SET_ETW_RESULT_FIELD(file_path_unresolved, context.quality.file_path_unresolved);
+    DA_SET_ETW_RESULT_FIELD(matched_op_end, context.quality.matched_op_end);
+    DA_SET_ETW_RESULT_FIELD(unmatched_op_end, context.quality.unmatched_op_end);
+    DA_SET_ETW_RESULT_FIELD(incomplete_io, context.quality.incomplete_io);
+    DA_SET_ETW_RESULT_FIELD(reused_irp, context.quality.reused_irp);
+    DA_SET_ETW_RESULT_FIELD(dropped_stack_walk, context.quality.dropped_stack_walk);
+#undef DA_SET_ETW_RESULT_FIELD
+}
+
 struct RealTimeConsumer final {
     ExtractionContext context;
     std::string session_name;
@@ -877,6 +1561,7 @@ void run_realtime_consumer(RealTimeConsumer* consumer) noexcept {
     logfile.EventRecordCallback = event_record_callback;
     logfile.Context = &consumer->context;
     const ULONG status = process_trace_logfile(logfile);
+    flush_pending_file_events(consumer->context);
     consumer->status.store(status, std::memory_order_relaxed);
 }
 
@@ -891,6 +1576,22 @@ struct ScopedBStr final {
         }
     }
 };
+
+bool keep_stack_walk_for_filter(ExtractionContext& context, PEVENT_RECORD record, const EventMetadata& metadata) {
+    auto stack = decode_stack_walk_event(record, metadata);
+    if (!stack.has_value()) {
+        return false;
+    }
+    if (!context.has_root_pid) {
+        return true;
+    }
+    return context.process_tree_pids.find(stack->stack_process) != context.process_tree_pids.end();
+}
+
+bool keep_file_completion_for_filter(ExtractionContext& context, PEVENT_RECORD record, const char* category) {
+    return preset_enabled(context.preset_flags, "file") && is_known_file_io_event(record, category) &&
+           record->EventHeader.EventDescriptor.Opcode == DA_FILE_IO_OP_END;
+}
 
 class FilteringReloggerCallback final : public ITraceEventCallback {
 public:
@@ -948,8 +1649,12 @@ public:
         const char* category = event_category(metadata.names);
         const bool keep_for_output = category != nullptr && preset_enabled(context_.preset_flags, category);
         const bool keep_for_module_map = category != nullptr && std::strcmp(category, "image") == 0;
-        if ((!keep_for_output && !keep_for_module_map) ||
-            !process_tree_allows_event(context_, metadata, category, record->EventHeader.ProcessId)) {
+        const bool keep_for_stack_walk = keep_stack_walk_for_filter(context_, record, metadata);
+        const bool keep_for_file_completion = keep_file_completion_for_filter(context_, record, category);
+        const bool needs_process_tree_filter = !keep_for_stack_walk && !keep_for_file_completion;
+        if ((!keep_for_output && !keep_for_module_map && !keep_for_stack_walk && !keep_for_file_completion) ||
+            (needs_process_tree_filter &&
+             !process_tree_allows_event(context_, metadata, category, record->EventHeader.ProcessId))) {
             context_.skipped_events += 1;
             return S_OK;
         }
@@ -1426,10 +2131,7 @@ int32_t da_etw_extract_file_events(
         if (out == nullptr) {
             return fail(DA_ETW_ERR_INVALID_ARGUMENT, "out extraction result pointer is null");
         }
-        out->struct_size = sizeof(DA_EtwEventExtractionResult);
-        out->events_written = 0;
-        out->files_written = 0;
-        out->skipped_events = 0;
+        const uint32_t caller_result_size = initialize_extraction_result(out);
         if (trace_path_utf8 == nullptr || trace_path_utf8[0] == '\0') {
             return fail(DA_ETW_ERR_INVALID_ARGUMENT, "trace path is empty");
         }
@@ -1455,13 +2157,12 @@ int32_t da_etw_extract_file_events(
         logfile.Context = &context;
 
         const ULONG status = process_trace_logfile(logfile);
+        flush_pending_file_events(context);
         if (status != ERROR_SUCCESS) {
             return fail_win32("ProcessTrace", status);
         }
 
-        out->events_written = context.events_written;
-        out->files_written = static_cast<uint32_t>(context.files_written.size());
-        out->skipped_events = context.skipped_events;
+        copy_extraction_result(out, caller_result_size, context);
         return DA_ETW_OK;
 #endif
     });
@@ -1478,10 +2179,7 @@ int32_t da_etw_filter_trace_file(
         if (out == nullptr) {
             return fail(DA_ETW_ERR_INVALID_ARGUMENT, "out filter result pointer is null");
         }
-        out->struct_size = sizeof(DA_EtwEventExtractionResult);
-        out->events_written = 0;
-        out->files_written = 0;
-        out->skipped_events = 0;
+        const uint32_t caller_result_size = initialize_extraction_result(out);
         if (input_trace_path_utf8 == nullptr || input_trace_path_utf8[0] == '\0') {
             return fail(DA_ETW_ERR_INVALID_ARGUMENT, "input trace path is empty");
         }
@@ -1564,9 +2262,7 @@ int32_t da_etw_filter_trace_file(
 
         hr = relogger->ProcessTrace();
         const auto& filter_context = callback->context();
-        out->events_written = filter_context.events_written;
-        out->files_written = static_cast<uint32_t>(filter_context.files_written.size());
-        out->skipped_events = filter_context.skipped_events;
+        copy_extraction_result(out, caller_result_size, filter_context);
         callback->Release();
         relogger->Release();
         if (should_uninitialize) {

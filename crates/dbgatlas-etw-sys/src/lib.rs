@@ -43,6 +43,16 @@ pub struct DA_EtwEventExtractionResult {
     pub events_written: u32,
     pub files_written: u32,
     pub skipped_events: u32,
+    pub stack_frames_total: u32,
+    pub stack_frames_resolved: u32,
+    pub stack_frames_unresolved: u32,
+    pub file_path_resolved: u32,
+    pub file_path_unresolved: u32,
+    pub matched_op_end: u32,
+    pub unmatched_op_end: u32,
+    pub incomplete_io: u32,
+    pub reused_irp: u32,
+    pub dropped_stack_walk: u32,
 }
 
 #[repr(C)]
