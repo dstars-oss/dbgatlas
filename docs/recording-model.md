@@ -120,6 +120,13 @@ MVP 3 定义完整的低层 ETW-derived event schema，但不定义高层 Timeli
     "image_path": "C:\\\\Windows\\\\System32\\\\notepad.exe",
     "command_line": "notepad.exe"
   },
+  "stack": {
+    "frames": [
+      "notepad.exe+0x1234",
+      "kernel32.dll+0x1d2f0",
+      "0x00007ff812345678"
+    ]
+  },
   "operation_id": "op-...",
   "artifact_id": "artifact-...",
   "etw": {
@@ -141,6 +148,8 @@ Category-specific normalized fields:
 - `file.jsonl`：file create/open/read/write/close/delete/rename、path、operation、status、byte count。
 - `registry.jsonl`：key/value create/open/query/set/delete、key path、value name、value type、status。
 - `network.jsonl`：connect/accept/send/receive/close、protocol、local/remote endpoint、status、byte count。
+
+ETW recording 默认尽力为写入 `events/*.jsonl` 的事件补充调用堆栈。`stack.frames` 是字符串数组，顺序保持 ETW/debug 消费语义，不额外排序或反转。frame 格式优先使用 `module_name+0xoffset`；模块归属仅来自 ETW image load/unload 事件维护的进程内模块表，不读取 PDB、不调用 DIA/DbgHelp、不解析函数名。若某帧找不到模块归属，则保留原始指令地址字符串。若系统、provider 或事件本身不提供 stack extended data，则省略 `stack` 字段，并在 `recording.json` 的 `stack_trace` metadata 中以 best-effort 状态和 warnings 说明降级。
 
 字段缺失时应显式省略或使用 `null`，不能用推断值伪装为 ETW 事实。解释、假设和结论仍写入 `analysis/` Markdown。
 

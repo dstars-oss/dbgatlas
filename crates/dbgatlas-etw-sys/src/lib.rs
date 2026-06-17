@@ -9,6 +9,7 @@ pub const DA_ETW_ERR_INTERNAL: i32 = 500;
 pub const DA_ETW_CAP_REALTIME_CONSUME: u32 = 1 << 0;
 pub const DA_ETW_CAP_FILE_TRACE: u32 = 1 << 1;
 pub const DA_ETW_CAP_PROCESS_TREE_FILTER: u32 = 1 << 2;
+pub const DA_ETW_CAP_EVENT_STACK_TRACE: u32 = 1 << 3;
 
 pub const DA_ETW_PRESET_PROCESS: u32 = 1 << 0;
 pub const DA_ETW_PRESET_THREAD: u32 = 1 << 1;
@@ -45,6 +46,19 @@ pub struct DA_EtwEventExtractionResult {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_EtwStackTraceStatus {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub requested: u32,
+    pub enabled: u32,
+    pub provider_stack_enabled: u32,
+    pub provider_stack_warning_count: u32,
+    pub kernel_stack_enabled: u32,
+    pub kernel_stack_warning_count: u32,
+}
+
+#[repr(C)]
 pub struct DA_EtwSessionHandle {
     _private: [u8; 0],
 }
@@ -76,6 +90,10 @@ unsafe extern "C" {
         preset_flags: u32,
         has_root_pid: u32,
         root_pid: u32,
+    ) -> i32;
+    pub fn da_etw_session_stack_trace_status(
+        handle: *mut DA_EtwSessionHandle,
+        out: *mut DA_EtwStackTraceStatus,
     ) -> i32;
     pub fn da_etw_session_stop(handle: *mut DA_EtwSessionHandle) -> i32;
     pub fn da_etw_extract_file_events(

@@ -317,6 +317,13 @@ impl ServiceHost {
             Ok(session) => (Some(session), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let (trace_stack_status, trace_stack_status_error) = match trace_session.as_ref() {
+            Some(session) => match session.stack_trace_status() {
+                Ok(status) => (Some(status), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, None),
+        };
         let prepared_target = match prepare_recording_target(&request.target) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -354,6 +361,8 @@ impl ServiceHost {
             now,
             trace_start_error.as_deref(),
             trace_consumer_error.as_deref(),
+            trace_stack_status,
+            trace_stack_status_error.as_deref(),
         )?;
         let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
 
@@ -384,6 +393,8 @@ impl ServiceHost {
             trace_session,
             trace_start_error,
             trace_consumer_error,
+            trace_stack_status,
+            trace_stack_status_error,
         };
 
         let mut operation = ServiceOperation::success(
@@ -1467,6 +1478,8 @@ struct ManagedRecording {
     trace_session: Arc<Mutex<Option<dbgatlas_etw::EtwFileSession>>>,
     trace_start_error: Option<String>,
     trace_consumer_error: Option<String>,
+    trace_stack_status: Option<dbgatlas_etw::EtwStackTraceStatus>,
+    trace_stack_status_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1766,6 +1779,8 @@ fn write_recording_start_artifacts(
     now: Timestamp,
     trace_start_error: Option<&str>,
     trace_consumer_error: Option<&str>,
+    trace_stack_status: Option<dbgatlas_etw::EtwStackTraceStatus>,
+    trace_stack_status_error: Option<&str>,
 ) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
     fs::create_dir_all(artifact_dir.join("events"))?;
     let metadata = recording_metadata_json(
@@ -1780,6 +1795,8 @@ fn write_recording_start_artifacts(
         etw_adapter_metadata(),
         trace_start_error,
         trace_consumer_error,
+        trace_stack_status,
+        trace_stack_status_error,
     );
     let metadata_snapshot = format!("metadata/{}.json", operation_id.id.as_str());
     let metadata_len = write_json_file(&artifact_dir.join(&metadata_snapshot), &metadata)?;
@@ -2011,6 +2028,8 @@ fn write_recording_terminal_metadata(
         etw_adapter_metadata(),
         recording.trace_start_error.as_deref(),
         recording.trace_consumer_error.as_deref(),
+        recording.trace_stack_status,
+        recording.trace_stack_status_error.as_deref(),
     );
     let metadata_len = write_json_file(&artifact_dir.join("recording.json"), &metadata)?;
     Ok(vec![WorkerArtifactWrite {
@@ -2033,6 +2052,8 @@ fn recording_metadata_json(
     adapter: EtwAdapterMetadata,
     trace_start_error: Option<&str>,
     trace_consumer_error: Option<&str>,
+    trace_stack_status: Option<dbgatlas_etw::EtwStackTraceStatus>,
+    trace_stack_status_error: Option<&str>,
 ) -> Value {
     json!({
         "recording_id": recording_id,
@@ -2049,10 +2070,58 @@ fn recording_metadata_json(
         "started_at": started_at,
         "stopped_at": stopped_at,
         "adapter": adapter,
+        "stack_trace": stack_trace_metadata(
+            trace_stack_status,
+            trace_stack_status_error,
+            trace_start_error,
+        ),
         "trace_start_error": trace_start_error,
         "trace_consumer_error": trace_consumer_error,
         "operation_id": operation_id,
     })
+}
+
+fn stack_trace_metadata(
+    status: Option<dbgatlas_etw::EtwStackTraceStatus>,
+    status_error: Option<&str>,
+    trace_start_error: Option<&str>,
+) -> Value {
+    let mut warnings = Vec::new();
+    if let Some(error) = trace_start_error {
+        warnings.push(format!("native ETW trace session was not started: {error}"));
+    }
+    if let Some(error) = status_error {
+        warnings.push(format!("stack trace status unavailable: {error}"));
+    }
+    if let Some(status) = status {
+        if status.provider_stack_warning_count > 0 {
+            warnings.push(format!(
+                "stack trace provider enable fell back without stack for {} provider(s)",
+                status.provider_stack_warning_count
+            ));
+        }
+        if status.kernel_stack_warning_count > 0 {
+            warnings.push(format!(
+                "kernel stack tracing enable failed for {} configuration attempt(s)",
+                status.kernel_stack_warning_count
+            ));
+        }
+        json!({
+            "requested": status.requested,
+            "enabled": status.enabled,
+            "provider_stack_enabled": status.provider_stack_enabled,
+            "kernel_stack_enabled": status.kernel_stack_enabled,
+            "warnings": warnings,
+        })
+    } else {
+        json!({
+            "requested": true,
+            "enabled": false,
+            "provider_stack_enabled": false,
+            "kernel_stack_enabled": false,
+            "warnings": warnings,
+        })
+    }
 }
 
 fn etw_preset_flags(presets: &[RecordingPreset]) -> dbgatlas_etw::EtwPresetFlags {
@@ -4898,6 +4967,13 @@ mod tests {
             metadata["adapter"]["capabilities"]["realtime_consume"],
             true
         );
+        assert_eq!(
+            metadata["adapter"]["capabilities"]["event_stack_trace"],
+            true
+        );
+        assert_eq!(metadata["stack_trace"]["requested"], true);
+        assert!(metadata["stack_trace"]["enabled"].is_boolean());
+        assert!(metadata["stack_trace"]["warnings"].is_array());
     }
 
     #[test]
@@ -5002,6 +5078,10 @@ mod tests {
             assert!(event.get("tid").is_some());
             assert!(event.get("process").is_some());
             assert!(event.get("etw").is_some());
+            if let Some(stack) = event.get("stack") {
+                let frames = stack["frames"].as_array().unwrap();
+                assert!(frames.iter().all(|frame| frame.is_string()));
+            }
         }
     }
 

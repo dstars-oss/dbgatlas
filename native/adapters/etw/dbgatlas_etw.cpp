@@ -20,6 +20,13 @@ DEFINE_GUID(DA_KernelProcessProviderGuid, 0x22fb2cd6, 0x0e7b, 0x422b, 0xa0, 0xc7
 DEFINE_GUID(DA_KernelFileProviderGuid, 0xedd08927, 0x9cc4, 0x4e65, 0xb9, 0x70, 0xc2, 0x56, 0x0f, 0xb5, 0xc2, 0x89);
 DEFINE_GUID(DA_KernelRegistryProviderGuid, 0x70eb4f03, 0xc1de, 0x4f73, 0xa0, 0x51, 0x33, 0xd1, 0x3d, 0x54, 0x13, 0xbd);
 DEFINE_GUID(DA_KernelNetworkProviderGuid, 0x7dd42a49, 0x5329, 0x4832, 0x8d, 0xfd, 0x43, 0xd9, 0x79, 0x15, 0x3a, 0x88);
+DEFINE_GUID(DA_ClassicProcessGuid, 0x3d6fa8d0, 0xfe05, 0x11d0, 0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c);
+DEFINE_GUID(DA_ClassicThreadGuid, 0x3d6fa8d1, 0xfe05, 0x11d0, 0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c);
+DEFINE_GUID(DA_ClassicFileIoGuid, 0x90cbdc39, 0x4a3e, 0x11d1, 0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3);
+DEFINE_GUID(DA_ClassicTcpIpGuid, 0x9a280ac0, 0xc8e0, 0x11d1, 0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2);
+DEFINE_GUID(DA_ClassicUdpIpGuid, 0xbf3a50c5, 0xa9c9, 0x4988, 0xa0, 0x05, 0x2d, 0xf0, 0xb7, 0xc8, 0x0f, 0x80);
+DEFINE_GUID(DA_ClassicImageLoadGuid, 0x2cb15d1d, 0x5fc1, 0x11d2, 0xab, 0xe1, 0x00, 0xa0, 0xc9, 0x11, 0xf5, 0x18);
+DEFINE_GUID(DA_ClassicRegistryGuid, 0xae53722e, 0xc863, 0x11d2, 0x86, 0x59, 0x00, 0xc0, 0x4f, 0xa3, 0x21, 0xa1);
 #endif
 
 #include <algorithm>
@@ -30,10 +37,12 @@ DEFINE_GUID(DA_KernelNetworkProviderGuid, 0x7dd42a49, 0x5329, 0x4832, 0x8d, 0xfd
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <initializer_list>
 #include <memory>
 #include <new>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -265,6 +274,25 @@ struct EventMetadata final {
     std::unordered_map<std::string, std::string> string_fields;
 };
 
+struct ModuleInfo final {
+    uint64_t base = 0;
+    uint64_t size = 0;
+    std::string path;
+    std::string name;
+};
+
+struct StackTraceRuntimeStatus final {
+    bool requested = true;
+    bool provider_stack_enabled = false;
+    uint32_t provider_stack_warning_count = 0;
+    bool kernel_stack_enabled = false;
+    uint32_t kernel_stack_warning_count = 0;
+
+    bool enabled() const {
+        return provider_stack_enabled || kernel_stack_enabled;
+    }
+};
+
 std::string trace_info_string(PTRACE_EVENT_INFO info, ULONG offset) {
     if (info == nullptr || offset == 0) {
         return {};
@@ -380,6 +408,28 @@ std::optional<uint64_t> first_matching_number(
     return std::nullopt;
 }
 
+std::string hex_u64(uint64_t value, int min_width = 0) {
+    std::ostringstream out;
+    out << "0x" << std::hex << std::nouppercase;
+    if (min_width > 0) {
+        out << std::setw(min_width) << std::setfill('0');
+    }
+    out << value;
+    return out.str();
+}
+
+std::string format_address(uint64_t address) {
+    return hex_u64(address, address > 0xffffffffULL ? 16 : 8);
+}
+
+std::string file_name_from_path(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) {
+        return path;
+    }
+    return path.substr(slash + 1);
+}
+
 EventMetadata event_metadata(PEVENT_RECORD record) {
     EventMetadata metadata;
     ULONG buffer_size = 0;
@@ -428,7 +478,7 @@ EventMetadata event_metadata(PEVENT_RECORD record) {
     return metadata;
 }
 
-const char* classify_event(const EventNames& names, uint32_t preset_flags) {
+const char* event_category(const EventNames& names) {
     const std::string task_opcode = to_lower_ascii(names.task + " " + names.opcode);
     const std::string text = to_lower_ascii(names.provider + " " + names.task + " " + names.opcode);
     const char* category = nullptr;
@@ -445,6 +495,11 @@ const char* classify_event(const EventNames& names, uint32_t preset_flags) {
     } else if (contains_any(text, {"file", "disk"})) {
         category = "file";
     }
+    return category;
+}
+
+const char* classify_event(const EventNames& names, uint32_t preset_flags) {
+    const char* category = event_category(names);
     if (category == nullptr || !preset_enabled(preset_flags, category)) {
         return nullptr;
     }
@@ -468,6 +523,7 @@ struct ExtractionContext final {
     uint32_t skipped_events = 0;
     std::unordered_set<std::string> files_written;
     std::unordered_set<uint32_t> process_tree_pids;
+    std::unordered_map<uint32_t, std::vector<ModuleInfo>> modules_by_pid;
 };
 
 void initialize_process_tree(ExtractionContext& context) {
@@ -495,6 +551,116 @@ bool process_tree_allows_event(ExtractionContext& context, const EventMetadata& 
     }
 
     return context.process_tree_pids.find(event_pid) != context.process_tree_pids.end();
+}
+
+void update_module_map(ExtractionContext& context, const EventMetadata& metadata, const std::string& event_type, uint32_t pid) {
+    auto base = first_matching_number(metadata, {"imagebase", "baseaddress", "base"});
+    if (!base.has_value()) {
+        return;
+    }
+
+    auto& modules = context.modules_by_pid[pid];
+    const uint64_t image_base = *base;
+    const std::string lower_event_type = to_lower_ascii(event_type);
+    if (contains_any(lower_event_type, {"unload", "stop", "end"})) {
+        modules.erase(
+            std::remove_if(
+                modules.begin(),
+                modules.end(),
+                [image_base](const ModuleInfo& module) { return module.base == image_base; }),
+            modules.end());
+        return;
+    }
+
+    const auto image_path = first_matching_string(metadata, {"image", "filename", "file name"});
+    ModuleInfo module;
+    module.base = image_base;
+    module.size = first_matching_number(metadata, {"imagesize", "size"}).value_or(0);
+    module.path = image_path.value_or(std::string{});
+    module.name = file_name_from_path(module.path);
+    if (module.name.empty()) {
+        module.name = format_address(module.base);
+    }
+
+    modules.erase(
+        std::remove_if(
+            modules.begin(),
+            modules.end(),
+            [image_base](const ModuleInfo& existing) { return existing.base == image_base; }),
+        modules.end());
+    modules.push_back(std::move(module));
+}
+
+const ModuleInfo* find_module(const ExtractionContext& context, uint32_t pid, uint64_t address) {
+    auto find_in_modules = [address](const std::vector<ModuleInfo>& modules) -> const ModuleInfo* {
+        for (const auto& module : modules) {
+            if (address < module.base) {
+                continue;
+            }
+            if (module.size != 0 && address - module.base < module.size) {
+                return &module;
+            }
+        }
+        return nullptr;
+    };
+
+    if (auto it = context.modules_by_pid.find(pid); it != context.modules_by_pid.end()) {
+        if (const auto* module = find_in_modules(it->second); module != nullptr) {
+            return module;
+        }
+    }
+    if (auto it = context.modules_by_pid.find(0); it != context.modules_by_pid.end()) {
+        return find_in_modules(it->second);
+    }
+    return nullptr;
+}
+
+std::vector<uint64_t> stack_addresses(PEVENT_RECORD record) {
+    std::vector<uint64_t> addresses;
+    if (record == nullptr || record->ExtendedData == nullptr || record->ExtendedDataCount == 0) {
+        return addresses;
+    }
+
+    for (USHORT index = 0; index < record->ExtendedDataCount; ++index) {
+        const auto& item = record->ExtendedData[index];
+        if (item.DataPtr == 0 || item.DataSize <= sizeof(ULONG64)) {
+            continue;
+        }
+        if (item.ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE64) {
+            const auto* stack = reinterpret_cast<const EVENT_EXTENDED_ITEM_STACK_TRACE64*>(
+                static_cast<uintptr_t>(item.DataPtr));
+            const size_t count = (item.DataSize - sizeof(ULONG64)) / sizeof(ULONG64);
+            for (size_t frame = 0; frame < count; ++frame) {
+                if (stack->Address[frame] != 0) {
+                    addresses.push_back(stack->Address[frame]);
+                }
+            }
+            continue;
+        }
+        if (item.ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE32) {
+            const auto* stack = reinterpret_cast<const EVENT_EXTENDED_ITEM_STACK_TRACE32*>(
+                static_cast<uintptr_t>(item.DataPtr));
+            const size_t count = (item.DataSize - sizeof(ULONG64)) / sizeof(ULONG);
+            for (size_t frame = 0; frame < count; ++frame) {
+                if (stack->Address[frame] != 0) {
+                    addresses.push_back(stack->Address[frame]);
+                }
+            }
+        }
+    }
+    return addresses;
+}
+
+std::vector<std::string> stack_frames(const ExtractionContext& context, PEVENT_RECORD record, uint32_t pid) {
+    std::vector<std::string> frames;
+    for (const uint64_t address : stack_addresses(record)) {
+        if (const auto* module = find_module(context, pid, address); module != nullptr && address >= module->base) {
+            frames.push_back(module->name + "+" + hex_u64(address - module->base));
+        } else {
+            frames.push_back(format_address(address));
+        }
+    }
+    return frames;
 }
 
 std::string json_string_or_null(const std::optional<std::string>& value) {
@@ -588,6 +754,10 @@ void write_extracted_event(ExtractionContext& context, PEVENT_RECORD record, con
                                        ? metadata.names.opcode
                                        : (!metadata.names.task.empty() ? metadata.names.task : "event");
     const uint32_t process_pid = metadata.process_pid.value_or(event_pid);
+    if (std::strcmp(category, "image") == 0) {
+        update_module_map(context, metadata, event_type, process_pid);
+    }
+    const auto frames = stack_frames(context, record, process_pid);
     out << "{\"schema_version\":1"
         << ",\"timestamp\":{\"unix_millis\":" << unix_millis_from_etw_timestamp(record->EventHeader.TimeStamp) << "}"
         << ",\"category\":\"" << category << "\""
@@ -606,6 +776,16 @@ void write_extracted_event(ExtractionContext& context, PEVENT_RECORD record, con
         << json_string_or_null(first_matching_string(metadata, {"commandline", "command line"}))
         << "}";
     write_category_fields(out, metadata, category, event_type);
+    if (!frames.empty()) {
+        out << ",\"stack\":{\"frames\":[";
+        for (size_t index = 0; index < frames.size(); ++index) {
+            if (index != 0) {
+                out << ",";
+            }
+            out << "\"" << json_escape(frames[index]) << "\"";
+        }
+        out << "]}";
+    }
     out
         << ",\"operation_id\":null"
         << ",\"artifact_id\":null"
@@ -648,7 +828,20 @@ void WINAPI event_record_callback(PEVENT_RECORD record) {
         return;
     }
     const EventMetadata metadata = event_metadata(record);
-    const char* category = classify_event(metadata.names, context->preset_flags);
+    const char* raw_category = event_category(metadata.names);
+    if (raw_category == nullptr) {
+        context->skipped_events += 1;
+        return;
+    }
+    const std::string event_type = !metadata.names.opcode.empty()
+                                       ? metadata.names.opcode
+                                       : (!metadata.names.task.empty() ? metadata.names.task : "event");
+    if (std::strcmp(raw_category, "image") == 0 &&
+        process_tree_allows_event(*context, metadata, raw_category, record->EventHeader.ProcessId)) {
+        const uint32_t image_pid = metadata.process_pid.value_or(record->EventHeader.ProcessId);
+        update_module_map(*context, metadata, event_type, image_pid);
+    }
+    const char* category = preset_enabled(context->preset_flags, raw_category) ? raw_category : nullptr;
     if (category == nullptr) {
         context->skipped_events += 1;
         return;
@@ -752,8 +945,10 @@ public:
         }
 
         const EventMetadata metadata = event_metadata(record);
-        const char* category = classify_event(metadata.names, context_.preset_flags);
-        if (category == nullptr ||
+        const char* category = event_category(metadata.names);
+        const bool keep_for_output = category != nullptr && preset_enabled(context_.preset_flags, category);
+        const bool keep_for_module_map = category != nullptr && std::strcmp(category, "image") == 0;
+        if ((!keep_for_output && !keep_for_module_map) ||
             !process_tree_allows_event(context_, metadata, category, record->EventHeader.ProcessId)) {
             context_.skipped_events += 1;
             return S_OK;
@@ -762,7 +957,9 @@ public:
         hr = relogger->Inject(event);
         if (SUCCEEDED(hr)) {
             context_.events_written += 1;
-            context_.files_written.insert(category);
+            if (keep_for_output) {
+                context_.files_written.insert(category);
+            }
         } else {
             context_.skipped_events += 1;
         }
@@ -791,13 +988,14 @@ struct ProviderSpec final {
 std::vector<ProviderSpec> provider_specs(uint32_t preset_flags) {
     std::vector<ProviderSpec> providers;
     ULONGLONG process_keywords = 0;
-    if ((preset_flags & DA_ETW_PRESET_PROCESS) != 0) {
+    const uint32_t collection_flags = preset_flags == 0 ? 0 : preset_flags | DA_ETW_PRESET_IMAGE;
+    if ((collection_flags & DA_ETW_PRESET_PROCESS) != 0) {
         process_keywords |= 0x10;
     }
-    if ((preset_flags & DA_ETW_PRESET_THREAD) != 0) {
+    if ((collection_flags & DA_ETW_PRESET_THREAD) != 0) {
         process_keywords |= 0x20;
     }
-    if ((preset_flags & DA_ETW_PRESET_IMAGE) != 0) {
+    if ((collection_flags & DA_ETW_PRESET_IMAGE) != 0) {
         process_keywords |= 0x40;
     }
     if (process_keywords != 0) {
@@ -815,9 +1013,97 @@ std::vector<ProviderSpec> provider_specs(uint32_t preset_flags) {
     return providers;
 }
 
-ULONG enable_providers(TRACEHANDLE handle, const std::vector<ProviderSpec>& providers) {
+std::vector<CLASSIC_EVENT_ID> stack_trace_events(uint32_t preset_flags) {
+    std::vector<CLASSIC_EVENT_ID> events;
+    const uint32_t collection_flags = preset_flags == 0 ? 0 : preset_flags | DA_ETW_PRESET_IMAGE;
+    auto add = [&events](const GUID& guid, UCHAR type) {
+        CLASSIC_EVENT_ID event = {};
+        event.EventGuid = guid;
+        event.Type = type;
+        events.push_back(event);
+    };
+
+    if ((collection_flags & DA_ETW_PRESET_PROCESS) != 0) {
+        add(DA_ClassicProcessGuid, EVENT_TRACE_TYPE_START);
+        add(DA_ClassicProcessGuid, EVENT_TRACE_TYPE_END);
+    }
+    if ((collection_flags & DA_ETW_PRESET_THREAD) != 0) {
+        add(DA_ClassicThreadGuid, EVENT_TRACE_TYPE_START);
+        add(DA_ClassicThreadGuid, EVENT_TRACE_TYPE_END);
+    }
+    if ((collection_flags & DA_ETW_PRESET_IMAGE) != 0) {
+        add(DA_ClassicImageLoadGuid, EVENT_TRACE_TYPE_LOAD);
+    }
+    if ((collection_flags & DA_ETW_PRESET_FILE) != 0) {
+        add(DA_ClassicFileIoGuid, EVENT_TRACE_TYPE_IO_READ);
+        add(DA_ClassicFileIoGuid, EVENT_TRACE_TYPE_IO_WRITE);
+        add(DA_ClassicFileIoGuid, EVENT_TRACE_TYPE_IO_READ_INIT);
+        add(DA_ClassicFileIoGuid, EVENT_TRACE_TYPE_IO_WRITE_INIT);
+    }
+    if ((collection_flags & DA_ETW_PRESET_REGISTRY) != 0) {
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGCREATE);
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGOPEN);
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGDELETE);
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGQUERY);
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGSETVALUE);
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGDELETEVALUE);
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGQUERYVALUE);
+        add(DA_ClassicRegistryGuid, EVENT_TRACE_TYPE_REGCLOSE);
+    }
+    if ((collection_flags & DA_ETW_PRESET_NETWORK) != 0) {
+        add(DA_ClassicTcpIpGuid, EVENT_TRACE_TYPE_SEND);
+        add(DA_ClassicTcpIpGuid, EVENT_TRACE_TYPE_RECEIVE);
+        add(DA_ClassicTcpIpGuid, EVENT_TRACE_TYPE_CONNECT);
+        add(DA_ClassicTcpIpGuid, EVENT_TRACE_TYPE_DISCONNECT);
+        add(DA_ClassicTcpIpGuid, EVENT_TRACE_TYPE_ACCEPT);
+        add(DA_ClassicUdpIpGuid, EVENT_TRACE_TYPE_SEND);
+        add(DA_ClassicUdpIpGuid, EVENT_TRACE_TYPE_RECEIVE);
+    }
+    return events;
+}
+
+void enable_kernel_stack_tracing(TRACEHANDLE handle, uint32_t preset_flags, StackTraceRuntimeStatus& stack_status) {
+    const auto events = stack_trace_events(preset_flags);
+    if (events.empty()) {
+        return;
+    }
+
+    const ULONG status = TraceSetInformation(
+        handle,
+        TraceStackTracingInfo,
+        const_cast<CLASSIC_EVENT_ID*>(events.data()),
+        static_cast<ULONG>(events.size() * sizeof(CLASSIC_EVENT_ID)));
+    if (status == ERROR_SUCCESS) {
+        stack_status.kernel_stack_enabled = true;
+    } else {
+        stack_status.kernel_stack_warning_count += 1;
+    }
+}
+
+ULONG enable_providers(
+    TRACEHANDLE handle,
+    const std::vector<ProviderSpec>& providers,
+    StackTraceRuntimeStatus& stack_status) {
     for (const auto& provider : providers) {
-        const ULONG status = EnableTraceEx2(
+        ENABLE_TRACE_PARAMETERS params = {};
+        params.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+        params.EnableProperty = EVENT_ENABLE_PROPERTY_STACK_TRACE;
+        ULONG status = EnableTraceEx2(
+            handle,
+            &provider.id,
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+            TRACE_LEVEL_VERBOSE,
+            provider.match_any_keyword,
+            0,
+            0,
+            &params);
+        if (status == ERROR_SUCCESS) {
+            stack_status.provider_stack_enabled = true;
+            continue;
+        }
+
+        stack_status.provider_stack_warning_count += 1;
+        status = EnableTraceEx2(
             handle,
             &provider.id,
             EVENT_CONTROL_CODE_ENABLE_PROVIDER,
@@ -878,6 +1164,7 @@ struct DA_EtwSessionHandle {
     std::string session_name;
     std::string trace_path;
     std::vector<ProviderSpec> enabled_providers;
+    StackTraceRuntimeStatus stack_trace_status;
     std::unique_ptr<RealTimeConsumer> realtime_consumer;
 #endif
 };
@@ -890,7 +1177,7 @@ int32_t da_etw_abi_version(DA_EtwVersion* out) {
         out->struct_size = sizeof(DA_EtwVersion);
         out->flags = 0;
         out->abi_major = 0;
-        out->abi_minor = 1;
+        out->abi_minor = 2;
         out->abi_patch = 0;
         return DA_ETW_OK;
     });
@@ -904,7 +1191,8 @@ int32_t da_etw_adapter_info(DA_EtwAdapterInfo* out) {
         out->struct_size = sizeof(DA_EtwAdapterInfo);
         out->flags = 0;
         out->capability_flags =
-            DA_ETW_CAP_REALTIME_CONSUME | DA_ETW_CAP_FILE_TRACE | DA_ETW_CAP_PROCESS_TREE_FILTER;
+            DA_ETW_CAP_REALTIME_CONSUME | DA_ETW_CAP_FILE_TRACE | DA_ETW_CAP_PROCESS_TREE_FILTER |
+            DA_ETW_CAP_EVENT_STACK_TRACE;
         return DA_ETW_OK;
     });
 }
@@ -954,11 +1242,13 @@ int32_t da_etw_write_minimal_file_trace(
         }
 
         const auto providers = provider_specs(preset_flags);
-        status = enable_providers(handle, providers);
+        StackTraceRuntimeStatus stack_status;
+        status = enable_providers(handle, providers, stack_status);
         if (status != ERROR_SUCCESS) {
             ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
             return fail_win32("EnableTraceEx2", status);
         }
+        enable_kernel_stack_tracing(handle, preset_flags, stack_status);
 
         status = ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
         if (status != ERROR_SUCCESS) {
@@ -1001,18 +1291,54 @@ int32_t da_etw_session_start_file_trace(
         }
 
         auto providers = provider_specs(preset_flags);
-        status = enable_providers(handle, providers);
+        StackTraceRuntimeStatus stack_status;
+        status = enable_providers(handle, providers, stack_status);
         if (status != ERROR_SUCCESS) {
             ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
             return fail_win32("EnableTraceEx2", status);
         }
+        enable_kernel_stack_tracing(handle, preset_flags, stack_status);
 
         auto session = std::make_unique<DA_EtwSessionHandle>();
         session->handle = handle;
         session->session_name = session_name_utf8;
         session->trace_path = trace_path_utf8;
         session->enabled_providers = std::move(providers);
+        session->stack_trace_status = stack_status;
         *out_handle = session.release();
+        return DA_ETW_OK;
+#endif
+    });
+}
+
+int32_t da_etw_session_stack_trace_status(
+    DA_EtwSessionHandle* handle,
+    DA_EtwStackTraceStatus* out) {
+    return guard([&]() -> int32_t {
+        if (handle == nullptr) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "session handle is null");
+        }
+        if (out == nullptr) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "out stack trace status pointer is null");
+        }
+        out->struct_size = sizeof(DA_EtwStackTraceStatus);
+        out->flags = 0;
+#ifndef _WIN32
+        out->requested = 1;
+        out->enabled = 0;
+        out->provider_stack_enabled = 0;
+        out->provider_stack_warning_count = 0;
+        out->kernel_stack_enabled = 0;
+        out->kernel_stack_warning_count = 0;
+        return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW stack trace status is only available on Windows");
+#else
+        const auto& status = handle->stack_trace_status;
+        out->requested = status.requested ? 1u : 0u;
+        out->enabled = status.enabled() ? 1u : 0u;
+        out->provider_stack_enabled = status.provider_stack_enabled ? 1u : 0u;
+        out->provider_stack_warning_count = status.provider_stack_warning_count;
+        out->kernel_stack_enabled = status.kernel_stack_enabled ? 1u : 0u;
+        out->kernel_stack_warning_count = status.kernel_stack_warning_count;
         return DA_ETW_OK;
 #endif
     });

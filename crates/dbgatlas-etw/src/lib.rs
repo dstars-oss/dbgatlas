@@ -14,6 +14,7 @@ pub struct EtwCapabilities {
     pub realtime_consume: bool,
     pub file_trace: bool,
     pub process_tree_filter: bool,
+    pub event_stack_trace: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,16 @@ pub struct EtwEventExtractionResult {
     pub events_written: u32,
     pub files_written: u32,
     pub skipped_events: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtwStackTraceStatus {
+    pub requested: bool,
+    pub enabled: bool,
+    pub provider_stack_enabled: bool,
+    pub provider_stack_warning_count: u32,
+    pub kernel_stack_enabled: bool,
+    pub kernel_stack_warning_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -172,6 +183,24 @@ impl EtwFileSession {
         _root_pid: Option<u32>,
     ) -> Result<(), EtwError> {
         path_to_cstring(events_dir.as_ref())?;
+        Err(EtwError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
+    pub fn stack_trace_status(&self) -> Result<EtwStackTraceStatus, EtwError> {
+        let mut status = dbgatlas_etw_sys::DA_EtwStackTraceStatus {
+            struct_size: size_of::<dbgatlas_etw_sys::DA_EtwStackTraceStatus>() as u32,
+            ..Default::default()
+        };
+        let native_status = unsafe {
+            dbgatlas_etw_sys::da_etw_session_stack_trace_status(self.handle, &mut status)
+        };
+        status_to_result(native_status)?;
+        Ok(stack_trace_status_from_native(status))
+    }
+
+    #[cfg(not(windows))]
+    pub fn stack_trace_status(&self) -> Result<EtwStackTraceStatus, EtwError> {
         Err(EtwError::UnsupportedPlatform)
     }
 
@@ -360,6 +389,20 @@ fn capabilities_from_flags(flags: u32) -> EtwCapabilities {
         realtime_consume: flags & dbgatlas_etw_sys::DA_ETW_CAP_REALTIME_CONSUME != 0,
         file_trace: flags & dbgatlas_etw_sys::DA_ETW_CAP_FILE_TRACE != 0,
         process_tree_filter: flags & dbgatlas_etw_sys::DA_ETW_CAP_PROCESS_TREE_FILTER != 0,
+        event_stack_trace: flags & dbgatlas_etw_sys::DA_ETW_CAP_EVENT_STACK_TRACE != 0,
+    }
+}
+
+fn stack_trace_status_from_native(
+    status: dbgatlas_etw_sys::DA_EtwStackTraceStatus,
+) -> EtwStackTraceStatus {
+    EtwStackTraceStatus {
+        requested: status.requested != 0,
+        enabled: status.enabled != 0,
+        provider_stack_enabled: status.provider_stack_enabled != 0,
+        provider_stack_warning_count: status.provider_stack_warning_count,
+        kernel_stack_enabled: status.kernel_stack_enabled != 0,
+        kernel_stack_warning_count: status.kernel_stack_warning_count,
     }
 }
 
@@ -431,6 +474,7 @@ mod tests {
         assert!(info.capabilities.file_trace);
         assert!(info.capabilities.process_tree_filter);
         assert!(info.capabilities.realtime_consume);
+        assert!(info.capabilities.event_stack_trace);
     }
 
     #[cfg(not(windows))]
@@ -451,6 +495,26 @@ mod tests {
         assert!(capabilities.realtime_consume);
         assert!(!capabilities.file_trace);
         assert!(capabilities.process_tree_filter);
+        assert!(!capabilities.event_stack_trace);
+    }
+
+    #[test]
+    fn decodes_stack_trace_status() {
+        let status = stack_trace_status_from_native(dbgatlas_etw_sys::DA_EtwStackTraceStatus {
+            requested: 1,
+            enabled: 1,
+            provider_stack_enabled: 1,
+            provider_stack_warning_count: 2,
+            kernel_stack_enabled: 0,
+            kernel_stack_warning_count: 1,
+            ..Default::default()
+        });
+        assert!(status.requested);
+        assert!(status.enabled);
+        assert!(status.provider_stack_enabled);
+        assert_eq!(status.provider_stack_warning_count, 2);
+        assert!(!status.kernel_stack_enabled);
+        assert_eq!(status.kernel_stack_warning_count, 1);
     }
 
     #[test]

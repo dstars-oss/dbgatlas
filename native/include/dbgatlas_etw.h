@@ -30,7 +30,8 @@ typedef enum DA_EtwStatus {
 typedef enum DA_EtwCapabilityFlags {
     DA_ETW_CAP_REALTIME_CONSUME = 1u << 0,
     DA_ETW_CAP_FILE_TRACE = 1u << 1,
-    DA_ETW_CAP_PROCESS_TREE_FILTER = 1u << 2
+    DA_ETW_CAP_PROCESS_TREE_FILTER = 1u << 2,
+    DA_ETW_CAP_EVENT_STACK_TRACE = 1u << 3
 } DA_EtwCapabilityFlags;
 
 typedef enum DA_EtwPresetFlags {
@@ -63,6 +64,17 @@ typedef struct DA_EtwEventExtractionResult {
     uint32_t skipped_events;
 } DA_EtwEventExtractionResult;
 
+typedef struct DA_EtwStackTraceStatus {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t requested;
+    uint32_t enabled;
+    uint32_t provider_stack_enabled;
+    uint32_t provider_stack_warning_count;
+    uint32_t kernel_stack_enabled;
+    uint32_t kernel_stack_warning_count;
+} DA_EtwStackTraceStatus;
+
 typedef struct DA_EtwSessionHandle DA_EtwSessionHandle;
 
 DA_ETW_EXPORT int32_t da_etw_abi_version(DA_EtwVersion* out);
@@ -86,6 +98,9 @@ DA_ETW_EXPORT int32_t da_etw_session_start_realtime_consumer(
     uint32_t preset_flags,
     uint32_t has_root_pid,
     uint32_t root_pid);
+DA_ETW_EXPORT int32_t da_etw_session_stack_trace_status(
+    DA_EtwSessionHandle* handle,
+    DA_EtwStackTraceStatus* out);
 DA_ETW_EXPORT int32_t da_etw_session_stop(DA_EtwSessionHandle* handle);
 DA_ETW_EXPORT int32_t da_etw_extract_file_events(
     const char* trace_path_utf8,
