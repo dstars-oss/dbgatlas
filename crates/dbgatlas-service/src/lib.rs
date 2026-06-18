@@ -5731,6 +5731,77 @@ mod tests {
     }
 
     #[test]
+    fn recording_workspace_facts_exposes_reportable_event_materials() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let start = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+        let recording_id = start.result.unwrap()["recording_id"].clone();
+
+        let stop = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "recording.stop".to_string(),
+            params: Some(json!({ "recording_id": recording_id.clone() })),
+        });
+        assert!(stop.error.is_none(), "{:?}", stop.error);
+        let stop_operation_id =
+            serde_json::from_value::<OperationRef>(stop.result.unwrap()["operation_id"].clone())
+                .unwrap();
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let facts = workspace.facts().unwrap();
+        assert!(facts.operations.iter().any(|operation| {
+            operation.operation_id == stop_operation_id
+                && operation.capability == "recording.stop"
+                && matches!(operation.status, OperationStatus::Success)
+        }));
+
+        let recording_id = recording_id["id"].as_str().unwrap();
+        let expected = [
+            ("recording.metadata", "recording.json"),
+            ("recording.trace", "trace.etl"),
+            ("recording.events.process", "events/process.jsonl"),
+            ("recording.events.thread", "events/thread.jsonl"),
+            ("recording.events.image", "events/image.jsonl"),
+            ("recording.events.file", "events/file.jsonl"),
+            ("recording.events.registry", "events/registry.jsonl"),
+            ("recording.events.network", "events/network.jsonl"),
+        ];
+        for (kind, suffix) in expected {
+            let relative_path =
+                PathBuf::from(format!("artifacts/recordings/{recording_id}/{suffix}"));
+            let artifact = facts
+                .artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.kind == kind
+                        && artifact.relative_path == relative_path
+                        && artifact.operation_id.as_ref() == Some(&stop_operation_id)
+                })
+                .unwrap_or_else(|| panic!("missing reportable artifact {kind} at {suffix}"));
+            assert!(artifact.byte_len.unwrap_or_default() > 0);
+        }
+
+        let process_events = workspace
+            .root()
+            .join("artifacts")
+            .join("recordings")
+            .join(recording_id)
+            .join("events")
+            .join("process.jsonl");
+        let first_line = fs::read_to_string(process_events)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let event: Value = serde_json::from_str(&first_line).unwrap();
+        assert_eq!(event["recording_id"]["id"], recording_id);
+        assert_eq!(event["schema_version"], 1);
+        assert_eq!(event["category"], "process");
+    }
+
+    #[test]
     fn recording_cancel_is_terminal() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
@@ -5766,6 +5837,65 @@ mod tests {
             artifacts
                 .iter()
                 .any(|artifact| artifact.kind == "recording.trace")
+        );
+    }
+
+    #[test]
+    fn recording_kill_records_failed_operation_and_keeps_artifacts_in_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let start = create_recording(&host, temp.path(), json!({ "type": "attach", "pid": 42 }));
+        let recording_id = start.result.unwrap()["recording_id"].clone();
+
+        let kill = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "recording.kill".to_string(),
+            params: Some(json!({ "recording_id": recording_id.clone() })),
+        });
+
+        assert!(kill.error.is_none(), "{:?}", kill.error);
+        let result = kill.result.unwrap();
+        assert_eq!(result["state"], "killed");
+        assert_eq!(result["operation_status"], "failed");
+        let kill_operation_id =
+            serde_json::from_value::<OperationRef>(result["operation_id"].clone()).unwrap();
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let facts = workspace.facts().unwrap();
+        assert!(facts.operations.iter().any(|operation| {
+            operation.capability == "recording.kill"
+                && matches!(operation.status, OperationStatus::Failed)
+        }));
+        let recording_id = recording_id["id"].as_str().unwrap();
+        let recording_json = PathBuf::from(format!(
+            "artifacts/recordings/{recording_id}/recording.json"
+        ));
+        let trace = PathBuf::from(format!("artifacts/recordings/{recording_id}/trace.etl"));
+        assert!(
+            facts
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.relative_path == recording_json
+                    && artifact.kind == "recording.metadata"
+                    && artifact.operation_id.as_ref() == Some(&kill_operation_id))
+        );
+        assert!(
+            facts
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.relative_path == trace
+                    && artifact.kind == "recording.trace"
+                    && artifact.operation_id.as_ref() == Some(&kill_operation_id))
+        );
+        let recording_metadata: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.root().join(recording_json)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recording_metadata["state"], "killed");
+        assert_eq!(
+            recording_metadata["operation_id"],
+            serde_json::to_value(kill_operation_id).unwrap()
         );
     }
 
