@@ -64,7 +64,7 @@ flowchart LR
 ## MVP 1 service 边界
 
 - 同一个 `dbgatlas.exe` 提供 `service run` 开发模式、安装态 Windows service 入口和普通 CLI client 命令。
-- Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。安装时复制 `dbgatlas.exe`、`dbgatlas-worker.exe` 和 `dbgatlas_dbgeng.dll` 到 `%ProgramData%\DbgAtlas\bin\`，SCM 只指向该安装目录，避免锁住开发构建产物。
+- Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。安装时复制 `dbgatlas.exe`、`dbgatlas-worker.exe`、`dbgatlas_dbgeng.dll` 和 `dbgatlas_etw.dll` 到 `%ProgramData%\DbgAtlas\bin\`，配置/token 放在 `%ProgramData%\DbgAtlas\etc\`，服务日志放在 `%ProgramData%\DbgAtlas\var\log\`，SCM 只指向安装目录下的 binary，避免锁住开发构建产物。
 - `debug.session.create` 接收 `project_root` 和 target，返回 `session_id`；后续 `debug.eval`、`debug.modules`、`debug.threads`、`debug.stack`、`debug.session.close` 和 `debug.session.kill` 只需要 `session_id`。
 - 外部 service API 表达产品能力；内部 worker protocol 表达低层执行、状态、artifact 写入清单和进程控制。两者分层演进。
 - Worker identity 按 capability policy 选择：debug 默认 user session，ETW recording 默认 LocalSystem 或显式配置的受控 identity，IDA 默认 user session。权限不足时返回结构化错误，不自动提权。

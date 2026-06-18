@@ -34,8 +34,12 @@ pub const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DbgAtlas Service";
 pub const WINDOWS_SERVICE_DESCRIPTION: &str = "DbgAtlas local debugging service";
 pub const WINDOWS_SERVICE_DIR: &str = "DbgAtlas";
 pub const WINDOWS_SERVICE_BIN_DIR: &str = "bin";
+pub const WINDOWS_SERVICE_ETC_DIR: &str = "etc";
+pub const WINDOWS_SERVICE_VAR_DIR: &str = "var";
+pub const WINDOWS_SERVICE_LOG_DIR: &str = "log";
 pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
 pub const WINDOWS_SERVICE_TOKEN_FILE: &str = "token";
+pub const WINDOWS_SERVICE_LOG_RETENTION_DAYS: i64 = 7;
 pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
     "dbgatlas.exe",
     "dbgatlas-worker.exe",
@@ -2764,6 +2768,9 @@ pub struct ServiceInstallPaths {
     pub root_dir: PathBuf,
     pub bin_dir: PathBuf,
     pub staging_bin_dir: PathBuf,
+    pub etc_dir: PathBuf,
+    pub var_dir: PathBuf,
+    pub log_dir: PathBuf,
     pub config_path: PathBuf,
     pub token_file: PathBuf,
     pub installed_exe: PathBuf,
@@ -2772,14 +2779,28 @@ pub struct ServiceInstallPaths {
 impl ServiceInstallPaths {
     pub fn for_root(root_dir: PathBuf) -> Self {
         let bin_dir = root_dir.join(WINDOWS_SERVICE_BIN_DIR);
+        let etc_dir = root_dir.join(WINDOWS_SERVICE_ETC_DIR);
+        let var_dir = root_dir.join(WINDOWS_SERVICE_VAR_DIR);
+        let log_dir = var_dir.join(WINDOWS_SERVICE_LOG_DIR);
         Self {
             staging_bin_dir: root_dir.join("bin.staging"),
-            config_path: root_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
-            token_file: root_dir.join(WINDOWS_SERVICE_TOKEN_FILE),
+            config_path: etc_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
+            token_file: etc_dir.join(WINDOWS_SERVICE_TOKEN_FILE),
             installed_exe: bin_dir.join("dbgatlas.exe"),
             bin_dir,
+            etc_dir,
+            var_dir,
+            log_dir,
             root_dir,
         }
+    }
+
+    pub fn legacy_config_path(&self) -> PathBuf {
+        self.root_dir.join(WINDOWS_SERVICE_CONFIG_FILE)
+    }
+
+    pub fn legacy_token_file(&self) -> PathBuf {
+        self.root_dir.join(WINDOWS_SERVICE_TOKEN_FILE)
     }
 }
 
@@ -2825,6 +2846,7 @@ pub struct WindowsServiceCommandResult {
     pub installed_binary: PathBuf,
     pub config_path: PathBuf,
     pub token_file: PathBuf,
+    pub log_dir: PathBuf,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub payload: Vec<ServicePayloadFile>,
 }
@@ -2923,6 +2945,7 @@ fn create_runtime_config_if_missing(
     paths: &ServiceInstallPaths,
     bind: SocketAddr,
 ) -> Result<RuntimeConfig, ServiceError> {
+    fs::create_dir_all(&paths.etc_dir)?;
     if paths.config_path.exists() {
         return Ok(RuntimeConfig::load(&paths.config_path)?);
     }
@@ -2930,6 +2953,26 @@ fn create_runtime_config_if_missing(
     let runtime = RuntimeConfig::from_toml_str(&config)?;
     fs::write(&paths.config_path, config)?;
     Ok(runtime)
+}
+
+fn prepare_install_layout(paths: &ServiceInstallPaths) -> Result<(), ServiceError> {
+    fs::create_dir_all(&paths.root_dir)?;
+    fs::create_dir_all(&paths.etc_dir)?;
+    fs::create_dir_all(&paths.log_dir)?;
+    migrate_legacy_install_file(&paths.legacy_config_path(), &paths.config_path)?;
+    migrate_legacy_install_file(&paths.legacy_token_file(), &paths.token_file)?;
+    Ok(())
+}
+
+fn migrate_legacy_install_file(legacy_path: &Path, target_path: &Path) -> Result<(), ServiceError> {
+    if target_path.exists() || !legacy_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(legacy_path, target_path)?;
+    Ok(())
 }
 
 fn install_payload(
@@ -3016,7 +3059,6 @@ mod windows_service_control {
         options: WindowsServiceInstallOptions,
     ) -> Result<WindowsServiceCommandResult, ServiceError> {
         let paths = default_windows_service_paths();
-        fs::create_dir_all(&paths.root_dir)?;
         let current_exe = std::env::current_exe()?;
         let source_dir = current_exe.parent().ok_or_else(|| {
             ServiceError::ServiceControl("current executable has no parent".into())
@@ -3045,6 +3087,7 @@ mod windows_service_control {
             }
         }
 
+        prepare_install_layout(&paths)?;
         let runtime = create_runtime_config_if_missing(&paths, options.bind)?;
         ensure_token_file(&paths.token_file)?;
         install_payload(&payload, &paths)?;
@@ -3338,6 +3381,9 @@ mod windows_service_control {
             }
             return Ok(());
         }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let token = generate_token()?;
         fs::write(path, format!("{token}\n"))?;
         Ok(())
@@ -3396,6 +3442,7 @@ mod windows_service_control {
             installed_binary: paths.installed_exe,
             config_path: paths.config_path,
             token_file: paths.token_file,
+            log_dir: paths.log_dir,
             payload,
         }
     }
@@ -3451,12 +3498,100 @@ mod windows_service_control {
     fn append_service_log(message: &str) {
         let paths = default_windows_service_paths();
         let timestamp = Timestamp::now().unix_millis;
+        let day = (timestamp / 86_400_000) as i64;
         let line = format!("{timestamp} {message}\n");
+        let log_path = paths
+            .log_dir
+            .join(format!("service-{}.log", utc_date_from_unix_day(day)));
+        let _ = fs::create_dir_all(&paths.log_dir);
+        let _ = prune_service_logs(&paths.log_dir, day);
         let _ = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(paths.root_dir.join("service.log"))
+            .open(log_path)
             .and_then(|mut file| file.write_all(line.as_bytes()));
+    }
+
+    pub(super) fn prune_service_logs(log_dir: &Path, current_day: i64) -> Result<(), ServiceError> {
+        let cutoff_day = current_day - WINDOWS_SERVICE_LOG_RETENTION_DAYS + 1;
+        for entry in fs::read_dir(log_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(day) = service_log_file_day(file_name) else {
+                continue;
+            };
+            if day < cutoff_day {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn service_log_file_day(file_name: &str) -> Option<i64> {
+        let date = file_name.strip_prefix("service-")?.strip_suffix(".log")?;
+        let mut parts = date.split('-');
+        let year = parts.next()?.parse::<i32>().ok()?;
+        let month = parts.next()?.parse::<u32>().ok()?;
+        let day = parts.next()?.parse::<u32>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        unix_day_from_date(year, month, day)
+    }
+
+    pub(super) fn utc_date_from_unix_day(day: i64) -> String {
+        let (year, month, day) = date_from_unix_day(day);
+        format!("{year:04}-{month:02}-{day:02}")
+    }
+
+    fn date_from_unix_day(day: i64) -> (i32, u32, u32) {
+        let z = day + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2).div_euclid(153);
+        let d = doy - (153 * mp + 2).div_euclid(5) + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let year = y + if m <= 2 { 1 } else { 0 };
+        (year as i32, m as u32, d as u32)
+    }
+
+    pub(super) fn unix_day_from_date(year: i32, month: u32, day: u32) -> Option<i64> {
+        if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
+            return None;
+        }
+        let mut y = year as i64;
+        let m = month as i64;
+        let d = day as i64;
+        y -= if m <= 2 { 1 } else { 0 };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = m + if m > 2 { -3 } else { 9 };
+        let doy = (153 * mp + 2).div_euclid(5) + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        Some(era * 146_097 + doe - 719_468)
+    }
+
+    fn days_in_month(year: i32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if is_leap_year(year) => 29,
+            2 => 28,
+            _ => 0,
+        }
+    }
+
+    fn is_leap_year(year: i32) -> bool {
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
     }
 }
 
@@ -4463,17 +4598,23 @@ mod tests {
 
         assert_eq!(paths.root_dir, root);
         assert_eq!(paths.bin_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\bin"));
+        assert_eq!(paths.etc_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\etc"));
+        assert_eq!(paths.var_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\var"));
+        assert_eq!(
+            paths.log_dir,
+            PathBuf::from(r"C:\ProgramData\DbgAtlas\var\log")
+        );
         assert_eq!(
             paths.installed_exe,
             PathBuf::from(r"C:\ProgramData\DbgAtlas\bin\dbgatlas.exe")
         );
         assert_eq!(
             paths.config_path,
-            PathBuf::from(r"C:\ProgramData\DbgAtlas\runtime.toml")
+            PathBuf::from(r"C:\ProgramData\DbgAtlas\etc\runtime.toml")
         );
         assert_eq!(
             paths.token_file,
-            PathBuf::from(r"C:\ProgramData\DbgAtlas\token")
+            PathBuf::from(r"C:\ProgramData\DbgAtlas\etc\token")
         );
     }
 
@@ -4524,6 +4665,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
         fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
         fs::write(&paths.installed_exe, "").unwrap();
         fs::write(
             &paths.config_path,
@@ -4542,7 +4684,7 @@ mod tests {
     fn installed_client_config_ignores_stale_config_without_installed_binary() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
-        fs::create_dir_all(&paths.root_dir).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
         fs::write(
             &paths.config_path,
             "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
@@ -4571,6 +4713,63 @@ mod tests {
             ServiceError::Runtime(dbgatlas_runtime::RuntimeConfigError::NonLoopbackBind(_))
         ));
         assert!(!paths.config_path.exists());
+    }
+
+    #[test]
+    fn install_layout_migrates_legacy_config_and_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.root_dir).unwrap();
+        fs::write(
+            paths.legacy_config_path(),
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
+        )
+        .unwrap();
+        fs::write(paths.legacy_token_file(), "legacy-token\n").unwrap();
+
+        prepare_install_layout(&paths).unwrap();
+
+        assert!(paths.etc_dir.is_dir());
+        assert!(paths.log_dir.is_dir());
+        assert_eq!(
+            fs::read_to_string(&paths.config_path).unwrap(),
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.token_file).unwrap(),
+            "legacy-token\n"
+        );
+        assert!(!paths.legacy_config_path().exists());
+        assert!(!paths.legacy_token_file().exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_log_pruning_keeps_seven_calendar_days() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_day =
+            windows_service_control::unix_day_from_date(2026, 6, 18).expect("valid date");
+        for offset in 0..8 {
+            let day = current_day - offset;
+            let date = windows_service_control::utc_date_from_unix_day(day);
+            fs::write(temp.path().join(format!("service-{date}.log")), "").unwrap();
+        }
+        fs::write(temp.path().join("other.log"), "").unwrap();
+
+        windows_service_control::prune_service_logs(temp.path(), current_day).unwrap();
+
+        assert!(temp.path().join("service-2026-06-18.log").is_file());
+        assert!(temp.path().join("service-2026-06-12.log").is_file());
+        assert!(!temp.path().join("service-2026-06-11.log").exists());
+        assert!(temp.path().join("other.log").is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_log_file_day_rejects_invalid_dates() {
+        assert!(windows_service_control::service_log_file_day("service-2026-02-29.log").is_none());
+        assert!(windows_service_control::service_log_file_day("service-2024-02-29.log").is_some());
+        assert!(windows_service_control::service_log_file_day("service-latest.log").is_none());
     }
 
     #[test]

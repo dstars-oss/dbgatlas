@@ -13,7 +13,7 @@ MVP 0 through MVP 1 contain:
 - Controlled artifact helpers for debug sessions and reserved recording/reverse artifact layouts.
 - A C++20 DbgEng native DLL with adapter-specific C ABI for open dump, attach process, raw command execution, session symbol path append, and virtual memory reads.
 - CLI commands for workspace initialization, workspace inspection, service dev mode, and debug session workflows.
-- Windows Service lifecycle commands that install an isolated runtime payload under `%ProgramData%\DbgAtlas\bin\`.
+- Windows Service lifecycle commands that install an isolated runtime payload under `%ProgramData%\DbgAtlas\bin\`, machine config under `etc\`, and service logs under `var\log\`.
 
 Useful commands:
 

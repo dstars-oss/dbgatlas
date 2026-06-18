@@ -658,6 +658,7 @@ fn print_service_command_result(
     println!("binary: {}", result.installed_binary.display());
     println!("config: {}", result.config_path.display());
     println!("token file: {}", result.token_file.display());
+    println!("log dir: {}", result.log_dir.display());
     Ok(())
 }
 
