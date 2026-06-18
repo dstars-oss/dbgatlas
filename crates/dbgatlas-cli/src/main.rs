@@ -337,7 +337,8 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
                 bearer_token: token,
             };
             if !as_json {
-                println!("DbgAtlas service listening on http://{}/rpc", config.bind);
+                println!("DbgAtlas service RPC listening on http://{}/rpc", config.bind);
+                println!("DbgAtlas MCP listening on http://{}/mcp", config.bind);
             }
             run_http_service(config, ServiceHost::with_process_workers()?)?;
         }
@@ -653,7 +654,8 @@ fn print_service_command_result(
     println!("service: {}", result.service_name);
     println!("status: {}", result.status);
     if let Some(endpoint) = result.endpoint {
-        println!("endpoint: http://{endpoint}/rpc");
+        println!("rpc endpoint: http://{endpoint}/rpc");
+        println!("mcp endpoint: http://{endpoint}/mcp");
     }
     println!("binary: {}", result.installed_binary.display());
     println!("config: {}", result.config_path.display());

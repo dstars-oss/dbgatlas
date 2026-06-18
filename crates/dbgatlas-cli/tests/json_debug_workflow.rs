@@ -1,6 +1,6 @@
 use dbgatlas_service::{ServiceConfig, ServiceHost, ServiceShutdown, run_http_service_until};
 use serde_json::Value;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -200,7 +200,7 @@ fn unused_loopback_endpoint() -> SocketAddr {
 
 fn wait_for_service(endpoint: SocketAddr) {
     for _ in 0..50 {
-        if TcpListener::bind(endpoint).is_err() {
+        if TcpStream::connect(endpoint).is_ok() {
             return;
         }
         thread::sleep(Duration::from_millis(20));

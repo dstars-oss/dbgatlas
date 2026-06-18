@@ -41,3 +41,18 @@ cargo run -p dbgatlas-cli -- debug add-symbols <session-id> "srv*C:\symbols*http
 cargo run -p dbgatlas-cli -- debug read-memory <session-id> --address 0x1000 --length 64
 cargo run -p dbgatlas-cli -- debug session close <session-id>
 ```
+
+Codex can connect to the service-hosted HTTP MCP endpoint with a bearer token
+kept in the local environment:
+
+```toml
+[mcp_servers.dbgatlas]
+url = "http://127.0.0.1:7331/mcp"
+bearer_token_env_var = "DBGATLAS_TOKEN"
+enabled = true
+startup_timeout_sec = 10
+tool_timeout_sec = 120
+```
+
+For the development service command above, start Codex with
+`DBGATLAS_TOKEN=dev-token`.

@@ -72,8 +72,8 @@ Tasks:
 - [x] 完善 command audit log。
 - [x] 稳定 CLI JSON 输出中的 operation status、artifact ref、raw output ref。
 - [x] 让 `--json` 输出覆盖主要 CLI 命令。
-- [x] 新增 `dbgatlas-mcp` 入口 crate。
-- [x] MCP server 只调用 core / domain manager，不复制 debug/recording 业务逻辑。
+- [x] 新增 service-hosted HTTP MCP 入口。
+- [x] MCP server 只调用 core / domain manager，不复制 debug/recording 业务逻辑，不提供独立 stdio MCP 进程。
 - [x] 为 CLI 与 MCP 共享 workflow 增加测试。
 - [x] 文档说明 AI agent 如何读取 workspace facts 并引用 artifact / operation id。
 

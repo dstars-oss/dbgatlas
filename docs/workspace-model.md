@@ -96,6 +96,17 @@ MCP 场景下使用 `workspace.facts` tool，参数为内部 workspace 路径：
 }
 ```
 
+Codex 通过 service-hosted HTTP MCP endpoint 接入，token 从本地环境读取：
+
+```toml
+[mcp_servers.dbgatlas]
+url = "http://127.0.0.1:7331/mcp"
+bearer_token_env_var = "DBGATLAS_TOKEN"
+enabled = true
+startup_timeout_sec = 10
+tool_timeout_sec = 120
+```
+
 debug workflow 的 CLI 和 MCP 调用都返回同一组引用字段：
 
 - `operation_id`：本次操作的稳定引用。

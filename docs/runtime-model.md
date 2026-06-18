@@ -57,7 +57,7 @@ SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe
 
 安装态 service 日志写入 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 
-开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。
+开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。
 
 ## Recording Runtime
 
@@ -78,7 +78,7 @@ recording policy 的文档目标：
 - 本地服务默认只绑定 loopback。
 - 安装态服务配置和机器级 bearer token 默认属于 `%ProgramData%\DbgAtlas\etc\`。
 - 安装态 bearer token 不进入 `runtime.toml`，CLI 普通输出不显示 token 内容。
-- 对外 HTTP API 需要 bearer token，并校验来自浏览器类客户端的 `Origin`。
+- 对外 HTTP API（包括 `/rpc` 和 `/mcp`）需要 bearer token，并校验来自浏览器类客户端的 `Origin`。
 - path、symbol path、proxy value 拒绝控制字符。
 - proxy env 只允许明确支持的 key。
 - recording provider/preset/filter 配置不得写入 workspace manifest；workspace 只保存实际 recording metadata 和 artifact 引用。

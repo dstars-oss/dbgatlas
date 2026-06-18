@@ -198,6 +198,104 @@ impl ServiceHost {
         }
     }
 
+    pub fn handle_mcp(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        if request.id.is_none() {
+            let _ = self.handle_mcp_method(request);
+            return None;
+        }
+        let id = request.id.clone();
+        Some(match self.handle_mcp_method(request) {
+            Ok(result) => JsonRpcResponse::result(id, result),
+            Err(error) => JsonRpcResponse::error(id, mcp_error_for(error)),
+        })
+    }
+
+    fn handle_mcp_method(&self, request: JsonRpcRequest) -> Result<Value, ServiceError> {
+        match request.method.as_str() {
+            "initialize" => Ok(json!({
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {
+                    "name": "dbgatlas-mcp",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "tools": {},
+                },
+            })),
+            "ping" => Ok(json!({})),
+            "notifications/initialized" => Ok(json!(null)),
+            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors() })),
+            "tools/call" => {
+                let params: ToolCallParams =
+                    serde_json::from_value(request.params.unwrap_or_else(|| json!({})))?;
+                let result = self.call_mcp_tool_output(
+                    &params.name,
+                    params.arguments.unwrap_or_else(|| json!({})),
+                )?;
+                Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&result.value)?,
+                    }],
+                    "isError": result.is_error,
+                }))
+            }
+            other => Err(ServiceError::Rpc(format!("unknown MCP method `{other}`"))),
+        }
+    }
+
+    fn call_mcp_tool_output(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolCallOutput, ServiceError> {
+        match name {
+            "service.health"
+            | "service.info"
+            | "operation.get"
+            | "operation.cancel"
+            | "operation.stream"
+            | "debug.session.create"
+            | "debug.session.close"
+            | "debug.session.kill"
+            | "debug.eval"
+            | "debug.modules"
+            | "debug.threads"
+            | "debug.stack"
+            | "debug.add_symbols"
+            | "debug.read_memory" => self.call_mcp_service_tool(name, arguments),
+            "workspace.facts" => Ok(ToolCallOutput::success(self.mcp_workspace_facts(arguments)?)),
+            other => Err(ServiceError::Rpc(format!(
+                "unknown DbgAtlas tool `{other}`"
+            ))),
+        }
+    }
+
+    fn call_mcp_service_tool(
+        &self,
+        method: &str,
+        arguments: Value,
+    ) -> Result<ToolCallOutput, ServiceError> {
+        if !arguments.is_object() {
+            return Err(ServiceError::Rpc(
+                "tool arguments must be a JSON object".to_string(),
+            ));
+        }
+        let response = self.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: method.to_string(),
+            params: Some(arguments),
+        });
+        Ok(mcp_service_response_result(response))
+    }
+
+    fn mcp_workspace_facts(&self, arguments: Value) -> Result<Value, ServiceError> {
+        let params: WorkspaceFactsParams = serde_json::from_value(arguments)?;
+        let workspace = Workspace::open(params.path)?;
+        Ok(serde_json::to_value(workspace.facts()?)?)
+    }
+
     fn service_health(&self) -> Result<Value, ServiceError> {
         Ok(json!({
             "status": "ok",
@@ -3925,6 +4023,183 @@ impl JsonRpcResponse {
     }
 }
 
+struct ToolCallOutput {
+    value: Value,
+    is_error: bool,
+}
+
+impl ToolCallOutput {
+    fn success(value: Value) -> Self {
+        Self {
+            value,
+            is_error: false,
+        }
+    }
+
+    fn error(value: Value) -> Self {
+        Self {
+            value,
+            is_error: true,
+        }
+    }
+}
+
+fn mcp_service_response_result(response: JsonRpcResponse) -> ToolCallOutput {
+    if let Some(error) = response.error {
+        return ToolCallOutput::error(json!({
+            "error": {
+                "code": error.code,
+                "message": error.message,
+            }
+        }));
+    }
+    ToolCallOutput::success(response.result.unwrap_or_else(|| json!(null)))
+}
+
+fn mcp_tool_descriptors() -> Vec<Value> {
+    vec![
+        mcp_tool(
+            "service.health",
+            "Return DbgAtlas service health.",
+            json!({}),
+        ),
+        mcp_tool(
+            "service.info",
+            "Return DbgAtlas service information.",
+            json!({}),
+        ),
+        mcp_tool(
+            "debug.session.create",
+            "Create a debug session from a dump or attach target.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_root": { "type": "string" },
+                    "target": { "type": "object" }
+                },
+                "required": ["project_root", "target"]
+            }),
+        ),
+        mcp_tool(
+            "debug.eval",
+            "Execute a raw WinDbg command in an existing session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "object" },
+                    "command": { "type": "string" }
+                },
+                "required": ["session_id", "command"]
+            }),
+        ),
+        mcp_tool(
+            "debug.modules",
+            "List modules for a debug session.",
+            mcp_session_schema(),
+        ),
+        mcp_tool(
+            "debug.threads",
+            "List threads for a debug session.",
+            mcp_session_schema(),
+        ),
+        mcp_tool(
+            "debug.stack",
+            "Get stack for a debug session.",
+            mcp_session_schema(),
+        ),
+        mcp_tool(
+            "debug.add_symbols",
+            "Add a symbol path to a debug session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "object" },
+                    "symbol_path": { "type": "string" },
+                    "reload": { "type": "boolean" }
+                },
+                "required": ["session_id", "symbol_path"]
+            }),
+        ),
+        mcp_tool(
+            "debug.read_memory",
+            "Read virtual memory to an artifact.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "object" },
+                    "address": {},
+                    "length": { "type": "integer" }
+                },
+                "required": ["session_id", "address", "length"]
+            }),
+        ),
+        mcp_tool(
+            "debug.session.close",
+            "Close a debug session.",
+            mcp_session_schema(),
+        ),
+        mcp_tool(
+            "debug.session.kill",
+            "Kill a debug session worker.",
+            mcp_session_schema(),
+        ),
+        mcp_tool(
+            "operation.get",
+            "Return an operation status and artifact refs.",
+            mcp_operation_schema(),
+        ),
+        mcp_tool(
+            "operation.cancel",
+            "Cancel a running operation.",
+            mcp_operation_schema(),
+        ),
+        mcp_tool(
+            "operation.stream",
+            "Return operation events.",
+            mcp_operation_schema(),
+        ),
+        mcp_tool(
+            "workspace.facts",
+            "Read workspace facts: artifact registry, operations, and command audit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"]
+            }),
+        ),
+    ]
+}
+
+fn mcp_tool(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+    })
+}
+
+fn mcp_session_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": { "type": "object" }
+        },
+        "required": ["session_id"]
+    })
+}
+
+fn mcp_operation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation_id": { "type": "object" }
+        },
+        "required": ["operation_id"]
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i64,
@@ -3983,6 +4258,18 @@ struct DebugReadMemoryParams {
 #[derive(Clone, Debug, Deserialize)]
 struct OperationGetParams {
     operation_id: OperationRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallParams {
+    name: String,
+    #[serde(default)]
+    arguments: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceFactsParams {
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -4078,8 +4365,16 @@ fn handle_http_stream(
     if rpc.jsonrpc != "2.0" {
         return Err(ServiceError::Rpc("jsonrpc must be `2.0`".to_string()));
     }
-    let response = host.handle_rpc(rpc);
-    http_json_response(200, &response)
+    match request.path.as_str() {
+        "/rpc" => http_json_response(200, &host.handle_rpc(rpc)),
+        "/mcp" => match host.handle_mcp(rpc) {
+            Some(response) => http_json_response(200, &response),
+            None => Ok(http_empty_response(202, "Accepted")),
+        },
+        other => Err(ServiceError::InvalidHttpRequest(format!(
+            "unsupported path `{other}`"
+        ))),
+    }
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ServiceError> {
@@ -4154,7 +4449,7 @@ fn authorize_http_request(
     request: &HttpRequest,
     config: &ServiceConfig,
 ) -> Result<(), ServiceError> {
-    if request.path != "/rpc" {
+    if !matches!(request.path.as_str(), "/rpc" | "/mcp") {
         return Err(ServiceError::InvalidHttpRequest(format!(
             "unsupported path `{}`",
             request.path
@@ -4186,6 +4481,10 @@ fn http_json_response(status: u16, value: &JsonRpcResponse) -> Result<String, Se
         body.len(),
         body
     ))
+}
+
+fn http_empty_response(status: u16, reason: &str) -> String {
+    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 }
 
 struct HttpRequest {
@@ -4315,6 +4614,13 @@ fn rpc_error_for(error: ServiceError) -> JsonRpcError {
     };
     JsonRpcError {
         code,
+        message: error.to_string(),
+    }
+}
+
+fn mcp_error_for(error: ServiceError) -> JsonRpcError {
+    JsonRpcError {
+        code: -32000,
         message: error.to_string(),
     }
 }
@@ -5595,6 +5901,341 @@ mod tests {
         assert!(!is_allowed_origin("http://localhost.evil.test"));
         assert!(!is_allowed_origin("http://127.0.0.1.evil.test"));
         assert!(!is_allowed_origin("http://[::1].evil.test"));
+    }
+
+    #[test]
+    fn http_mcp_initialize_returns_capabilities() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 200);
+        let body = http_body_json(&response);
+        assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(body["result"]["serverInfo"]["name"], "dbgatlas-mcp");
+        assert!(body["result"]["capabilities"].get("tools").is_some());
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_tools_list_returns_current_tools() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 200);
+        let body = http_body_json(&response);
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "debug.eval"));
+        assert!(tools.iter().any(|tool| tool["name"] == "workspace.facts"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "recording.start"));
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_ping_returns_empty_result() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "ping",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 200);
+        assert_eq!(http_body_json(&response)["result"], json!({}));
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_notifications_return_accepted_without_body() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 202);
+        assert!(response.ends_with("\r\n\r\n"));
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_debug_workflow_uses_service_results_with_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = start_mock_http_service();
+        let create = mcp_tool_call(
+            server.endpoint,
+            "debug.session.create",
+            json!({
+                "project_root": temp.path(),
+                "target": { "kind": "dump", "path": "sample.dmp" }
+            }),
+        );
+        let session_id = create["session_id"].clone();
+        let eval = mcp_tool_call(
+            server.endpoint,
+            "debug.eval",
+            json!({
+                "session_id": session_id,
+                "command": ".echo from-http-mcp"
+            }),
+        );
+
+        assert_eq!(eval["operation_status"], "success");
+        assert!(eval["raw_output_ref"].get("id").is_some());
+        assert_eq!(eval["artifact_refs"].as_array().unwrap().len(), 3);
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_workspace_facts_reads_recording_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = start_mock_http_service();
+        let create = mcp_tool_call(
+            server.endpoint,
+            "debug.session.create",
+            json!({
+                "project_root": temp.path(),
+                "target": { "kind": "dump", "path": "sample.dmp" }
+            }),
+        );
+        let session_id = create["session_id"].clone();
+        mcp_tool_call(
+            server.endpoint,
+            "debug.eval",
+            json!({
+                "session_id": session_id,
+                "command": ".echo facts"
+            }),
+        );
+
+        let facts = mcp_tool_call(
+            server.endpoint,
+            "workspace.facts",
+            json!({ "path": temp.path().join(INTERNAL_WORKSPACE_DIR) }),
+        );
+
+        assert_eq!(facts["command_audit"].as_array().unwrap().len(), 1);
+        assert!(
+            facts["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["capability"] == "debug.eval")
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_rejects_missing_bearer_token() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            None,
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 401);
+        assert_eq!(http_body_json(&response)["error"]["code"], -32001);
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_rejects_non_loopback_origin() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            Some("test-token"),
+            Some("http://localhost.evil.test"),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 403);
+        assert_eq!(http_body_json(&response)["error"]["code"], -32002);
+        server.stop();
+    }
+
+    #[test]
+    fn http_rpc_path_still_returns_health() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/rpc",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "service.health",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 200);
+        assert_eq!(http_body_json(&response)["result"]["status"], "ok");
+        server.stop();
+    }
+
+    struct TestServer {
+        endpoint: SocketAddr,
+        shutdown: ServiceShutdown,
+        handle: std::thread::JoinHandle<Result<(), ServiceError>>,
+    }
+
+    impl TestServer {
+        fn stop(self) {
+            self.shutdown.request_stop();
+            self.handle.join().unwrap().unwrap();
+        }
+    }
+
+    fn start_mock_http_service() -> TestServer {
+        let endpoint = unused_loopback_endpoint();
+        let shutdown = ServiceShutdown::new();
+        let server_shutdown = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            run_http_service_until(
+                ServiceConfig {
+                    bind: endpoint,
+                    bearer_token: "test-token".to_string(),
+                },
+                ServiceHost::with_mock_workers(),
+                server_shutdown,
+            )
+        });
+        wait_for_service(endpoint);
+        TestServer {
+            endpoint,
+            shutdown,
+            handle,
+        }
+    }
+
+    fn unused_loopback_endpoint() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        drop(listener);
+        endpoint
+    }
+
+    fn wait_for_service(endpoint: SocketAddr) {
+        for _ in 0..50 {
+            if TcpStream::connect(endpoint).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("service did not start at {endpoint}");
+    }
+
+    fn post_json(
+        endpoint: SocketAddr,
+        path: &str,
+        token: Option<&str>,
+        origin: Option<&str>,
+        body: Value,
+    ) -> String {
+        let body = serde_json::to_string(&body).unwrap();
+        let mut stream = TcpStream::connect(endpoint).unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {endpoint}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        )
+        .unwrap();
+        if let Some(token) = token {
+            write!(stream, "Authorization: Bearer {token}\r\n").unwrap();
+        }
+        if let Some(origin) = origin {
+            write!(stream, "Origin: {origin}\r\n").unwrap();
+        }
+        write!(stream, "\r\n{body}").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn http_status(response: &str) -> u16 {
+        response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse().ok())
+            .unwrap()
+    }
+
+    fn http_body_json(response: &str) -> Value {
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+
+    fn mcp_tool_call(endpoint: SocketAddr, name: &str, arguments: Value) -> Value {
+        let response = post_json(
+            endpoint,
+            "/mcp",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }),
+        );
+        assert_eq!(http_status(&response), 200);
+        let body = http_body_json(&response);
+        assert_eq!(body["result"]["isError"], false, "{body}");
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
 
     fn create_debug_session(host: &ServiceHost, project_root: &Path) -> JsonRpcResponse {

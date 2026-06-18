@@ -1,5 +1,6 @@
 /target/
 /build/
 /scratch-workspace/
+/.codex/
 *.pdb
 *.ilk
