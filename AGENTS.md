@@ -92,3 +92,21 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 `GOALS.md` 是项目的 milestone task list。完成一个 feature 后，应在同一个变更中更新对应 checkbox；只有实现、文档和验证都完成后才标记为已完成。如果 feature 改变了里程碑范围，应先同步调整 `GOALS.md`，再继续实现。
 
 完成非平凡代码、构建、schema 或测试改动后，应运行最相关且范围最小的验证命令。若无法运行，应说明原因和已完成的替代检查。
+
+## 当前运行入口约定
+
+`dbgatlas service` 是当前安装态和开发态的主入口。它在同一个 loopback HTTP listener 上暴露两个 endpoint：`/rpc` 是 DbgAtlas 自有 JSON-RPC API，`/mcp` 是 Codex 等 MCP 客户端使用的 HTTP MCP endpoint。项目不再维护独立的 stdio MCP server 或 `dbgatlas-mcp` crate。
+
+`/rpc` 和 `/mcp` 共享 bearer token、loopback bind 限制和浏览器类客户端的 `Origin` 校验。Codex 项目配置可放在本地 `.codex/config.toml`，但 `.codex/` 应保持 ignored，不提交；token 通过 `DBGATLAS_TOKEN` 等本机环境变量传入，不写进仓库。
+
+`dbgatlas service install` 不应覆盖已有 `%ProgramData%\DbgAtlas\etc\runtime.toml` 或 `%ProgramData%\DbgAtlas\etc\token`。`--force` 只用于更新 installed payload 和 Windows service entry，不重置 token/config。
+
+涉及 service、MCP、CLI HTTP client 或安装态行为的改动，优先运行：
+
+```powershell
+cargo test -p dbgatlas-service
+cargo test -p dbgatlas-cli
+cargo test --workspace
+```
+
+验证安装态 service / MCP 时，优先检查 `dbgatlas service status --json`、`%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，以及相关 analysis workspace 的 `artifacts/operations.jsonl` 和 `artifacts/command_audit.jsonl`。
