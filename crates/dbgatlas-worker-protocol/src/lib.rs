@@ -51,6 +51,26 @@ pub enum WorkerRequest {
         length: u64,
         artifact_dir: PathBuf,
     },
+    OpenReverseSession {
+        session_id: SessionRef,
+        reverse_session_id: SessionRef,
+        ida_install_dir: PathBuf,
+        database_path: PathBuf,
+        artifact_dir: PathBuf,
+    },
+    LookupReverseFunction {
+        session_id: SessionRef,
+        reverse_session_id: SessionRef,
+        operation_id: OperationRef,
+        runtime_address: u64,
+        runtime_module_base: u64,
+        ida_image_base: u64,
+        artifact_dir: PathBuf,
+    },
+    CloseReverseSession {
+        session_id: SessionRef,
+        reverse_session_id: SessionRef,
+    },
     CloseSession {
         session_id: SessionRef,
     },
@@ -78,11 +98,32 @@ pub enum WorkerResponse {
         result: DebugMemoryResult,
         writes: Vec<WorkerArtifactWrite>,
     },
+    ReverseSessionOpened {
+        reverse_session_id: SessionRef,
+        writes: Vec<WorkerArtifactWrite>,
+    },
+    ReverseFunctionLookup {
+        result: ReverseFunctionLookupResult,
+        writes: Vec<WorkerArtifactWrite>,
+    },
     Failed {
         code: String,
         message: String,
         writes: Vec<WorkerArtifactWrite>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseFunctionLookupResult {
+    pub runtime_address: u64,
+    pub runtime_module_base: u64,
+    pub rva: u64,
+    pub ida_image_base: u64,
+    pub ida_ea: u64,
+    pub function_start: u64,
+    pub function_end: u64,
+    pub function_name: String,
+    pub found: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +182,7 @@ pub fn decode_jsonl<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbgatlas_model::{Id, SessionRef};
+    use dbgatlas_model::{Id, OperationRef, SessionRef};
 
     #[test]
     fn request_round_trips_as_jsonl() {
@@ -174,6 +215,76 @@ mod tests {
         let encoded = encode_jsonl(&request).unwrap();
         let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn reverse_requests_round_trip_as_jsonl() {
+        let session_id = SessionRef::new(Id::new("session-001").unwrap());
+        let reverse_session_id = SessionRef::new(Id::new("reverse-001").unwrap());
+        let open = WorkerEnvelope::new(
+            "req-rev-open",
+            WorkerRequest::OpenReverseSession {
+                session_id: session_id.clone(),
+                reverse_session_id: reverse_session_id.clone(),
+                ida_install_dir: PathBuf::from(r"C:\Program Files\IDA Professional 9.3"),
+                database_path: PathBuf::from(r"C:\case\sample.i64"),
+                artifact_dir: PathBuf::from(
+                    r"C:\case\dbgatlas\artifacts\reverse_sessions\session-001",
+                ),
+            },
+        );
+        let lookup = WorkerEnvelope::new(
+            "req-rev-lookup",
+            WorkerRequest::LookupReverseFunction {
+                session_id: session_id.clone(),
+                reverse_session_id: reverse_session_id.clone(),
+                operation_id: OperationRef::new(Id::new("op-001").unwrap()),
+                runtime_address: 0x180001234,
+                runtime_module_base: 0x180000000,
+                ida_image_base: 0x140000000,
+                artifact_dir: PathBuf::from(
+                    r"C:\case\dbgatlas\artifacts\reverse_sessions\session-001",
+                ),
+            },
+        );
+        let close = WorkerEnvelope::new(
+            "req-rev-close",
+            WorkerRequest::CloseReverseSession {
+                session_id,
+                reverse_session_id,
+            },
+        );
+
+        for request in [open, lookup, close] {
+            let encoded = encode_jsonl(&request).unwrap();
+            let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn reverse_lookup_response_round_trips_as_jsonl() {
+        let response = WorkerEnvelope::new(
+            "req-rev-lookup",
+            WorkerResponse::ReverseFunctionLookup {
+                result: ReverseFunctionLookupResult {
+                    runtime_address: 0x180001234,
+                    runtime_module_base: 0x180000000,
+                    rva: 0x1234,
+                    ida_image_base: 0x140000000,
+                    ida_ea: 0x140001234,
+                    function_start: 0x140001200,
+                    function_end: 0x140001300,
+                    function_name: "sub_140001200".to_string(),
+                    found: true,
+                },
+                writes: Vec::new(),
+            },
+        );
+
+        let encoded = encode_jsonl(&response).unwrap();
+        let decoded: WorkerEnvelope<WorkerResponse> = decode_jsonl(&encoded).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

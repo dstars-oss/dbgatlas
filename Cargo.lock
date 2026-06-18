@@ -193,6 +193,20 @@ name = "dbgatlas-etw-sys"
 version = "0.1.0"
 
 [[package]]
+name = "dbgatlas-ida"
+version = "0.1.0"
+dependencies = [
+ "dbgatlas-ida-sys",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "dbgatlas-ida-sys"
+version = "0.1.0"
+
+[[package]]
 name = "dbgatlas-model"
 version = "0.1.0"
 dependencies = [
@@ -225,6 +239,7 @@ dependencies = [
  "dbgatlas-dbgeng",
  "dbgatlas-debug",
  "dbgatlas-etw",
+ "dbgatlas-ida",
  "dbgatlas-model",
  "dbgatlas-recording",
  "dbgatlas-runtime",

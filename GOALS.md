@@ -126,22 +126,31 @@ Acceptance:
 
 Tasks:
 
-- [ ] 定义 IDA database target。
-- [ ] 明确 `ida-pro-mcp` supervisor/worker 集成方式。
+- [x] 定义 IDA database target。
+- [x] 明确 IDA native adapter 动态加载集成方式。
+- [x] 将 IDA reverse session 放入 active interactive user worker 进程，避免安装态 LocalSystem 直接加载 IDALib。
+- [x] 实现显式 runtime address / module base / IDA image base -> IDA function mapping。
 - [ ] 实现 stack frame -> module/symbol -> IDA function mapping。
 - [ ] 实现 IDA navigation API。
 - [ ] 实现 IDA comment API。
-- [ ] 将 reverse workflow 低层输出写入 `artifacts/reverse_sessions/<session_id>/`。
-- [ ] 登记 IDA 操作的 operation record 和 artifact metadata。
+- [x] 将 reverse workflow 低层输出写入 `artifacts/reverse_sessions/<session_id>/`。
+- [x] 登记 IDA 操作的 operation record 和 artifact metadata。
+- [x] 增加显式地址到 IDA function 的端到端 service 测试。
 - [ ] 增加 debug stack frame 到 IDA function 的端到端测试。
 
 Non-goals:
 
-- 不把 IDA 做成 C++ native adapter 主线。
+- 不在第一条 MVP 链路写 IDA comment 或保存 IDB。
 - 不把 IDA 数据库内容大块塞入 FFI。
 - 不在 DbgAtlas 内部重建完整反编译器模型。
 
-Acceptance:
+MVP 4 minimal chain acceptance:
+
+- [x] 从显式 runtime address / module base / IDA image base 可定位到 IDA function。
+- [x] IDA lookup 操作有 operation record 和 artifact metadata。
+- [x] 人/模型可基于 workspace artifact 在 `analysis/` 写 reverse notes。
+
+Full MVP 4 acceptance:
 
 - [ ] 从 debug stack frame 可跳转或定位到 IDA function。
 - [ ] IDA 操作有 operation record 和 artifact metadata。

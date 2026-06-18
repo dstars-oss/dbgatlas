@@ -22,9 +22,14 @@ add_library(dbgatlas_etw SHARED
     adapters/etw/dbgatlas_etw.cpp
 )
 
+add_library(dbgatlas_ida SHARED
+    adapters/ida/dbgatlas_ida.cpp
+)
+
 if(WIN32)
     set_target_properties(dbgatlas_dbgeng PROPERTIES PREFIX "")
     set_target_properties(dbgatlas_etw PROPERTIES PREFIX "")
+    set_target_properties(dbgatlas_ida PROPERTIES PREFIX "")
 endif()
 
 target_compile_definitions(dbgatlas_dbgeng PRIVATE DBGATLAS_NATIVE_BUILD)
@@ -39,9 +44,34 @@ target_include_directories(dbgatlas_etw
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+set(DBGATLAS_IDA_SDK_DIR "" CACHE PATH "Path to the IDA SDK root")
+if(NOT DBGATLAS_IDA_SDK_DIR AND DEFINED ENV{DBGATLAS_IDA_SDK_DIR})
+    set(DBGATLAS_IDA_SDK_DIR "$ENV{DBGATLAS_IDA_SDK_DIR}")
+endif()
+if(NOT DBGATLAS_IDA_SDK_DIR)
+    set(DBGATLAS_IDA_SDK_DIR "D:/Installer/ida93sp1/misc/ida-sdk")
+endif()
+
+target_compile_definitions(dbgatlas_ida PRIVATE
+    DBGATLAS_NATIVE_BUILD
+    IDALIB_IMPL
+    __IDP__
+    __EA64__=1
+    $<$<PLATFORM_ID:Windows>:__NT__ WIN32 _WINDOWS>
+)
+target_include_directories(dbgatlas_ida
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    PRIVATE
+        "${DBGATLAS_IDA_SDK_DIR}/src/include"
+)
+
 if(WIN32)
     target_link_libraries(dbgatlas_dbgeng PRIVATE DbgEng)
     target_link_libraries(dbgatlas_etw PRIVATE Advapi32 Tdh Ole32 OleAut32 uuid)
+    target_link_directories(dbgatlas_ida PRIVATE "${DBGATLAS_IDA_SDK_DIR}/src/lib/x64_win_64")
+    target_link_libraries(dbgatlas_ida PRIVATE ida idalib delayimp)
+    target_link_options(dbgatlas_ida PRIVATE /DELAYLOAD:ida.dll /DELAYLOAD:idalib.dll)
 endif()
 
 if(MSVC)
@@ -51,9 +81,14 @@ if(MSVC)
     set_property(TARGET dbgatlas_etw PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
+    set_property(TARGET dbgatlas_ida PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
     target_compile_options(dbgatlas_dbgeng PRIVATE /W4 /permissive-)
     target_compile_options(dbgatlas_etw PRIVATE /W4 /permissive-)
+    target_compile_options(dbgatlas_ida PRIVATE /W4 /permissive-)
 else()
     target_compile_options(dbgatlas_dbgeng PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(dbgatlas_etw PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(dbgatlas_ida PRIVATE -Wall -Wextra -Wpedantic)
 endif()

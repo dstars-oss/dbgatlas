@@ -8,6 +8,8 @@ members = [
     "crates/dbgatlas-dbgeng-sys",
     "crates/dbgatlas-etw",
     "crates/dbgatlas-etw-sys",
+    "crates/dbgatlas-ida",
+    "crates/dbgatlas-ida-sys",
     "crates/dbgatlas-model",
     "crates/dbgatlas-recording",
     "crates/dbgatlas-runtime",
@@ -40,6 +42,8 @@ dbgatlas-dbgeng = { path = "crates/dbgatlas-dbgeng" }
 dbgatlas-dbgeng-sys = { path = "crates/dbgatlas-dbgeng-sys" }
 dbgatlas-etw = { path = "crates/dbgatlas-etw" }
 dbgatlas-etw-sys = { path = "crates/dbgatlas-etw-sys" }
+dbgatlas-ida = { path = "crates/dbgatlas-ida" }
+dbgatlas-ida-sys = { path = "crates/dbgatlas-ida-sys" }
 dbgatlas-model = { path = "crates/dbgatlas-model" }
 dbgatlas-recording = { path = "crates/dbgatlas-recording" }
 dbgatlas-runtime = { path = "crates/dbgatlas-runtime" }

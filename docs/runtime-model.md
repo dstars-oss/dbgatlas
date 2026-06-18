@@ -29,7 +29,7 @@ analysis-workspace/
 - `tools.ttd_dir`
 - `tools.ida.install_dir`
 - `tools.ida.python_executable`
-- `tools.ida.vendor_src_dir`
+- `tools.ida.vendor_src_dir`（仅用于本机开发/构建 IDA native adapter 的 SDK include/lib 定位；运行时打开 reverse session 不依赖该路径）
 - `process.child_identity`
 - `process.fallback_child_identity`
 - `process.elevate_if_admin`
@@ -45,6 +45,7 @@ analysis-workspace/
     dbgatlas-worker.exe
     dbgatlas_dbgeng.dll
     dbgatlas_etw.dll
+    dbgatlas_ida.dll
   etc\
     runtime.toml        # runtime config
     token               # machine-local bearer token
@@ -71,7 +72,7 @@ recording policy 的文档目标：
 - attach 不回填历史，只记录 `recording.start` 之后的事件。
 - WPR/WPAExport 不作为主采集链路，只作为未来诊断、比对或 fallback 方向。
 
-安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
+安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。IDA reverse worker 使用 active interactive session 用户，不使用 LocalSystem fallback。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
 
 ## 校验原则
 

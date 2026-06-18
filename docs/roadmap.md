@@ -18,7 +18,7 @@
 - `dbgatlas-runtime` 定义 runtime config、tool path、proxy 和 process policy。
 - workspace 增加 domain artifact layout helper 和 artifact path 校验。
 - core 增加长任务 operation 状态预留。
-- 文档明确 per-session worker、runtime/workspace 分离、IDA supervisor/worker 路线。
+- 文档明确 per-session worker、runtime/workspace 分离、IDA native adapter + user worker 路线。
 
 ## MVP 1: Debug Session And Minimal DbgEng Loop
 
@@ -52,8 +52,11 @@
 ## MVP 4: IDA Bridge
 
 - IDA database target。
+- native IDA adapter dynamic loading。
+- explicit runtime address / module base / IDA image base -> IDA function mapping。
 - stack frame -> module/symbol -> IDA function mapping。
 - IDA navigation/comment API。
+- reverse workflow artifact / operation records。
 
 ## MVP 5: Report And AI Workflow
 

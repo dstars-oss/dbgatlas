@@ -50,6 +50,21 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 当前实现使用 DbgEng `DebugCreate` 建立 session。dump 通过 `OpenDumpFile` 打开，attach 使用非侵入 attach，不在 close 时终止目标进程。raw command 通过 `IDebugControl::Execute` 执行，并用 output callbacks 捕获输出。`add_symbols` 追加当前 session 的 symbol path，可选执行 `.reload`。`read_virtual` 用 `IDebugDataSpaces::ReadVirtual` 返回二进制 view。
 
+## IDA native adapter ABI
+
+IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。`dbgatlas_ida.dll` 内部动态加载 IDA install dir 下的 `ida.dll` / `idalib.dll`，并按需使用 SDK header；导出边界只暴露 opaque handle、固定宽度整数和 text view。
+
+当前最小 ABI：
+
+- `da_ida_abi_version(out)`
+- `da_ida_session_open(install_dir_utf8, database_path_utf8, out_handle)`
+- `da_ida_lookup_function(handle, runtime_address, runtime_module_base, ida_image_base, out)`
+- `da_ida_session_close(handle)`
+- `da_ida_last_error(buffer, buffer_len, required_len)`
+- `da_ida_release_view(owner)`
+
+第一条 MVP 链路只做定位和记录，不写 IDA comment，不保存 IDB。
+
 `DA_DbgEngTextView` 也用于 read memory 的 byte view；Rust safe wrapper 按 `data/len` 复制为 `Vec<u8>` 后调用 `da_dbgeng_release_view(owner)`。
 
 ## 错误处理

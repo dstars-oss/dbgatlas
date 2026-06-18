@@ -34,7 +34,9 @@ function Assert-ReleasePayload {
     $required = @(
         "dbgatlas.exe",
         "dbgatlas-worker.exe",
-        "dbgatlas_dbgeng.dll"
+        "dbgatlas_dbgeng.dll",
+        "dbgatlas_etw.dll",
+        "dbgatlas_ida.dll"
     )
 
     foreach ($name in $required) {

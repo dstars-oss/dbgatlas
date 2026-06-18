@@ -6,8 +6,8 @@ use dbgatlas_model::{ArtifactRef, Id, OperationRef, RecordingRef, SessionRef, Ti
 use dbgatlas_recording::{RecordingPreset, RecordingState, RecordingTarget, StartRecording};
 use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
-    WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError, WorkerRequest, WorkerResponse,
-    decode_jsonl, encode_jsonl,
+    ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError,
+    WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
 };
 use dbgatlas_workspace::{
     ArtifactMetadata, CommandAuditRecord, OperationRecord, OperationStatus, Workspace,
@@ -45,7 +45,9 @@ pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
     "dbgatlas-worker.exe",
     "dbgatlas_dbgeng.dll",
     "dbgatlas_etw.dll",
+    "dbgatlas_ida.dll",
 ];
+pub const DEFAULT_IDA_INSTALL_DIR: &str = r"C:\Program Files\IDA Professional 9.3";
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static RECORDING_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -134,6 +136,8 @@ pub enum ServiceError {
     #[error(transparent)]
     Recording(#[from] dbgatlas_recording::RecordingError),
     #[error(transparent)]
+    Ida(#[from] dbgatlas_ida::IdaError),
+    #[error(transparent)]
     Runtime(#[from] dbgatlas_runtime::RuntimeConfigError),
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
@@ -167,6 +171,12 @@ impl ServiceHost {
         Ok(Self::new(Arc::new(ProcessWorkerSupervisor::new()?)))
     }
 
+    pub fn with_installed_process_workers() -> Result<Self, ServiceError> {
+        Ok(Self::new(Arc::new(
+            ProcessWorkerSupervisor::new_installed_service()?,
+        )))
+    }
+
     pub fn handle_rpc(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let id = request.id.clone();
         let result = match request.method.as_str() {
@@ -184,6 +194,9 @@ impl ServiceHost {
             "debug.stack" => self.debug_builtin_eval(request.params, "debug.stack", "k"),
             "debug.add_symbols" => self.debug_add_symbols(request.params),
             "debug.read_memory" => self.debug_read_memory(request.params),
+            "reverse.session.open" => self.reverse_session_open(request.params),
+            "reverse.lookup_function" => self.reverse_lookup_function(request.params),
+            "reverse.session.close" => self.reverse_session_close(request.params),
             "recording.start" => self.recording_start(request.params),
             "recording.status" => self.recording_status(request.params),
             "recording.stop" => self.recording_stop(request.params),
@@ -263,8 +276,13 @@ impl ServiceHost {
             | "debug.threads"
             | "debug.stack"
             | "debug.add_symbols"
-            | "debug.read_memory" => self.call_mcp_service_tool(name, arguments),
-            "workspace.facts" => Ok(ToolCallOutput::success(self.mcp_workspace_facts(arguments)?)),
+            | "debug.read_memory"
+            | "reverse.session.open"
+            | "reverse.lookup_function"
+            | "reverse.session.close" => self.call_mcp_service_tool(name, arguments),
+            "workspace.facts" => Ok(ToolCallOutput::success(
+                self.mcp_workspace_facts(arguments)?,
+            )),
             other => Err(ServiceError::Rpc(format!(
                 "unknown DbgAtlas tool `{other}`"
             ))),
@@ -885,6 +903,9 @@ impl ServiceHost {
         state
             .sessions
             .insert(session.session_id.id.as_str().to_string(), session.clone());
+        state
+            .reverse_sessions
+            .retain(|_, reverse| reverse.debug_session_id != session.session_id);
 
         Ok(json!({
             "session_id": session.session_id,
@@ -947,6 +968,584 @@ impl ServiceHost {
         };
         request.validate(MAX_MEMORY_READ_LENGTH)?;
         self.read_memory(request)
+    }
+
+    fn reverse_session_open(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: ReverseSessionOpenParams = parse_params(params)?;
+        let debug_session = self.reusable_session(&params.session_id)?;
+        if debug_session.project_root != params.project_root {
+            return Err(ServiceError::Rpc(format!(
+                "project_root does not match session {}",
+                params.session_id
+            )));
+        }
+        let operation_id = next_operation_ref();
+        let reverse_session_id = next_session_ref();
+        let workspace = Workspace::open(&debug_session.internal_workspace_root)?;
+        let artifact_dir = workspace.ensure_reverse_session_artifact_dir(&params.session_id.id)?;
+        let ida_install_dir = params
+            .ida_install_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_IDA_INSTALL_DIR));
+
+        let request_lock = debug_session.request_lock.clone();
+        let _request_guard = request_lock
+            .lock()
+            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+        let open = self.supervisor.request_worker(
+            &debug_session.worker,
+            WorkerRequest::OpenReverseSession {
+                session_id: params.session_id.clone(),
+                reverse_session_id: reverse_session_id.clone(),
+                ida_install_dir: ida_install_dir.clone(),
+                database_path: params.database_path.clone(),
+                artifact_dir: artifact_dir.clone(),
+            },
+        );
+        match open {
+            Ok(WorkerResponse::ReverseSessionOpened { .. }) => {}
+            Ok(WorkerResponse::Failed { code, message, .. }) => {
+                let error = worker_failed_message(code, message);
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &artifact_dir,
+                    &operation_id,
+                    "reverse.session.open",
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.session.open".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Ok(other) => {
+                let error = format!("unexpected reverse open response: {other:?}");
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &artifact_dir,
+                    &operation_id,
+                    "reverse.session.open",
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.session.open".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &artifact_dir,
+                    &operation_id,
+                    "reverse.session.open",
+                    &message,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.session.open".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    message,
+                    artifacts,
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+
+        let result = (|| {
+            let now = Timestamp::now();
+            let metadata = json!({
+                "reverse_session_id": reverse_session_id,
+                "debug_session_id": params.session_id,
+                "database_path": params.database_path,
+                "ida_install_dir": ida_install_dir,
+                "created_at": now,
+                "mode": "native_dynamic_idalib",
+                "writes_idb": false
+            });
+            let session_metadata_file = format!("sessions/{}.json", reverse_session_id.id.as_str());
+            let byte_len = write_json_file(&artifact_dir.join(&session_metadata_file), &metadata)?;
+            let artifact_id = next_artifact_ref();
+            workspace.register_artifact(&ArtifactMetadata {
+                artifact_id: artifact_id.clone(),
+                kind: "reverse.session".to_string(),
+                relative_path: reverse_relative_path(&params.session_id, &session_metadata_file),
+                created_at: now,
+                operation_id: Some(operation_id.clone()),
+                byte_len: Some(byte_len),
+                description: Some("IDA reverse session metadata".to_string()),
+            })?;
+            workspace.append_operation(&OperationRecord {
+                operation_id: operation_id.clone(),
+                adapter_id: "ida".to_string(),
+                capability: "reverse.session.open".to_string(),
+                status: OperationStatus::Success,
+                created_at: now,
+                summary: "reverse session opened".to_string(),
+                artifacts: vec![artifact_id.clone()],
+                raw_output: None,
+            })?;
+
+            let reverse_session = ManagedReverseSession {
+                reverse_session_id: reverse_session_id.clone(),
+                debug_session_id: params.session_id.clone(),
+                project_root: params.project_root,
+                internal_workspace_root: workspace.root().to_path_buf(),
+                artifact_dir,
+                database_path: params.database_path,
+                ida_install_dir,
+                created_at: now,
+                updated_at: now,
+                last_operation: Some(operation_id.clone()),
+                artifacts: vec![artifact_id.clone()],
+                worker: debug_session.worker.clone(),
+                request_lock: request_lock.clone(),
+            };
+
+            let mut operation = ServiceOperation::success(
+                operation_id.clone(),
+                "reverse.session.open",
+                Some(params.session_id.clone()),
+                "reverse session opened",
+            );
+            operation.artifacts = vec![artifact_id.clone()];
+            let mut state = self.lock_state()?;
+            state
+                .operations
+                .insert(operation_id.id.as_str().to_string(), operation);
+            state.reverse_sessions.insert(
+                reverse_session_id.id.as_str().to_string(),
+                reverse_session.clone(),
+            );
+
+            Ok(json!({
+                "reverse_session_id": reverse_session_id,
+                "session_id": params.session_id,
+                "operation_id": operation_id,
+                "operation_status": "success",
+                "artifact_refs": [artifact_id],
+                "operation": {
+                    "status": "success",
+                    "artifact_refs": [artifact_id],
+                    "raw_output_ref": null
+                }
+            }))
+        })();
+        if result.is_err() {
+            let _ = self.supervisor.request_worker(
+                &debug_session.worker,
+                WorkerRequest::CloseReverseSession {
+                    session_id: params.session_id,
+                    reverse_session_id,
+                },
+            );
+        }
+        result
+    }
+
+    fn reverse_lookup_function(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: ReverseLookupFunctionParams = parse_params(params)?;
+        let runtime_address = parse_u64_param(&params.runtime_address, "runtime_address")?;
+        let runtime_module_base =
+            parse_u64_param(&params.runtime_module_base, "runtime_module_base")?;
+        let ida_image_base = parse_u64_param(&params.ida_image_base, "ida_image_base")?;
+        let reverse_session = {
+            let state = self.lock_state()?;
+            state
+                .reverse_sessions
+                .get(params.reverse_session_id.id.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    ServiceError::SessionNotFound(params.reverse_session_id.to_string())
+                })?
+        };
+        if reverse_session.debug_session_id != params.session_id {
+            return Err(ServiceError::Rpc(format!(
+                "reverse session {} belongs to session {}",
+                params.reverse_session_id, reverse_session.debug_session_id
+            )));
+        }
+
+        let operation_id = next_operation_ref();
+        let workspace = Workspace::open(&reverse_session.internal_workspace_root)?;
+        let lookup = {
+            let _request_guard = reverse_session
+                .request_lock
+                .lock()
+                .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+            self.supervisor.request_worker(
+                &reverse_session.worker,
+                WorkerRequest::LookupReverseFunction {
+                    session_id: params.session_id.clone(),
+                    reverse_session_id: params.reverse_session_id.clone(),
+                    operation_id: operation_id.clone(),
+                    runtime_address,
+                    runtime_module_base,
+                    ida_image_base,
+                    artifact_dir: reverse_session.artifact_dir.clone(),
+                },
+            )
+        };
+        let lookup = match lookup {
+            Ok(WorkerResponse::ReverseFunctionLookup { result, .. }) => result,
+            Ok(WorkerResponse::Failed { code, message, .. }) => {
+                let error = worker_failed_message(code, message);
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    "reverse.lookup_function",
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.lookup_function".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Ok(other) => {
+                let error = format!("unexpected reverse lookup response: {other:?}");
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    "reverse.lookup_function",
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.lookup_function".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    "reverse.lookup_function",
+                    &message,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.lookup_function".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    message,
+                    artifacts,
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+        let now = Timestamp::now();
+        let event = json!({
+            "operation_id": operation_id,
+            "reverse_session_id": params.reverse_session_id,
+            "session_id": params.session_id,
+            "created_at": now,
+            "lookup": lookup,
+        });
+        let lookup_file = format!("lookups/{}.jsonl", operation_id.id.as_str());
+        let byte_len = write_jsonl_file(&reverse_session.artifact_dir.join(&lookup_file), &event)?;
+        let artifact_id = next_artifact_ref();
+        workspace.register_artifact(&ArtifactMetadata {
+            artifact_id: artifact_id.clone(),
+            kind: "reverse.lookup".to_string(),
+            relative_path: reverse_relative_path(&params.session_id, &lookup_file),
+            created_at: now,
+            operation_id: Some(operation_id.clone()),
+            byte_len: Some(byte_len),
+            description: Some("IDA function lookup result".to_string()),
+        })?;
+        workspace.append_operation(&OperationRecord {
+            operation_id: operation_id.clone(),
+            adapter_id: "ida".to_string(),
+            capability: "reverse.lookup_function".to_string(),
+            status: OperationStatus::Success,
+            created_at: now,
+            summary: if lookup.found {
+                "IDA function located".to_string()
+            } else {
+                "IDA function not found".to_string()
+            },
+            artifacts: vec![artifact_id.clone()],
+            raw_output: None,
+        })?;
+
+        let mut operation = ServiceOperation::success(
+            operation_id.clone(),
+            "reverse.lookup_function",
+            Some(params.session_id.clone()),
+            "reverse lookup completed",
+        );
+        operation.artifacts = vec![artifact_id.clone()];
+        let mut state = self.lock_state()?;
+        state
+            .operations
+            .insert(operation_id.id.as_str().to_string(), operation);
+        if let Some(session) = state
+            .reverse_sessions
+            .get_mut(params.reverse_session_id.id.as_str())
+        {
+            session.updated_at = now;
+            session.last_operation = Some(operation_id.clone());
+            session.artifacts.push(artifact_id.clone());
+        }
+
+        Ok(json!({
+            "session_id": params.session_id,
+            "reverse_session_id": params.reverse_session_id,
+            "operation_id": operation_id,
+            "operation_status": "success",
+            "artifact_refs": [artifact_id],
+            "runtime_address": lookup.runtime_address,
+            "runtime_module_base": lookup.runtime_module_base,
+            "rva": lookup.rva,
+            "ida_image_base": lookup.ida_image_base,
+            "ida_ea": lookup.ida_ea,
+            "function_start": lookup.function_start,
+            "function_end": lookup.function_end,
+            "function_name": lookup.function_name,
+            "found": lookup.found,
+            "operation": {
+                "status": "success",
+                "artifact_refs": [artifact_id],
+                "raw_output_ref": null
+            }
+        }))
+    }
+
+    fn reverse_session_close(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: ReverseSessionCloseParams = parse_params(params)?;
+        let reverse_session = {
+            let state = self.lock_state()?;
+            state
+                .reverse_sessions
+                .get(params.reverse_session_id.id.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    ServiceError::SessionNotFound(params.reverse_session_id.to_string())
+                })?
+        };
+        let operation_id = next_operation_ref();
+        let workspace = Workspace::open(&reverse_session.internal_workspace_root)?;
+        let close = {
+            let _request_guard = reverse_session
+                .request_lock
+                .lock()
+                .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+            self.supervisor.request_worker(
+                &reverse_session.worker,
+                WorkerRequest::CloseReverseSession {
+                    session_id: reverse_session.debug_session_id.clone(),
+                    reverse_session_id: params.reverse_session_id.clone(),
+                },
+            )
+        };
+        match close {
+            Ok(WorkerResponse::Ok { .. }) => {}
+            Ok(WorkerResponse::Failed { code, message, .. }) => {
+                let error = worker_failed_message(code, message);
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &reverse_session.debug_session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    "reverse.session.close",
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.session.close".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Ok(other) => {
+                let error = format!("unexpected reverse close response: {other:?}");
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &reverse_session.debug_session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    "reverse.session.close",
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.session.close".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &reverse_session.debug_session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    "reverse.session.close",
+                    &message,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.session.close".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    message,
+                    artifacts,
+                    None,
+                )?;
+                return Err(error);
+            }
+        }
+        workspace.append_operation(&OperationRecord {
+            operation_id: operation_id.clone(),
+            adapter_id: "ida".to_string(),
+            capability: "reverse.session.close".to_string(),
+            status: OperationStatus::Success,
+            created_at: Timestamp::now(),
+            summary: "reverse session closed".to_string(),
+            artifacts: Vec::new(),
+            raw_output: None,
+        })?;
+        let operation = ServiceOperation::success(
+            operation_id.clone(),
+            "reverse.session.close",
+            Some(reverse_session.debug_session_id.clone()),
+            "reverse session closed",
+        );
+        let mut state = self.lock_state()?;
+        state
+            .reverse_sessions
+            .remove(params.reverse_session_id.id.as_str());
+        state
+            .operations
+            .insert(operation_id.id.as_str().to_string(), operation);
+        Ok(json!({
+            "reverse_session_id": params.reverse_session_id,
+            "session_id": reverse_session.debug_session_id,
+            "operation_id": operation_id,
+            "operation_status": "success",
+            "operation": {
+                "status": "success",
+                "artifact_refs": [],
+                "raw_output_ref": null
+            }
+        }))
     }
 
     fn eval_command(
@@ -1559,6 +2158,7 @@ impl ServiceHost {
 struct ServiceState {
     sessions: HashMap<String, ManagedSession>,
     recordings: HashMap<String, ManagedRecording>,
+    reverse_sessions: HashMap<String, ManagedReverseSession>,
     operations: HashMap<String, ServiceOperation>,
 }
 
@@ -1601,11 +2201,30 @@ struct ManagedSession {
     last_operation: Option<OperationRef>,
 }
 
+#[derive(Clone, Serialize)]
+struct ManagedReverseSession {
+    reverse_session_id: SessionRef,
+    debug_session_id: SessionRef,
+    project_root: PathBuf,
+    internal_workspace_root: PathBuf,
+    artifact_dir: PathBuf,
+    database_path: PathBuf,
+    ida_install_dir: PathBuf,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    last_operation: Option<OperationRef>,
+    artifacts: Vec<ArtifactRef>,
+    #[serde(skip)]
+    worker: WorkerHandle,
+    #[serde(skip)]
+    request_lock: Arc<Mutex<()>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerIdentity {
     LocalSystem,
-    UserSession,
+    ActiveInteractiveUser,
     CurrentUserDevMode,
 }
 
@@ -1728,8 +2347,32 @@ pub struct ProcessWorkerSupervisor {
 }
 
 struct ProcessWorkerState {
-    child: Mutex<Child>,
+    child: Mutex<WorkerProcess>,
     transport: Mutex<WorkerTransport>,
+}
+
+enum WorkerProcess {
+    Std(Child),
+    #[cfg(windows)]
+    RawWindows(windows_active_user_process::RawProcess),
+}
+
+impl WorkerProcess {
+    fn kill(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Std(child) => child.kill(),
+            #[cfg(windows)]
+            Self::RawWindows(process) => process.kill(),
+        }
+    }
+
+    fn wait(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Std(child) => child.wait().map(|_| ()),
+            #[cfg(windows)]
+            Self::RawWindows(process) => process.wait(),
+        }
+    }
 }
 
 impl ProcessWorkerSupervisor {
@@ -1738,6 +2381,14 @@ impl ProcessWorkerSupervisor {
             identity: WorkerIdentity::CurrentUserDevMode,
             workers: Mutex::new(HashMap::new()),
             job: job::ManagedJob::create_result("DbgAtlasDevWorkers")?,
+        })
+    }
+
+    pub fn new_installed_service() -> Result<Self, ServiceError> {
+        Ok(Self {
+            identity: WorkerIdentity::ActiveInteractiveUser,
+            workers: Mutex::new(HashMap::new()),
+            job: job::ManagedJob::create_result("DbgAtlasInstalledWorkers")?,
         })
     }
 
@@ -1763,13 +2414,13 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         let pipe_name = unique_pipe_name(&request.session_id);
         let transport = WorkerTransport::create_server(&pipe_name)?;
         let worker_exe = worker_executable_path()?;
-        let mut child = Command::new(worker_exe)
-            .arg("--pipe")
-            .arg(&pipe_name)
-            .arg("--session-id")
-            .arg(request.session_id.id.as_str())
-            .spawn()?;
-        self.job.assign_child(&child)?;
+        let mut child = spawn_worker_process(
+            &worker_exe,
+            &pipe_name,
+            request.session_id.id.as_str(),
+            &self.identity,
+        )?;
+        self.job.assign_process(&child)?;
         let connected = match transport.connect(request.startup_timeout_ms) {
             Ok(connected) => connected,
             Err(error) => {
@@ -2529,6 +3180,36 @@ fn write_jsonl_file(path: &Path, value: &Value) -> Result<u64, ServiceError> {
     Ok(bytes.len() as u64)
 }
 
+fn record_failed_reverse_operation(
+    workspace: &Workspace,
+    session_id: &SessionRef,
+    artifact_dir: &Path,
+    operation_id: &OperationRef,
+    capability: &str,
+    message: &str,
+) -> Result<Vec<ArtifactRef>, ServiceError> {
+    let value = json!({
+        "operation_id": operation_id,
+        "session_id": session_id,
+        "capability": capability,
+        "error": message,
+        "created_at": Timestamp::now()
+    });
+    let error_file = format!("errors/{}.json", operation_id.id.as_str());
+    let byte_len = write_json_file(&artifact_dir.join(&error_file), &value)?;
+    let artifact_id = next_artifact_ref();
+    workspace.register_artifact(&ArtifactMetadata {
+        artifact_id: artifact_id.clone(),
+        kind: "reverse.adapter_error".to_string(),
+        relative_path: reverse_relative_path(session_id, &error_file),
+        created_at: Timestamp::now(),
+        operation_id: Some(operation_id.clone()),
+        byte_len: Some(byte_len),
+        description: Some("IDA adapter error".to_string()),
+    })?;
+    Ok(vec![artifact_id])
+}
+
 fn recording_response(
     recording: &ManagedRecording,
     operation_id: &OperationRef,
@@ -2600,6 +3281,55 @@ fn mock_worker_response(request: WorkerRequest) -> Result<WorkerResponse, Servic
             length,
             artifact_dir,
         } => write_mock_memory_response(session_id, operation_id, address, length, artifact_dir),
+        WorkerRequest::OpenReverseSession {
+            reverse_session_id, ..
+        } => Ok(WorkerResponse::ReverseSessionOpened {
+            reverse_session_id,
+            writes: Vec::new(),
+        }),
+        WorkerRequest::LookupReverseFunction {
+            runtime_address,
+            runtime_module_base,
+            ida_image_base,
+            ..
+        } => {
+            if runtime_address < runtime_module_base {
+                return Ok(WorkerResponse::Failed {
+                    code: "reverse_lookup_failed".to_string(),
+                    message: "runtime_address is below runtime_module_base".to_string(),
+                    writes: Vec::new(),
+                });
+            }
+            let rva = runtime_address - runtime_module_base;
+            let ida_ea = match ida_image_base.checked_add(rva) {
+                Some(value) => value,
+                None => {
+                    return Ok(WorkerResponse::Failed {
+                        code: "reverse_lookup_failed".to_string(),
+                        message: "ida_ea overflow".to_string(),
+                        writes: Vec::new(),
+                    });
+                }
+            };
+            Ok(WorkerResponse::ReverseFunctionLookup {
+                result: ReverseFunctionLookupResult {
+                    runtime_address,
+                    runtime_module_base,
+                    rva,
+                    ida_image_base,
+                    ida_ea,
+                    function_start: ida_ea & !0xff,
+                    function_end: (ida_ea & !0xff) + 0x100,
+                    function_name: format!("mock_function_{:x}", ida_ea & !0xff),
+                    found: true,
+                },
+                writes: Vec::new(),
+            })
+        }
+        WorkerRequest::CloseReverseSession { .. } => Ok(WorkerResponse::Ok {
+            summary: "reverse session closed by mock worker".to_string(),
+            writes: Vec::new(),
+        }),
         WorkerRequest::CloseSession { .. } => Ok(WorkerResponse::Ok {
             summary: "debug session closed by mock worker".to_string(),
             writes: Vec::new(),
@@ -2859,6 +3589,49 @@ fn worker_executable_path() -> Result<PathBuf, ServiceError> {
         "dbgatlas-worker"
     };
     Ok(directory.join(file_name))
+}
+
+fn spawn_worker_process(
+    worker_exe: &Path,
+    pipe_name: &str,
+    session_id: &str,
+    identity: &WorkerIdentity,
+) -> Result<WorkerProcess, ServiceError> {
+    match identity {
+        WorkerIdentity::ActiveInteractiveUser => {
+            spawn_active_interactive_worker_process(worker_exe, pipe_name, session_id)
+        }
+        WorkerIdentity::CurrentUserDevMode | WorkerIdentity::LocalSystem => Ok(WorkerProcess::Std(
+            Command::new(worker_exe)
+                .arg("--pipe")
+                .arg(pipe_name)
+                .arg("--session-id")
+                .arg(session_id)
+                .spawn()?,
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_active_interactive_worker_process(
+    worker_exe: &Path,
+    pipe_name: &str,
+    session_id: &str,
+) -> Result<WorkerProcess, ServiceError> {
+    windows_active_user_process::spawn(
+        worker_exe,
+        &["--pipe", pipe_name, "--session-id", session_id],
+    )
+    .map(WorkerProcess::RawWindows)
+}
+
+#[cfg(not(windows))]
+fn spawn_active_interactive_worker_process(
+    _worker_exe: &Path,
+    _pipe_name: &str,
+    _session_id: &str,
+) -> Result<WorkerProcess, ServiceError> {
+    Err(ServiceError::WorkerTransportUnsupported)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3335,7 +4108,11 @@ mod windows_service_control {
         validate_config(&config)?;
         set_status(&status_handle, ServiceState::Running)?;
         append_service_log(&format!("reported running on {}", config.bind));
-        let result = run_http_service_until(config, ServiceHost::with_process_workers()?, shutdown);
+        let result = run_http_service_until(
+            config,
+            ServiceHost::with_installed_process_workers()?,
+            shutdown,
+        );
         set_status(&status_handle, ServiceState::Stopped)?;
         append_service_log("reported stopped");
         result
@@ -3772,6 +4549,7 @@ fn create_worker_pipe_server(pipe_name: &str) -> Result<WorkerPipeServer, Servic
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let mut security = worker_pipe_security()?;
     let handle = unsafe {
         CreateNamedPipeW(
             wide_name.as_ptr(),
@@ -3781,13 +4559,73 @@ fn create_worker_pipe_server(pipe_name: &str) -> Result<WorkerPipeServer, Servic
             64 * 1024,
             64 * 1024,
             0,
-            std::ptr::null(),
+            security.attributes_ptr(),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(WorkerPipeServer { handle })
+}
+
+#[cfg(windows)]
+struct WorkerPipeSecurity {
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    attributes: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+#[cfg(windows)]
+impl WorkerPipeSecurity {
+    fn attributes_ptr(&mut self) -> *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        &mut self.attributes
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WorkerPipeSecurity {
+    fn drop(&mut self) {
+        if !self.descriptor.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.descriptor as _);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn worker_pipe_security() -> Result<WorkerPipeSecurity, ServiceError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    // LocalSystem service creates the server end; active interactive user workers need client access.
+    let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
+    let wide_sddl: Vec<u16> = std::ffi::OsStr::new(sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(WorkerPipeSecurity {
+        descriptor,
+        attributes: SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        },
+    })
 }
 
 #[cfg(not(windows))]
@@ -4134,6 +4972,52 @@ fn mcp_tool_descriptors() -> Vec<Value> {
             }),
         ),
         mcp_tool(
+            "reverse.session.open",
+            "Open an IDA reverse session for an existing debug session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_root": { "type": "string" },
+                    "session_id": { "type": "object" },
+                    "database_path": { "type": "string" },
+                    "ida_install_dir": { "type": "string" }
+                },
+                "required": ["project_root", "session_id", "database_path"]
+            }),
+        ),
+        mcp_tool(
+            "reverse.lookup_function",
+            "Map a runtime address to an IDA function and record the lookup.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "object" },
+                    "reverse_session_id": { "type": "object" },
+                    "runtime_address": {},
+                    "runtime_module_base": {},
+                    "ida_image_base": {}
+                },
+                "required": [
+                    "session_id",
+                    "reverse_session_id",
+                    "runtime_address",
+                    "runtime_module_base",
+                    "ida_image_base"
+                ]
+            }),
+        ),
+        mcp_tool(
+            "reverse.session.close",
+            "Close an IDA reverse session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "reverse_session_id": { "type": "object" }
+                },
+                "required": ["reverse_session_id"]
+            }),
+        ),
+        mcp_tool(
             "debug.session.close",
             "Close a debug session.",
             mcp_session_schema(),
@@ -4253,6 +5137,29 @@ struct DebugReadMemoryParams {
     session_id: SessionRef,
     address: Value,
     length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReverseSessionOpenParams {
+    project_root: PathBuf,
+    session_id: SessionRef,
+    database_path: PathBuf,
+    #[serde(default)]
+    ida_install_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReverseLookupFunctionParams {
+    session_id: SessionRef,
+    reverse_session_id: SessionRef,
+    runtime_address: Value,
+    runtime_module_base: Value,
+    ida_image_base: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReverseSessionCloseParams {
+    reverse_session_id: SessionRef,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4544,6 +5451,10 @@ fn parse_u64_param(value: &Value, field: &'static str) -> Result<u64, ServiceErr
     }
 }
 
+fn worker_failed_message(code: String, message: String) -> String {
+    format!("{code}: {message}")
+}
+
 fn session_relative_path(session_id: &SessionRef, suffix: &str) -> PathBuf {
     PathBuf::from("artifacts")
         .join("sessions")
@@ -4555,6 +5466,13 @@ fn recording_relative_path(recording_id: &RecordingRef, suffix: &str) -> PathBuf
     PathBuf::from("artifacts")
         .join("recordings")
         .join(recording_id.id.as_str())
+        .join(suffix)
+}
+
+fn reverse_relative_path(session_id: &SessionRef, suffix: &str) -> PathBuf {
+    PathBuf::from("artifacts")
+        .join("reverse_sessions")
+        .join(session_id.id.as_str())
         .join(suffix)
 }
 
@@ -4719,14 +5637,17 @@ mod job {
             Ok(Self { handle })
         }
 
-        pub fn assign_child(&self, child: &std::process::Child) -> Result<(), std::io::Error> {
+        pub fn assign_process(&self, process: &crate::WorkerProcess) -> Result<(), std::io::Error> {
             use std::os::windows::io::AsRawHandle;
 
             if self.handle.is_null() {
                 return Ok(());
             }
-            let ok =
-                unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle() as HANDLE) };
+            let process_handle = match process {
+                crate::WorkerProcess::Std(child) => child.as_raw_handle() as HANDLE,
+                crate::WorkerProcess::RawWindows(process) => process.handle(),
+            };
+            let ok = unsafe { AssignProcessToJobObject(self.handle, process_handle) };
             if ok == 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -4758,9 +5679,270 @@ mod job {
             Ok(Self)
         }
 
-        pub fn assign_child(&self, _child: &std::process::Child) -> Result<(), std::io::Error> {
+        pub fn assign_process(
+            &self,
+            _process: &crate::WorkerProcess,
+        ) -> Result<(), std::io::Error> {
             Ok(())
         }
+    }
+}
+
+#[cfg(windows)]
+mod windows_active_user_process {
+    use super::{ServiceError, WINDOWS_SERVICE_NAME};
+    use std::ffi::{OsStr, c_void};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_FAILED};
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary,
+    };
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess, INFINITE,
+        PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    };
+
+    pub struct RawProcess {
+        process_handle: HANDLE,
+        thread_handle: HANDLE,
+        waited: bool,
+    }
+
+    unsafe impl Send for RawProcess {}
+
+    impl RawProcess {
+        pub fn handle(&self) -> HANDLE {
+            self.process_handle
+        }
+
+        pub fn kill(&mut self) -> Result<(), io::Error> {
+            if self.process_handle.is_null() || self.waited {
+                return Ok(());
+            }
+            let mut exit_code = 0;
+            let ok = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
+            if ok != 0 && exit_code != STILL_ACTIVE as u32 {
+                return Ok(());
+            }
+            let ok = unsafe { TerminateProcess(self.process_handle, 1) };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        pub fn wait(&mut self) -> Result<(), io::Error> {
+            if self.process_handle.is_null() || self.waited {
+                return Ok(());
+            }
+            let status = unsafe { WaitForSingleObject(self.process_handle, INFINITE) };
+            if status == WAIT_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            self.waited = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for RawProcess {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.thread_handle.is_null() {
+                    CloseHandle(self.thread_handle);
+                }
+                if !self.process_handle.is_null() {
+                    CloseHandle(self.process_handle);
+                }
+            }
+        }
+    }
+
+    struct Handle(HANDLE);
+
+    impl Handle {
+        fn new(handle: HANDLE) -> Self {
+            Self(handle)
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct EnvironmentBlock(*mut c_void);
+
+    impl EnvironmentBlock {
+        fn create(primary_token: HANDLE) -> Result<Self, ServiceError> {
+            let mut environment = std::ptr::null_mut();
+            let ok = unsafe { CreateEnvironmentBlock(&mut environment, primary_token, 0) };
+            if ok == 0 {
+                return Err(ServiceError::Worker(format!(
+                    "CreateEnvironmentBlock for active interactive user failed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            Ok(Self(environment))
+        }
+
+        fn raw(&self) -> *mut c_void {
+            self.0
+        }
+    }
+
+    impl Drop for EnvironmentBlock {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    DestroyEnvironmentBlock(self.0);
+                }
+            }
+        }
+    }
+
+    pub fn spawn(worker_exe: &Path, args: &[&str]) -> Result<RawProcess, ServiceError> {
+        let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+        if session_id == u32::MAX {
+            return Err(ServiceError::Worker(
+                "no active interactive session is available for IDA worker".to_string(),
+            ));
+        }
+
+        let mut impersonation_token = std::ptr::null_mut();
+        let ok = unsafe { WTSQueryUserToken(session_id, &mut impersonation_token) };
+        if ok == 0 {
+            return Err(ServiceError::Worker(format!(
+                "WTSQueryUserToken for active interactive session {session_id} failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let impersonation_token = Handle::new(impersonation_token);
+
+        let mut primary_token = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateTokenEx(
+                impersonation_token.raw(),
+                TOKEN_ALL_ACCESS,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut primary_token,
+            )
+        };
+        if ok == 0 {
+            return Err(ServiceError::Worker(format!(
+                "DuplicateTokenEx for active interactive session {session_id} failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let primary_token = Handle::new(primary_token);
+        let environment = EnvironmentBlock::create(primary_token.raw())?;
+
+        let mut command_line = command_line(worker_exe.as_os_str(), args);
+        let mut desktop = wide_null("winsta0\\default");
+        let current_directory = worker_exe
+            .parent()
+            .map(|path| path.as_os_str())
+            .unwrap_or_else(|| OsStr::new("."));
+        let current_directory = wide_null_os(current_directory);
+        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        startup.lpDesktop = desktop.as_mut_ptr();
+        let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            CreateProcessAsUserW(
+                primary_token.raw(),
+                std::ptr::null(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_UNICODE_ENVIRONMENT,
+                environment.raw(),
+                current_directory.as_ptr(),
+                &startup,
+                &mut process_info,
+            )
+        };
+        if ok == 0 {
+            return Err(ServiceError::Worker(format!(
+                "CreateProcessAsUserW failed to launch {WINDOWS_SERVICE_NAME} worker in active interactive session {session_id}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+
+        Ok(RawProcess {
+            process_handle: process_info.hProcess,
+            thread_handle: process_info.hThread,
+            waited: false,
+        })
+    }
+
+    fn command_line(executable: &OsStr, args: &[&str]) -> Vec<u16> {
+        let mut parts = Vec::with_capacity(args.len() + 1);
+        parts.push(quote_arg(&executable.to_string_lossy()));
+        parts.extend(args.iter().map(|arg| quote_arg(arg)));
+        wide_null(&parts.join(" "))
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    fn wide_null_os(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn quote_arg(arg: &str) -> String {
+        if arg.is_empty() {
+            return "\"\"".to_string();
+        }
+        let needs_quotes = arg
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'));
+        if !needs_quotes {
+            return arg.to_string();
+        }
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                    quoted.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    quoted.extend(std::iter::repeat_n('\\', backslashes));
+                    backslashes = 0;
+                    quoted.push(ch);
+                }
+            }
+        }
+        quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+        quoted.push('"');
+        quoted
     }
 }
 
@@ -5173,6 +6355,15 @@ mod tests {
     }
 
     #[test]
+    fn process_worker_identity_policy_separates_dev_and_installed_service() {
+        let dev = ProcessWorkerSupervisor::new().unwrap();
+        assert_eq!(dev.identity, WorkerIdentity::CurrentUserDevMode);
+
+        let installed = ProcessWorkerSupervisor::new_installed_service().unwrap();
+        assert_eq!(installed.identity, WorkerIdentity::ActiveInteractiveUser);
+    }
+
+    #[test]
     fn repeated_close_is_rejected_after_session_is_terminal() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
@@ -5524,6 +6715,247 @@ mod tests {
                 .iter()
                 .any(|operation| operation.capability == "debug.read_memory")
         );
+    }
+
+    #[test]
+    fn reverse_lookup_records_session_lookup_and_workspace_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let open = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "reverse.session.open".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "session_id": session_id,
+                "database_path": database,
+                "ida_install_dir": temp.path().join("ida")
+            })),
+        });
+        assert!(open.error.is_none(), "{:?}", open.error);
+        let open_result = open.result.unwrap();
+        let reverse_session_id = open_result["reverse_session_id"].clone();
+        let session_id = open_result["session_id"].clone();
+
+        let lookup = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "reverse.lookup_function".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "reverse_session_id": reverse_session_id,
+                "runtime_address": "0x180001234",
+                "runtime_module_base": "0x180000000",
+                "ida_image_base": "0x140000000"
+            })),
+        });
+        assert!(lookup.error.is_none(), "{:?}", lookup.error);
+        let lookup_result = lookup.result.unwrap();
+        assert_eq!(lookup_result["rva"], json!(0x1234));
+        assert_eq!(lookup_result["ida_ea"], json!(0x140001234u64));
+        assert_eq!(lookup_result["found"], json!(true));
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "reverse.session")
+        );
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "reverse.lookup")
+        );
+        let operations = workspace.list_operations().unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.capability == "reverse.session.open")
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.capability == "reverse.lookup_function")
+        );
+        let session_id = serde_json::from_value::<SessionRef>(session_id).unwrap();
+        assert!(
+            workspace
+                .root()
+                .join("artifacts")
+                .join("reverse_sessions")
+                .join(session_id.id.as_str())
+                .join("sessions")
+                .is_dir()
+        );
+        assert!(
+            workspace
+                .root()
+                .join("artifacts")
+                .join("reverse_sessions")
+                .join(session_id.id.as_str())
+                .join("lookups")
+                .is_dir()
+        );
+        assert!(
+            workspace
+                .root()
+                .join("artifacts")
+                .join("reverse_sessions")
+                .join(session_id.id.as_str())
+                .join("sessions")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_some()
+        );
+        assert!(
+            workspace
+                .root()
+                .join("artifacts")
+                .join("reverse_sessions")
+                .join(session_id.id.as_str())
+                .join("lookups")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_reverse_open_records_adapter_error_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let host = ServiceHost::new(Arc::new(FailingReverseOpenSupervisor));
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let open = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "reverse.session.open".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "session_id": session_id,
+                "database_path": database
+            })),
+        });
+        assert!(open.error.is_some());
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "reverse.adapter_error")
+        );
+        let operations = workspace.list_operations().unwrap();
+        let failed = operations
+            .iter()
+            .find(|operation| operation.capability == "reverse.session.open")
+            .unwrap();
+        assert!(matches!(failed.status, OperationStatus::Failed));
+    }
+
+    #[test]
+    fn failed_reverse_close_keeps_session_reusable_and_records_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let host = ServiceHost::new(Arc::new(FailingReverseCloseSupervisor));
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+        let open = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "reverse.session.open".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "session_id": session_id,
+                "database_path": database
+            })),
+        });
+        let open_result = open.result.unwrap();
+        let reverse_session_id = open_result["reverse_session_id"].clone();
+        let session_id = open_result["session_id"].clone();
+
+        let close = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "reverse.session.close".to_string(),
+            params: Some(json!({ "reverse_session_id": reverse_session_id })),
+        });
+        assert!(close.error.is_some());
+
+        let lookup = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(4)),
+            method: "reverse.lookup_function".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "reverse_session_id": reverse_session_id,
+                "runtime_address": 0x180001000u64,
+                "runtime_module_base": 0x180000000u64,
+                "ida_image_base": 0x140000000u64
+            })),
+        });
+        assert!(lookup.error.is_none(), "{:?}", lookup.error);
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let close_operation = workspace
+            .list_operations()
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.capability == "reverse.session.close")
+            .unwrap();
+        assert!(matches!(close_operation.status, OperationStatus::Failed));
+    }
+
+    #[test]
+    fn closing_debug_session_drops_reverse_sessions_from_service_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+        let open = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "reverse.session.open".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "session_id": session_id,
+                "database_path": database
+            })),
+        });
+        let open_result = open.result.unwrap();
+        let reverse_session_id = open_result["reverse_session_id"].clone();
+        let session_id = open_result["session_id"].clone();
+
+        let close = close_request(&host, session_id.clone());
+        assert!(close.error.is_none(), "{:?}", close.error);
+
+        let lookup = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(4)),
+            method: "reverse.lookup_function".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "reverse_session_id": reverse_session_id,
+                "runtime_address": 0x180001000u64,
+                "runtime_module_base": 0x180000000u64,
+                "ida_image_base": 0x140000000u64
+            })),
+        });
+        assert_eq!(lookup.error.unwrap().code, -32010);
     }
 
     #[test]
@@ -6442,6 +7874,10 @@ mod tests {
 
     struct FailingEvalSupervisor;
 
+    struct FailingReverseOpenSupervisor;
+
+    struct FailingReverseCloseSupervisor;
+
     impl WorkerSupervisor for FailingStartSupervisor {
         fn create_debug_worker(
             &self,
@@ -6533,6 +7969,97 @@ mod tests {
 
         fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
             Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for FailingReverseOpenSupervisor {
+        fn create_debug_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Ok(test_worker_handle(request.session_id))
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::OpenReverseSession { .. } => Ok(WorkerResponse::Failed {
+                    code: "reverse_open_failed".to_string(),
+                    message: "mock IDA open failed".to_string(),
+                    writes: Vec::new(),
+                }),
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for FailingReverseCloseSupervisor {
+        fn create_debug_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Ok(test_worker_handle(request.session_id))
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::CloseReverseSession { .. } => Ok(WorkerResponse::Failed {
+                    code: "reverse_close_failed".to_string(),
+                    message: "mock IDA close failed".to_string(),
+                    writes: Vec::new(),
+                }),
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn test_worker_handle(session_id: SessionRef) -> WorkerHandle {
+        WorkerHandle {
+            worker_id: Id::new(format!("test-worker-{}", session_id.id.as_str())).unwrap(),
+            session_id,
+            pipe_name: "test-pipe".to_string(),
+            identity: WorkerIdentity::CurrentUserDevMode,
         }
     }
 
