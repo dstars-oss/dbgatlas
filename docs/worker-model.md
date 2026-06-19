@@ -37,8 +37,8 @@ stateDiagram-v2
 - service 为每个 session 分配一个 worker 和请求队列，MVP 默认 session:worker 为 1:1。
 - 同一 session 内只允许一个 command/eval/start/close 操作处于 running。
 - MVP 1 的 per-session worker 持有真实 DbgEng session；`eval`、`modules`、`threads`、`stack`、`add_symbols` 和 `read_memory` 都通过同一 worker 串行执行。
-- MVP 4 的 IDA native adapter 在 `dbgatlas-worker.exe` 内运行；worker 内部再由 Rust safe wrapper 放到专用线程持有 native handle，满足 IDALib 同一线程调用约束。service/RPC 请求通过 worker protocol 串行发送 open/lookup/close，service 只登记 operation/artifact。
-- 创建 session 时调用方传入 `project_root`；service 内部懒创建 `<project_root>/dbgatlas` 并分配 `artifacts/sessions/<session_id>/`。
+- MVP 4 的 IDA native adapter 在独立 reverse session 的 `dbgatlas-worker.exe` 内运行；每个 IDA database 对应一个 worker 子进程。worker 内部再由 Rust safe wrapper 放到专用线程持有 native handle，满足 IDALib 同一线程调用约束。service/RPC 请求通过 worker protocol 串行发送 open/lookup/close，service 只登记 operation/artifact。
+- 创建 debug session 时调用方传入 `project_root`；service 内部懒创建 `<project_root>/dbgatlas` 并分配 `artifacts/sessions/<session_id>/`。创建 reverse session 时同样传入 `project_root`，并分配 `artifacts/reverse_sessions/<session_id>/`。
 - 后续 eval/close/kill 等请求只携带 `session_id`，不重复传 `project_root`，也不暴露 workspace resource。
 - worker 可在 service 授权的 session/domain artifact 路径下写 transcript、events、raw output 或 memory dump；service 负责登记全局 `artifacts.jsonl`、`operations.jsonl`。
 - `add_symbols` 是 session 级操作，只追加当前 DbgEng session 的 symbol path；它不修改 runtime config，也不写入 workspace manifest。

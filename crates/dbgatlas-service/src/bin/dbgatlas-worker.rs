@@ -5,7 +5,6 @@ use dbgatlas_worker_protocol::{
     ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
     WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
 };
-use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,11 +25,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let line = read_jsonl_line(&mut pipe)?;
         let request: WorkerEnvelope<WorkerRequest> = decode_jsonl(&line)?;
-        let should_exit = matches!(
+        let is_terminal_request = matches!(
             request.message,
             WorkerRequest::CloseSession { .. } | WorkerRequest::KillSession { .. }
         );
+        let is_reverse_close = matches!(request.message, WorkerRequest::CloseReverseSession { .. });
         let response = state.handle_request(request.message);
+        let should_exit = is_terminal_request
+            || (is_reverse_close && matches!(response, WorkerResponse::Ok { .. }));
         let response = WorkerEnvelope::new(request.request_id, response);
         let line = encode_jsonl(&response)?;
         pipe.write_all(line.as_bytes())?;
@@ -69,7 +71,7 @@ impl WorkerArgs {
 struct WorkerState {
     expected_session_id: String,
     session: Option<DbgEngSession>,
-    reverse_sessions: HashMap<String, dbgatlas_ida::IdaSession>,
+    reverse_session: Option<dbgatlas_ida::IdaSession>,
 }
 
 impl WorkerState {
@@ -77,7 +79,7 @@ impl WorkerState {
         Self {
             expected_session_id,
             session: None,
-            reverse_sessions: HashMap::new(),
+            reverse_session: None,
         }
     }
 
@@ -178,35 +180,25 @@ impl WorkerState {
                 )
             }),
             WorkerRequest::OpenReverseSession {
-                reverse_session_id,
                 ida_install_dir,
                 database_path,
                 ..
-            } => self.open_reverse_session(reverse_session_id, ida_install_dir, database_path),
+            } => self.open_reverse_session(ida_install_dir, database_path),
             WorkerRequest::LookupReverseFunction {
-                reverse_session_id,
                 runtime_address,
                 runtime_module_base,
                 ida_image_base,
                 ..
-            } => self.lookup_reverse_function(
-                reverse_session_id,
-                runtime_address,
-                runtime_module_base,
-                ida_image_base,
-            ),
+            } => self.lookup_reverse_function(runtime_address, runtime_module_base, ida_image_base),
             WorkerRequest::ReverseCoreFunction {
-                reverse_session_id,
                 function,
                 arguments,
                 ..
-            } => self.reverse_core_function(reverse_session_id, function, arguments),
-            WorkerRequest::CloseReverseSession {
-                reverse_session_id, ..
-            } => self.close_reverse_session(reverse_session_id),
+            } => self.reverse_core_function(function, arguments),
+            WorkerRequest::CloseReverseSession { .. } => self.close_reverse_session(),
             WorkerRequest::CloseSession { .. } => {
                 self.session = None;
-                self.reverse_sessions.clear();
+                self.reverse_session = None;
                 WorkerResponse::Ok {
                     summary: "debug session closed".to_string(),
                     writes: Vec::new(),
@@ -214,7 +206,7 @@ impl WorkerState {
             }
             WorkerRequest::KillSession { .. } => {
                 self.session = None;
-                self.reverse_sessions.clear();
+                self.reverse_session = None;
                 WorkerResponse::Ok {
                     summary: "debug session killed".to_string(),
                     writes: Vec::new(),
@@ -261,25 +253,20 @@ impl WorkerState {
 
     fn open_reverse_session(
         &mut self,
-        reverse_session_id: SessionRef,
         ida_install_dir: PathBuf,
         database_path: PathBuf,
     ) -> WorkerResponse {
-        let key = reverse_session_id.id.as_str().to_string();
-        if self.reverse_sessions.contains_key(&key) {
+        if self.reverse_session.is_some() {
             return WorkerResponse::Failed {
                 code: "reverse_session_exists".to_string(),
-                message: format!("reverse session {reverse_session_id} already exists"),
+                message: "reverse session already exists".to_string(),
                 writes: Vec::new(),
             };
         }
         match dbgatlas_ida::IdaSession::open(ida_install_dir, database_path) {
             Ok(session) => {
-                self.reverse_sessions.insert(key, session);
-                WorkerResponse::ReverseSessionOpened {
-                    reverse_session_id,
-                    writes: Vec::new(),
-                }
+                self.reverse_session = Some(session);
+                WorkerResponse::ReverseSessionOpened { writes: Vec::new() }
             }
             Err(error) => WorkerResponse::Failed {
                 code: "reverse_open_failed".to_string(),
@@ -291,16 +278,14 @@ impl WorkerState {
 
     fn lookup_reverse_function(
         &mut self,
-        reverse_session_id: SessionRef,
         runtime_address: u64,
         runtime_module_base: u64,
         ida_image_base: u64,
     ) -> WorkerResponse {
-        let key = reverse_session_id.id.as_str();
-        let Some(session) = self.reverse_sessions.get(key) else {
+        let Some(session) = self.reverse_session.as_ref() else {
             return WorkerResponse::Failed {
                 code: "reverse_session_not_found".to_string(),
-                message: format!("reverse session {reverse_session_id} is not open"),
+                message: "reverse session is not open".to_string(),
                 writes: Vec::new(),
             };
         };
@@ -327,12 +312,11 @@ impl WorkerState {
         }
     }
 
-    fn close_reverse_session(&mut self, reverse_session_id: SessionRef) -> WorkerResponse {
-        let key = reverse_session_id.id.as_str();
-        let Some(session) = self.reverse_sessions.get_mut(key) else {
+    fn close_reverse_session(&mut self) -> WorkerResponse {
+        let Some(session) = self.reverse_session.as_mut() else {
             return WorkerResponse::Failed {
                 code: "reverse_session_not_found".to_string(),
-                message: format!("reverse session {reverse_session_id} is not open"),
+                message: "reverse session is not open".to_string(),
                 writes: Vec::new(),
             };
         };
@@ -343,7 +327,7 @@ impl WorkerState {
                 writes: Vec::new(),
             };
         }
-        self.reverse_sessions.remove(key);
+        self.reverse_session = None;
         WorkerResponse::Ok {
             summary: "reverse session closed".to_string(),
             writes: Vec::new(),
@@ -352,15 +336,13 @@ impl WorkerState {
 
     fn reverse_core_function(
         &mut self,
-        reverse_session_id: SessionRef,
         function: String,
         arguments: serde_json::Value,
     ) -> WorkerResponse {
-        let key = reverse_session_id.id.as_str();
-        let Some(session) = self.reverse_sessions.get(key) else {
+        let Some(session) = self.reverse_session.as_ref() else {
             return WorkerResponse::Failed {
                 code: "reverse_session_not_found".to_string(),
-                message: format!("reverse session {reverse_session_id} is not open"),
+                message: "reverse session is not open".to_string(),
                 writes: Vec::new(),
             };
         };
@@ -655,7 +637,6 @@ mod tests {
         let mut state = WorkerState::new("session-001".to_string());
         let response = state.handle_request(WorkerRequest::LookupReverseFunction {
             session_id: session_ref("session-001"),
-            reverse_session_id: session_ref("reverse-missing"),
             operation_id: OperationRef::new(Id::new("op-001").unwrap()),
             runtime_address: 0x180001000,
             runtime_module_base: 0x180000000,
@@ -666,7 +647,7 @@ mod tests {
         match response {
             WorkerResponse::Failed { code, message, .. } => {
                 assert_eq!(code, "reverse_session_not_found");
-                assert!(message.contains("reverse-missing"));
+                assert!(message.contains("not open"));
             }
             other => panic!("expected failed response, got {other:?}"),
         }
@@ -680,7 +661,6 @@ mod tests {
         let mut state = WorkerState::new("session-001".to_string());
         let response = state.handle_request(WorkerRequest::OpenReverseSession {
             session_id: session_ref("session-001"),
-            reverse_session_id: session_ref("reverse-001"),
             ida_install_dir: temp.path().join("missing-ida"),
             database_path: database,
             artifact_dir: temp.path().join("artifacts"),

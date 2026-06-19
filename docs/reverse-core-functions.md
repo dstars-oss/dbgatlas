@@ -1,36 +1,38 @@
 # IDA Core Functions
 
-MVP 4 exposes IDA Core Functions through service RPC and HTTP MCP tools. Except for
-`reverse.session.open` and `reverse.session.close`, every Core Function call requires an
-active debug `session_id` and IDA `reverse_session_id`.
+MVP 4 exposes IDA Core Functions through service RPC and HTTP MCP tools. `reverse.session.open`
+creates a top-level reverse `session_id` backed by its own worker process. Every Core
+Function call requires that reverse `session_id`.
 
 ## RPC methods
 
-- `reverse.lookup_funcs`: `{ session_id, reverse_session_id, queries, runtime_module_base?, ida_image_base? }`
-- `reverse.int_convert`: `{ session_id, reverse_session_id, inputs }`
-- `reverse.list_funcs`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
-- `reverse.list_globals`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
-- `reverse.imports`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
-- `reverse.list_strings`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
-- `reverse.get_string`: `{ session_id, reverse_session_id, addr, length?, type? }`
-- `reverse.get_bytes`: `{ session_id, reverse_session_id, addr, length }`
-- `reverse.get_int`: `{ session_id, reverse_session_id, addr, size?, endian? }`
-- `reverse.decompile`: `{ session_id, reverse_session_id, addr }`
-- `reverse.disasm`: `{ session_id, reverse_session_id, addr }`
-- `reverse.xrefs_to`: `{ session_id, reverse_session_id, addrs }`
-- `reverse.xrefs_to_field`: `{ session_id, reverse_session_id, queries }`
-- `reverse.callees`: `{ session_id, reverse_session_id, addrs }`
-- `reverse.rename`: `{ session_id, reverse_session_id, items }`
-- `reverse.set_comments`: `{ session_id, reverse_session_id, items }`
-- `reverse.set_type`: `{ session_id, reverse_session_id, items }`
-- `reverse.declare_type`: `{ session_id, reverse_session_id, decls }`
-- `reverse.force_recompile`: `{ session_id, reverse_session_id, addrs? }`
-- `reverse.idb_save`: `{ session_id, reverse_session_id, path? }`
-- `reverse.find_bytes`: `{ session_id, reverse_session_id, patterns, offset?, limit? }`
-- `reverse.search_text`: `{ session_id, reverse_session_id, query, scope?, offset?, limit? }`
-- `reverse.xref_query`: `{ session_id, reverse_session_id, target, direction?, xref_type?, offset?, limit? }`
-- `reverse.func_query`: `{ session_id, reverse_session_id, filter?, name_regex?, min_size?, max_size?, has_type?, sort_by?, descending?, offset?, count? }`
-- `reverse.entity_query`: `{ session_id, reverse_session_id, kind, filter?, fields?, offset?, count? }`
+- `reverse.session.open`: `{ project_root, database_path, ida_install_dir? }`
+- `reverse.session.close`: `{ session_id }`
+- `reverse.lookup_funcs`: `{ session_id, queries, runtime_module_base?, ida_image_base? }`
+- `reverse.int_convert`: `{ session_id, inputs }`
+- `reverse.list_funcs`: `{ session_id, offset?, count?, filter? }`
+- `reverse.list_globals`: `{ session_id, offset?, count?, filter? }`
+- `reverse.imports`: `{ session_id, offset?, count?, filter? }`
+- `reverse.list_strings`: `{ session_id, offset?, count?, filter? }`
+- `reverse.get_string`: `{ session_id, addr, length?, type? }`
+- `reverse.get_bytes`: `{ session_id, addr, length }`
+- `reverse.get_int`: `{ session_id, addr, size?, endian? }`
+- `reverse.decompile`: `{ session_id, addr }`
+- `reverse.disasm`: `{ session_id, addr }`
+- `reverse.xrefs_to`: `{ session_id, addrs }`
+- `reverse.xrefs_to_field`: `{ session_id, queries }`
+- `reverse.callees`: `{ session_id, addrs }`
+- `reverse.rename`: `{ session_id, items }`
+- `reverse.set_comments`: `{ session_id, items }`
+- `reverse.set_type`: `{ session_id, items }`
+- `reverse.declare_type`: `{ session_id, decls }`
+- `reverse.force_recompile`: `{ session_id, addrs? }`
+- `reverse.idb_save`: `{ session_id, path? }`
+- `reverse.find_bytes`: `{ session_id, patterns, offset?, limit? }`
+- `reverse.search_text`: `{ session_id, query, scope?, offset?, limit? }`
+- `reverse.xref_query`: `{ session_id, target, direction?, xref_type?, offset?, limit? }`
+- `reverse.func_query`: `{ session_id, filter?, name_regex?, min_size?, max_size?, has_type?, sort_by?, descending?, offset?, count? }`
+- `reverse.entity_query`: `{ session_id, kind, filter?, fields?, offset?, count? }`
 
 List inputs accept either a JSON array or a comma-separated string. Integer inputs accept
 JSON numbers, decimal strings, `0x` hex strings, and `0b` binary strings. `int_convert`
@@ -64,7 +66,6 @@ Successful calls return:
 ```json
 {
   "session_id": { "id": "session-..." },
-  "reverse_session_id": { "id": "session-..." },
   "operation_id": { "id": "op-..." },
   "operation_status": "success",
   "artifact_refs": [{ "id": "artifact-..." }],
@@ -92,7 +93,7 @@ available through an explicit `reverse.disasm` call.
 Each Core Function call writes one JSONL record under:
 
 ```text
-artifacts/reverse_sessions/<debug_session_id>/core/<operation_id>.jsonl
+artifacts/reverse_sessions/<session_id>/core/<operation_id>.jsonl
 ```
 
 The workspace registers this output as a `reverse.core` artifact and appends an operation

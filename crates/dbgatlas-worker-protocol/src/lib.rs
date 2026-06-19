@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerEnvelope<T> {
@@ -54,14 +54,12 @@ pub enum WorkerRequest {
     },
     OpenReverseSession {
         session_id: SessionRef,
-        reverse_session_id: SessionRef,
         ida_install_dir: PathBuf,
         database_path: PathBuf,
         artifact_dir: PathBuf,
     },
     LookupReverseFunction {
         session_id: SessionRef,
-        reverse_session_id: SessionRef,
         operation_id: OperationRef,
         runtime_address: u64,
         runtime_module_base: u64,
@@ -70,7 +68,6 @@ pub enum WorkerRequest {
     },
     ReverseCoreFunction {
         session_id: SessionRef,
-        reverse_session_id: SessionRef,
         operation_id: OperationRef,
         function: String,
         arguments: Value,
@@ -78,7 +75,6 @@ pub enum WorkerRequest {
     },
     CloseReverseSession {
         session_id: SessionRef,
-        reverse_session_id: SessionRef,
     },
     CloseSession {
         session_id: SessionRef,
@@ -108,7 +104,6 @@ pub enum WorkerResponse {
         writes: Vec<WorkerArtifactWrite>,
     },
     ReverseSessionOpened {
-        reverse_session_id: SessionRef,
         writes: Vec<WorkerArtifactWrite>,
     },
     ReverseFunctionLookup {
@@ -240,12 +235,10 @@ mod tests {
     #[test]
     fn reverse_requests_round_trip_as_jsonl() {
         let session_id = SessionRef::new(Id::new("session-001").unwrap());
-        let reverse_session_id = SessionRef::new(Id::new("reverse-001").unwrap());
         let open = WorkerEnvelope::new(
             "req-rev-open",
             WorkerRequest::OpenReverseSession {
                 session_id: session_id.clone(),
-                reverse_session_id: reverse_session_id.clone(),
                 ida_install_dir: PathBuf::from(r"C:\Program Files\IDA Professional 9.3"),
                 database_path: PathBuf::from(r"C:\case\sample.i64"),
                 artifact_dir: PathBuf::from(
@@ -257,7 +250,6 @@ mod tests {
             "req-rev-lookup",
             WorkerRequest::LookupReverseFunction {
                 session_id: session_id.clone(),
-                reverse_session_id: reverse_session_id.clone(),
                 operation_id: OperationRef::new(Id::new("op-001").unwrap()),
                 runtime_address: 0x180001234,
                 runtime_module_base: 0x180000000,
@@ -269,10 +261,7 @@ mod tests {
         );
         let close = WorkerEnvelope::new(
             "req-rev-close",
-            WorkerRequest::CloseReverseSession {
-                session_id,
-                reverse_session_id,
-            },
+            WorkerRequest::CloseReverseSession { session_id },
         );
 
         for request in [open, lookup, close] {
@@ -288,7 +277,6 @@ mod tests {
             "req-rev-core",
             WorkerRequest::ReverseCoreFunction {
                 session_id: SessionRef::new(Id::new("session-001").unwrap()),
-                reverse_session_id: SessionRef::new(Id::new("reverse-001").unwrap()),
                 operation_id: OperationRef::new(Id::new("op-001").unwrap()),
                 function: "rename".to_string(),
                 arguments: serde_json::json!({

@@ -67,6 +67,7 @@ flowchart LR
 - Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。安装时复制 `dbgatlas.exe`、`dbgatlas-worker.exe`、`dbgatlas_dbgeng.dll`、`dbgatlas_etw.dll` 和 `dbgatlas_ida.dll` 到 `%ProgramData%\DbgAtlas\bin\`，配置/token 放在 `%ProgramData%\DbgAtlas\etc\`，服务日志放在 `%ProgramData%\DbgAtlas\var\log\`，SCM 只指向安装目录下的 binary，避免锁住开发构建产物。
 - 安装态 service 可通过 `service.update` JSON-RPC/MCP 方法从构建好的 payload 目录异步更新自身；更新由独立 updater 进程完成 stop、rename swap、restart 和 best-effort cleanup。
 - `debug.session.create` 接收 `project_root` 和 target，返回 `session_id`；后续 `debug.eval`、`debug.modules`、`debug.threads`、`debug.stack`、`debug.session.close` 和 `debug.session.kill` 只需要 `session_id`。
+- `reverse.session.open` 接收 `project_root`、IDA database path 和可选 IDA install dir，返回独立的 reverse `session_id`；后续 `reverse.*` 和 `reverse.session.close` 只需要这个 `session_id`。
 - 外部 service API 表达产品能力；内部 worker protocol 表达低层执行、状态、artifact 写入清单和进程控制。两者分层演进。
 - Worker identity 按 capability policy 选择：debug/IDA 默认 active interactive user session，ETW recording 默认 LocalSystem 或显式配置的受控 identity。安装态 IDA worker 不允许 fallback 到 LocalSystem；权限不足时返回结构化错误，不自动提权。
 
@@ -76,7 +77,7 @@ flowchart LR
 
 MVP 2 引入 service-hosted HTTP MCP 入口。它通过现有 service/domain workflow 暴露 MCP tools，不复制 debug/session/recording 业务逻辑，也不提供独立 stdio MCP 进程。
 
-IDA 路线走 DbgAtlas 自有 C++ native adapter 主线。Rust safe wrapper 通过 runtime config 或请求参数提供的 IDA install dir 配置 DLL search path，并运行时加载 `dbgatlas_ida.dll`；adapter 正常链接 `ida.dll` / `idalib.dll` 并在内部使用 IDA SDK / Hex-Rays SDK。Rust 侧通过 `dbgatlas-ida-sys` ABI 类型和 safe wrapper 暴露最小能力，不把 IDA C++ 类型穿过 C ABI。安装态 service 通过 active interactive user worker 执行 IDA open、lookup、Core Functions 和 close，避免 LocalSystem 直接加载 IDALib。
+IDA 路线走 DbgAtlas 自有 C++ native adapter 主线。Rust safe wrapper 通过 runtime config 或请求参数提供的 IDA install dir 配置 DLL search path，并运行时加载 `dbgatlas_ida.dll`；adapter 正常链接 `ida.dll` / `idalib.dll` 并在内部使用 IDA SDK / Hex-Rays SDK。Rust 侧通过 `dbgatlas-ida-sys` ABI 类型和 safe wrapper 暴露最小能力，不把 IDA C++ 类型穿过 C ABI。安装态 service 通过 active interactive user worker 执行 IDA open、lookup、Core Functions 和 close；每个 IDA database 使用独立 reverse session worker，避免 LocalSystem 直接加载 IDALib。
 
 ETW recording 路线优先走 C++ adapter + Rust safe wrapper：ETW session、provider enable、实时消费、预处理和过滤留在 native adapter 内部，Rust 侧负责安全封装、worker 编排、artifact 登记和 service/CLI/MCP 入口。WPR/WPAExport 不作为 MVP 3 主线。
 

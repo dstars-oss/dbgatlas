@@ -763,12 +763,11 @@ impl ServiceHost {
         let operation_id = next_operation_ref();
         let workspace = ensure_project_workspace(&params.project_root)?;
         let session_dir = workspace.ensure_session_artifact_dir(&session_id.id)?;
-        let worker = self.supervisor.create_debug_worker(WorkerCreateRequest {
+        let worker = self.supervisor.create_worker(WorkerCreateRequest {
             session_id: session_id.clone(),
             project_root: params.project_root.clone(),
             internal_workspace_root: workspace.root().to_path_buf(),
             artifact_dir: session_dir.clone(),
-            target: request.target.clone(),
             startup_timeout_ms: request.startup_timeout_ms.unwrap_or(5_000),
         })?;
         let start = self.supervisor.request_worker(
@@ -823,13 +822,16 @@ impl ServiceHost {
             project_root: params.project_root,
             internal_workspace_root: workspace.root().to_path_buf(),
             artifact_dir: session_dir,
-            target,
+            target: Some(target),
+            database_path: None,
+            ida_install_dir: None,
             state: DebugSessionState::Ready,
             worker,
             request_lock: Arc::new(Mutex::new(())),
             created_at: now,
             updated_at: now,
             last_operation: Some(operation_id.clone()),
+            artifacts: registered_start_writes.artifacts.clone(),
         };
 
         let mut operation = ServiceOperation::success(
@@ -900,6 +902,12 @@ impl ServiceHost {
                 params.session_id.to_string(),
             ));
         }
+        if session.capability != "debug" {
+            return Err(ServiceError::Rpc(format!(
+                "session {} is {}, expected debug",
+                params.session_id, session.capability
+            )));
+        }
         let request_lock = session.request_lock.clone();
         let _request_guard = match mode {
             SessionFinishMode::Close => Some(
@@ -921,6 +929,12 @@ impl ServiceHost {
             return Err(ServiceError::SessionAlreadyTerminal(
                 params.session_id.to_string(),
             ));
+        }
+        if session.capability != "debug" {
+            return Err(ServiceError::Rpc(format!(
+                "session {} is {}, expected debug",
+                params.session_id, session.capability
+            )));
         }
         let operation_id = next_operation_ref();
         match mode {
@@ -976,10 +990,6 @@ impl ServiceHost {
         state
             .sessions
             .insert(session.session_id.id.as_str().to_string(), session.clone());
-        state
-            .reverse_sessions
-            .retain(|_, reverse| reverse.debug_session_id != session.session_id);
-
         Ok(json!({
             "session_id": session.session_id,
             "state": session.state,
@@ -1045,31 +1055,26 @@ impl ServiceHost {
 
     fn reverse_session_open(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         let params: ReverseSessionOpenParams = parse_params(params)?;
-        let debug_session = self.reusable_session(&params.session_id)?;
-        if debug_session.project_root != params.project_root {
-            return Err(ServiceError::Rpc(format!(
-                "project_root does not match session {}",
-                params.session_id
-            )));
-        }
+        let session_id = next_session_ref();
         let operation_id = next_operation_ref();
-        let reverse_session_id = next_session_ref();
-        let workspace = Workspace::open(&debug_session.internal_workspace_root)?;
-        let artifact_dir = workspace.ensure_reverse_session_artifact_dir(&params.session_id.id)?;
+        let workspace = ensure_project_workspace(&params.project_root)?;
+        let artifact_dir = workspace.ensure_reverse_session_artifact_dir(&session_id.id)?;
         let ida_install_dir = params
             .ida_install_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_IDA_INSTALL_DIR));
+        let worker = self.supervisor.create_worker(WorkerCreateRequest {
+            session_id: session_id.clone(),
+            project_root: params.project_root.clone(),
+            internal_workspace_root: workspace.root().to_path_buf(),
+            artifact_dir: artifact_dir.clone(),
+            startup_timeout_ms: 5_000,
+        })?;
 
-        let request_lock = debug_session.request_lock.clone();
-        let _request_guard = request_lock
-            .lock()
-            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
         let open = self.supervisor.request_worker(
-            &debug_session.worker,
+            &worker,
             WorkerRequest::OpenReverseSession {
-                session_id: params.session_id.clone(),
-                reverse_session_id: reverse_session_id.clone(),
+                session_id: session_id.clone(),
                 ida_install_dir: ida_install_dir.clone(),
                 database_path: params.database_path.clone(),
                 artifact_dir: artifact_dir.clone(),
@@ -1078,10 +1083,11 @@ impl ServiceHost {
         match open {
             Ok(WorkerResponse::ReverseSessionOpened { .. }) => {}
             Ok(WorkerResponse::Failed { code, message, .. }) => {
+                let _ = self.supervisor.kill_worker(&worker);
                 let error = worker_failed_message(code, message);
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
-                    &params.session_id,
+                    &session_id,
                     &artifact_dir,
                     &operation_id,
                     "reverse.session.open",
@@ -1107,10 +1113,11 @@ impl ServiceHost {
                 return Err(ServiceError::Worker(error));
             }
             Ok(other) => {
+                let _ = self.supervisor.kill_worker(&worker);
                 let error = format!("unexpected reverse open response: {other:?}");
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
-                    &params.session_id,
+                    &session_id,
                     &artifact_dir,
                     &operation_id,
                     "reverse.session.open",
@@ -1136,10 +1143,11 @@ impl ServiceHost {
                 return Err(ServiceError::Worker(error));
             }
             Err(error) => {
+                let _ = self.supervisor.kill_worker(&worker);
                 let message = error.to_string();
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
-                    &params.session_id,
+                    &session_id,
                     &artifact_dir,
                     &operation_id,
                     "reverse.session.open",
@@ -1169,21 +1177,20 @@ impl ServiceHost {
         let result = (|| {
             let now = Timestamp::now();
             let metadata = json!({
-                "reverse_session_id": reverse_session_id,
-                "debug_session_id": params.session_id,
+                "session_id": session_id,
                 "database_path": params.database_path,
                 "ida_install_dir": ida_install_dir,
                 "created_at": now,
                 "mode": "native_dynamic_idalib",
                 "writes_idb": false
             });
-            let session_metadata_file = format!("sessions/{}.json", reverse_session_id.id.as_str());
+            let session_metadata_file = "sessions/session.json";
             let byte_len = write_json_file(&artifact_dir.join(&session_metadata_file), &metadata)?;
             let artifact_id = next_artifact_ref();
             workspace.register_artifact(&ArtifactMetadata {
                 artifact_id: artifact_id.clone(),
                 kind: "reverse.session".to_string(),
-                relative_path: reverse_relative_path(&params.session_id, &session_metadata_file),
+                relative_path: reverse_relative_path(&session_id, session_metadata_file),
                 created_at: now,
                 operation_id: Some(operation_id.clone()),
                 byte_len: Some(byte_len),
@@ -1200,26 +1207,28 @@ impl ServiceHost {
                 raw_output: None,
             })?;
 
-            let reverse_session = ManagedReverseSession {
-                reverse_session_id: reverse_session_id.clone(),
-                debug_session_id: params.session_id.clone(),
+            let session = ManagedSession {
+                session_id: session_id.clone(),
+                capability: "reverse".to_string(),
                 project_root: params.project_root,
                 internal_workspace_root: workspace.root().to_path_buf(),
                 artifact_dir,
-                database_path: params.database_path,
-                ida_install_dir,
+                target: None,
+                database_path: Some(params.database_path),
+                ida_install_dir: Some(ida_install_dir),
+                state: DebugSessionState::Ready,
+                worker: worker.clone(),
+                request_lock: Arc::new(Mutex::new(())),
                 created_at: now,
                 updated_at: now,
                 last_operation: Some(operation_id.clone()),
                 artifacts: vec![artifact_id.clone()],
-                worker: debug_session.worker.clone(),
-                request_lock: request_lock.clone(),
             };
 
             let mut operation = ServiceOperation::success(
                 operation_id.clone(),
                 "reverse.session.open",
-                Some(params.session_id.clone()),
+                Some(session_id.clone()),
                 "reverse session opened",
             );
             operation.artifacts = vec![artifact_id.clone()];
@@ -1227,14 +1236,12 @@ impl ServiceHost {
             state
                 .operations
                 .insert(operation_id.id.as_str().to_string(), operation);
-            state.reverse_sessions.insert(
-                reverse_session_id.id.as_str().to_string(),
-                reverse_session.clone(),
-            );
+            state
+                .sessions
+                .insert(session_id.id.as_str().to_string(), session.clone());
 
             Ok(json!({
-                "reverse_session_id": reverse_session_id,
-                "session_id": params.session_id,
+                "session_id": session_id,
                 "operation_id": operation_id,
                 "operation_status": "success",
                 "artifact_refs": [artifact_id],
@@ -1246,13 +1253,14 @@ impl ServiceHost {
             }))
         })();
         if result.is_err() {
-            let _ = self.supervisor.request_worker(
-                &debug_session.worker,
-                WorkerRequest::CloseReverseSession {
-                    session_id: params.session_id,
-                    reverse_session_id,
-                },
-            );
+            let close = self
+                .supervisor
+                .request_worker(&worker, WorkerRequest::CloseReverseSession { session_id });
+            if matches!(close, Ok(WorkerResponse::Ok { .. })) {
+                let _ = self.supervisor.close_worker(&worker);
+            } else {
+                let _ = self.supervisor.kill_worker(&worker);
+            }
         }
         result
     }
@@ -1263,40 +1271,24 @@ impl ServiceHost {
         let runtime_module_base =
             parse_u64_param(&params.runtime_module_base, "runtime_module_base")?;
         let ida_image_base = parse_u64_param(&params.ida_image_base, "ida_image_base")?;
-        let reverse_session = {
-            let state = self.lock_state()?;
-            state
-                .reverse_sessions
-                .get(params.reverse_session_id.id.as_str())
-                .cloned()
-                .ok_or_else(|| {
-                    ServiceError::SessionNotFound(params.reverse_session_id.to_string())
-                })?
-        };
-        if reverse_session.debug_session_id != params.session_id {
-            return Err(ServiceError::Rpc(format!(
-                "reverse session {} belongs to session {}",
-                params.reverse_session_id, reverse_session.debug_session_id
-            )));
-        }
+        let session = self.reusable_reverse_session(&params.session_id)?;
 
         let operation_id = next_operation_ref();
-        let workspace = Workspace::open(&reverse_session.internal_workspace_root)?;
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
         let lookup = {
-            let _request_guard = reverse_session
+            let _request_guard = session
                 .request_lock
                 .lock()
                 .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
             self.supervisor.request_worker(
-                &reverse_session.worker,
+                &session.worker,
                 WorkerRequest::LookupReverseFunction {
                     session_id: params.session_id.clone(),
-                    reverse_session_id: params.reverse_session_id.clone(),
                     operation_id: operation_id.clone(),
                     runtime_address,
                     runtime_module_base,
                     ida_image_base,
-                    artifact_dir: reverse_session.artifact_dir.clone(),
+                    artifact_dir: session.artifact_dir.clone(),
                 },
             )
         };
@@ -1307,7 +1299,7 @@ impl ServiceHost {
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &params.session_id,
-                    &reverse_session.artifact_dir,
+                    &session.artifact_dir,
                     &operation_id,
                     "reverse.lookup_function",
                     &error,
@@ -1336,7 +1328,7 @@ impl ServiceHost {
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &params.session_id,
-                    &reverse_session.artifact_dir,
+                    &session.artifact_dir,
                     &operation_id,
                     "reverse.lookup_function",
                     &error,
@@ -1365,7 +1357,7 @@ impl ServiceHost {
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &params.session_id,
-                    &reverse_session.artifact_dir,
+                    &session.artifact_dir,
                     &operation_id,
                     "reverse.lookup_function",
                     &message,
@@ -1393,13 +1385,12 @@ impl ServiceHost {
         let now = Timestamp::now();
         let event = json!({
             "operation_id": operation_id,
-            "reverse_session_id": params.reverse_session_id,
             "session_id": params.session_id,
             "created_at": now,
             "lookup": lookup,
         });
         let lookup_file = format!("lookups/{}.jsonl", operation_id.id.as_str());
-        let byte_len = write_jsonl_file(&reverse_session.artifact_dir.join(&lookup_file), &event)?;
+        let byte_len = write_jsonl_file(&session.artifact_dir.join(&lookup_file), &event)?;
         let artifact_id = next_artifact_ref();
         workspace.register_artifact(&ArtifactMetadata {
             artifact_id: artifact_id.clone(),
@@ -1436,10 +1427,7 @@ impl ServiceHost {
         state
             .operations
             .insert(operation_id.id.as_str().to_string(), operation);
-        if let Some(session) = state
-            .reverse_sessions
-            .get_mut(params.reverse_session_id.id.as_str())
-        {
+        if let Some(session) = state.sessions.get_mut(params.session_id.id.as_str()) {
             session.updated_at = now;
             session.last_operation = Some(operation_id.clone());
             session.artifacts.push(artifact_id.clone());
@@ -1447,7 +1435,6 @@ impl ServiceHost {
 
         Ok(json!({
             "session_id": params.session_id,
-            "reverse_session_id": params.reverse_session_id,
             "operation_id": operation_id,
             "operation_status": "success",
             "artifact_refs": [artifact_id],
@@ -1474,41 +1461,25 @@ impl ServiceHost {
         params: Option<Value>,
     ) -> Result<Value, ServiceError> {
         let params: ReverseCoreFunctionParams = parse_params(params)?;
-        let reverse_session = {
-            let state = self.lock_state()?;
-            state
-                .reverse_sessions
-                .get(params.reverse_session_id.id.as_str())
-                .cloned()
-                .ok_or_else(|| {
-                    ServiceError::SessionNotFound(params.reverse_session_id.to_string())
-                })?
-        };
-        if reverse_session.debug_session_id != params.session_id {
-            return Err(ServiceError::Rpc(format!(
-                "reverse session {} belongs to session {}",
-                params.reverse_session_id, reverse_session.debug_session_id
-            )));
-        }
+        let session = self.reusable_reverse_session(&params.session_id)?;
 
         let operation_id = next_operation_ref();
-        let workspace = Workspace::open(&reverse_session.internal_workspace_root)?;
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
         let arguments = Value::Object(params.arguments.into_iter().collect());
         let capability = format!("reverse.{function}");
         let core = {
-            let _request_guard = reverse_session
+            let _request_guard = session
                 .request_lock
                 .lock()
                 .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
             self.supervisor.request_worker(
-                &reverse_session.worker,
+                &session.worker,
                 WorkerRequest::ReverseCoreFunction {
                     session_id: params.session_id.clone(),
-                    reverse_session_id: params.reverse_session_id.clone(),
                     operation_id: operation_id.clone(),
                     function: function.to_string(),
                     arguments: arguments.clone(),
-                    artifact_dir: reverse_session.artifact_dir.clone(),
+                    artifact_dir: session.artifact_dir.clone(),
                 },
             )
         };
@@ -1519,7 +1490,7 @@ impl ServiceHost {
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &params.session_id,
-                    &reverse_session.artifact_dir,
+                    &session.artifact_dir,
                     &operation_id,
                     &capability,
                     &error,
@@ -1548,7 +1519,7 @@ impl ServiceHost {
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &params.session_id,
-                    &reverse_session.artifact_dir,
+                    &session.artifact_dir,
                     &operation_id,
                     &capability,
                     &error,
@@ -1577,7 +1548,7 @@ impl ServiceHost {
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &params.session_id,
-                    &reverse_session.artifact_dir,
+                    &session.artifact_dir,
                     &operation_id,
                     &capability,
                     &message,
@@ -1605,9 +1576,8 @@ impl ServiceHost {
         record_successful_reverse_core_operation(
             self,
             &workspace,
-            &reverse_session,
+            &session,
             &params.session_id,
-            &params.reverse_session_id,
             &operation_id,
             &capability,
             arguments,
@@ -1617,39 +1587,31 @@ impl ServiceHost {
 
     fn reverse_session_close(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         let params: ReverseSessionCloseParams = parse_params(params)?;
-        let reverse_session = {
-            let state = self.lock_state()?;
-            state
-                .reverse_sessions
-                .get(params.reverse_session_id.id.as_str())
-                .cloned()
-                .ok_or_else(|| {
-                    ServiceError::SessionNotFound(params.reverse_session_id.to_string())
-                })?
-        };
+        let session = self.reusable_reverse_session(&params.session_id)?;
         let operation_id = next_operation_ref();
-        let workspace = Workspace::open(&reverse_session.internal_workspace_root)?;
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
         let close = {
-            let _request_guard = reverse_session
+            let _request_guard = session
                 .request_lock
                 .lock()
                 .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
             self.supervisor.request_worker(
-                &reverse_session.worker,
+                &session.worker,
                 WorkerRequest::CloseReverseSession {
-                    session_id: reverse_session.debug_session_id.clone(),
-                    reverse_session_id: params.reverse_session_id.clone(),
+                    session_id: params.session_id.clone(),
                 },
             )
         };
         match close {
-            Ok(WorkerResponse::Ok { .. }) => {}
+            Ok(WorkerResponse::Ok { .. }) => {
+                self.supervisor.close_worker(&session.worker)?;
+            }
             Ok(WorkerResponse::Failed { code, message, .. }) => {
                 let error = worker_failed_message(code, message);
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
-                    &reverse_session.debug_session_id,
-                    &reverse_session.artifact_dir,
+                    &params.session_id,
+                    &session.artifact_dir,
                     &operation_id,
                     "reverse.session.close",
                     &error,
@@ -1677,8 +1639,8 @@ impl ServiceHost {
                 let error = format!("unexpected reverse close response: {other:?}");
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
-                    &reverse_session.debug_session_id,
-                    &reverse_session.artifact_dir,
+                    &params.session_id,
+                    &session.artifact_dir,
                     &operation_id,
                     "reverse.session.close",
                     &error,
@@ -1706,8 +1668,8 @@ impl ServiceHost {
                 let message = error.to_string();
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
-                    &reverse_session.debug_session_id,
-                    &reverse_session.artifact_dir,
+                    &params.session_id,
+                    &session.artifact_dir,
                     &operation_id,
                     "reverse.session.close",
                     &message,
@@ -1745,19 +1707,16 @@ impl ServiceHost {
         let operation = ServiceOperation::success(
             operation_id.clone(),
             "reverse.session.close",
-            Some(reverse_session.debug_session_id.clone()),
+            Some(params.session_id.clone()),
             "reverse session closed",
         );
         let mut state = self.lock_state()?;
         state
-            .reverse_sessions
-            .remove(params.reverse_session_id.id.as_str());
-        state
             .operations
             .insert(operation_id.id.as_str().to_string(), operation);
+        state.sessions.remove(params.session_id.id.as_str());
         Ok(json!({
-            "reverse_session_id": params.reverse_session_id,
-            "session_id": reverse_session.debug_session_id,
+            "session_id": params.session_id,
             "operation_id": operation_id,
             "operation_status": "success",
             "operation": {
@@ -1785,6 +1744,12 @@ impl ServiceHost {
             return Err(ServiceError::SessionNotReusable(
                 request.session_id.to_string(),
             ));
+        }
+        if session.capability != "debug" {
+            return Err(ServiceError::Rpc(format!(
+                "session {} is {}, expected debug",
+                request.session_id, session.capability
+            )));
         }
         let request_lock = session.request_lock.clone();
         let _request_guard = request_lock
@@ -1840,12 +1805,12 @@ impl ServiceHost {
     }
 
     fn add_symbols(&self, request: AddSymbolsRequest) -> Result<Value, ServiceError> {
-        let session = self.reusable_session(&request.session_id)?;
+        let session = self.reusable_debug_session(&request.session_id)?;
         let request_lock = session.request_lock.clone();
         let _request_guard = request_lock
             .lock()
             .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
-        let session = self.reusable_session(&request.session_id)?;
+        let session = self.reusable_debug_session(&request.session_id)?;
 
         let operation_id = next_operation_ref();
         let workspace = Workspace::open(&session.internal_workspace_root)?;
@@ -1889,12 +1854,12 @@ impl ServiceHost {
     }
 
     fn read_memory(&self, request: ReadMemoryRequest) -> Result<Value, ServiceError> {
-        let session = self.reusable_session(&request.session_id)?;
+        let session = self.reusable_debug_session(&request.session_id)?;
         let request_lock = session.request_lock.clone();
         let _request_guard = request_lock
             .lock()
             .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
-        let session = self.reusable_session(&request.session_id)?;
+        let session = self.reusable_debug_session(&request.session_id)?;
 
         let operation_id = next_operation_ref();
         let workspace = Workspace::open(&session.internal_workspace_root)?;
@@ -2360,7 +2325,25 @@ impl ServiceHost {
         Ok(())
     }
 
-    fn reusable_session(&self, session_id: &SessionRef) -> Result<ManagedSession, ServiceError> {
+    fn reusable_debug_session(
+        &self,
+        session_id: &SessionRef,
+    ) -> Result<ManagedSession, ServiceError> {
+        self.reusable_session_with_capability(session_id, "debug")
+    }
+
+    fn reusable_reverse_session(
+        &self,
+        session_id: &SessionRef,
+    ) -> Result<ManagedSession, ServiceError> {
+        self.reusable_session_with_capability(session_id, "reverse")
+    }
+
+    fn reusable_session_with_capability(
+        &self,
+        session_id: &SessionRef,
+        capability: &str,
+    ) -> Result<ManagedSession, ServiceError> {
         let state = self.lock_state()?;
         let session = state
             .sessions
@@ -2370,6 +2353,12 @@ impl ServiceHost {
         if !session.state.is_reusable() {
             return Err(ServiceError::SessionNotReusable(session_id.to_string()));
         }
+        if session.capability != capability {
+            return Err(ServiceError::Rpc(format!(
+                "session {} is {}, expected {}",
+                session_id, session.capability, capability
+            )));
+        }
         Ok(session)
     }
 }
@@ -2378,7 +2367,6 @@ impl ServiceHost {
 struct ServiceState {
     sessions: HashMap<String, ManagedSession>,
     recordings: HashMap<String, ManagedRecording>,
-    reverse_sessions: HashMap<String, ManagedReverseSession>,
     operations: HashMap<String, ServiceOperation>,
 }
 
@@ -2411,7 +2399,9 @@ struct ManagedSession {
     project_root: PathBuf,
     internal_workspace_root: PathBuf,
     artifact_dir: PathBuf,
-    target: DebugTarget,
+    target: Option<DebugTarget>,
+    database_path: Option<PathBuf>,
+    ida_install_dir: Option<PathBuf>,
     state: DebugSessionState,
     worker: WorkerHandle,
     #[serde(skip)]
@@ -2419,25 +2409,7 @@ struct ManagedSession {
     created_at: Timestamp,
     updated_at: Timestamp,
     last_operation: Option<OperationRef>,
-}
-
-#[derive(Clone, Serialize)]
-struct ManagedReverseSession {
-    reverse_session_id: SessionRef,
-    debug_session_id: SessionRef,
-    project_root: PathBuf,
-    internal_workspace_root: PathBuf,
-    artifact_dir: PathBuf,
-    database_path: PathBuf,
-    ida_install_dir: PathBuf,
-    created_at: Timestamp,
-    updated_at: Timestamp,
-    last_operation: Option<OperationRef>,
     artifacts: Vec<ArtifactRef>,
-    #[serde(skip)]
-    worker: WorkerHandle,
-    #[serde(skip)]
-    request_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2462,15 +2434,11 @@ pub struct WorkerCreateRequest {
     pub project_root: PathBuf,
     pub internal_workspace_root: PathBuf,
     pub artifact_dir: PathBuf,
-    pub target: DebugTarget,
     pub startup_timeout_ms: u64,
 }
 
 pub trait WorkerSupervisor: Send + Sync {
-    fn create_debug_worker(
-        &self,
-        request: WorkerCreateRequest,
-    ) -> Result<WorkerHandle, ServiceError>;
+    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError>;
     fn request_worker(
         &self,
         worker: &WorkerHandle,
@@ -2513,10 +2481,7 @@ impl Default for MockWorkerSupervisor {
 }
 
 impl WorkerSupervisor for MockWorkerSupervisor {
-    fn create_debug_worker(
-        &self,
-        request: WorkerCreateRequest,
-    ) -> Result<WorkerHandle, ServiceError> {
+    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
         let worker_id = Id::new(format!("worker-{}", request.session_id.id.as_str()))
             .expect("generated worker ids are valid");
         Ok(WorkerHandle {
@@ -2625,10 +2590,7 @@ impl ProcessWorkerSupervisor {
 }
 
 impl WorkerSupervisor for ProcessWorkerSupervisor {
-    fn create_debug_worker(
-        &self,
-        request: WorkerCreateRequest,
-    ) -> Result<WorkerHandle, ServiceError> {
+    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
         let worker_id = Id::new(format!("worker-{}", request.session_id.id.as_str()))
             .expect("generated worker ids are valid");
         let pipe_name = unique_pipe_name(&request.session_id);
@@ -3433,9 +3395,8 @@ fn record_failed_reverse_operation(
 fn record_successful_reverse_core_operation(
     host: &ServiceHost,
     workspace: &Workspace,
-    reverse_session: &ManagedReverseSession,
+    session: &ManagedSession,
     session_id: &SessionRef,
-    reverse_session_id: &SessionRef,
     operation_id: &OperationRef,
     capability: &str,
     arguments: Value,
@@ -3444,7 +3405,6 @@ fn record_successful_reverse_core_operation(
     let now = Timestamp::now();
     let event = json!({
         "operation_id": operation_id,
-        "reverse_session_id": reverse_session_id,
         "session_id": session_id,
         "created_at": now,
         "function": core.function,
@@ -3453,7 +3413,7 @@ fn record_successful_reverse_core_operation(
         "warnings": core.warnings,
     });
     let core_file = format!("core/{}.jsonl", operation_id.id.as_str());
-    let byte_len = write_jsonl_file(&reverse_session.artifact_dir.join(&core_file), &event)?;
+    let byte_len = write_jsonl_file(&session.artifact_dir.join(&core_file), &event)?;
     let artifact_id = next_artifact_ref();
     workspace.register_artifact(&ArtifactMetadata {
         artifact_id: artifact_id.clone(),
@@ -3486,10 +3446,7 @@ fn record_successful_reverse_core_operation(
     state
         .operations
         .insert(operation_id.id.as_str().to_string(), operation);
-    if let Some(session) = state
-        .reverse_sessions
-        .get_mut(reverse_session_id.id.as_str())
-    {
+    if let Some(session) = state.sessions.get_mut(session_id.id.as_str()) {
         session.updated_at = now;
         session.last_operation = Some(operation_id.clone());
         session.artifacts.push(artifact_id.clone());
@@ -3497,7 +3454,6 @@ fn record_successful_reverse_core_operation(
 
     Ok(json!({
         "session_id": session_id,
-        "reverse_session_id": reverse_session_id,
         "operation_id": operation_id,
         "operation_status": "success",
         "artifact_refs": [artifact_id],
@@ -3583,12 +3539,9 @@ fn mock_worker_response(request: WorkerRequest) -> Result<WorkerResponse, Servic
             length,
             artifact_dir,
         } => write_mock_memory_response(session_id, operation_id, address, length, artifact_dir),
-        WorkerRequest::OpenReverseSession {
-            reverse_session_id, ..
-        } => Ok(WorkerResponse::ReverseSessionOpened {
-            reverse_session_id,
-            writes: Vec::new(),
-        }),
+        WorkerRequest::OpenReverseSession { .. } => {
+            Ok(WorkerResponse::ReverseSessionOpened { writes: Vec::new() })
+        }
         WorkerRequest::LookupReverseFunction {
             runtime_address,
             runtime_module_base,
@@ -6212,16 +6165,15 @@ fn mcp_tool_descriptors() -> Vec<Value> {
         ),
         mcp_tool(
             "reverse.session.open",
-            "Open an IDA reverse session for an existing debug session.",
+            "Open an IDA reverse session.",
             json!({
                 "type": "object",
                 "properties": {
                     "project_root": { "type": "string" },
-                    "session_id": { "type": "object" },
                     "database_path": { "type": "string" },
                     "ida_install_dir": { "type": "string" }
                 },
-                "required": ["project_root", "session_id", "database_path"]
+                "required": ["project_root", "database_path"]
             }),
         ),
         mcp_tool(
@@ -6231,14 +6183,12 @@ fn mcp_tool_descriptors() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "object" },
-                    "reverse_session_id": { "type": "object" },
                     "runtime_address": {},
                     "runtime_module_base": {},
                     "ida_image_base": {}
                 },
                 "required": [
                     "session_id",
-                    "reverse_session_id",
                     "runtime_address",
                     "runtime_module_base",
                     "ida_image_base"
@@ -6472,9 +6422,9 @@ fn mcp_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "reverse_session_id": { "type": "object" }
+                    "session_id": { "type": "object" }
                 },
-                "required": ["reverse_session_id"]
+                "required": ["session_id"]
             }),
         ),
         mcp_tool(
@@ -6541,16 +6491,12 @@ fn mcp_reverse_core_schema(extra_properties: Value) -> Value {
 fn mcp_reverse_core_schema_required(extra_properties: Value, extra_required: &[&str]) -> Value {
     let mut properties = serde_json::Map::new();
     properties.insert("session_id".to_string(), json!({ "type": "object" }));
-    properties.insert(
-        "reverse_session_id".to_string(),
-        json!({ "type": "object" }),
-    );
     if let Value::Object(extra) = extra_properties {
         for (key, value) in extra {
             properties.insert(key, value);
         }
     }
-    let mut required = vec![json!("session_id"), json!("reverse_session_id")];
+    let mut required = vec![json!("session_id")];
     required.extend(extra_required.iter().map(|field| json!(field)));
     json!({
         "type": "object",
@@ -6627,7 +6573,6 @@ struct DebugReadMemoryParams {
 #[derive(Clone, Debug, Deserialize)]
 struct ReverseSessionOpenParams {
     project_root: PathBuf,
-    session_id: SessionRef,
     database_path: PathBuf,
     #[serde(default)]
     ida_install_dir: Option<PathBuf>,
@@ -6636,7 +6581,6 @@ struct ReverseSessionOpenParams {
 #[derive(Clone, Debug, Deserialize)]
 struct ReverseLookupFunctionParams {
     session_id: SessionRef,
-    reverse_session_id: SessionRef,
     runtime_address: Value,
     runtime_module_base: Value,
     ida_image_base: Value,
@@ -6645,14 +6589,13 @@ struct ReverseLookupFunctionParams {
 #[derive(Clone, Debug, Deserialize)]
 struct ReverseCoreFunctionParams {
     session_id: SessionRef,
-    reverse_session_id: SessionRef,
     #[serde(flatten)]
     arguments: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct ReverseSessionCloseParams {
-    reverse_session_id: SessionRef,
+    session_id: SessionRef,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -8348,8 +8291,6 @@ mod tests {
         let database = temp.path().join("sample.exe");
         fs::write(&database, b"sample").unwrap();
         let host = ServiceHost::with_mock_workers();
-        let session_id =
-            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
 
         let open = host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -8357,14 +8298,12 @@ mod tests {
             method: "reverse.session.open".to_string(),
             params: Some(json!({
                 "project_root": temp.path(),
-                "session_id": session_id,
                 "database_path": database,
                 "ida_install_dir": temp.path().join("ida")
             })),
         });
         assert!(open.error.is_none(), "{:?}", open.error);
         let open_result = open.result.unwrap();
-        let reverse_session_id = open_result["reverse_session_id"].clone();
         let session_id = open_result["session_id"].clone();
 
         let lookup = host.handle_rpc(JsonRpcRequest {
@@ -8373,7 +8312,6 @@ mod tests {
             method: "reverse.lookup_function".to_string(),
             params: Some(json!({
                 "session_id": session_id,
-                "reverse_session_id": reverse_session_id,
                 "runtime_address": "0x180001234",
                 "runtime_module_base": "0x180000000",
                 "ida_image_base": "0x140000000"
@@ -8457,7 +8395,7 @@ mod tests {
     fn reverse_core_functions_record_artifacts_and_operations() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
-        let (session_id, reverse_session_id) = open_reverse_session(&host, temp.path());
+        let session_id = open_reverse_session(&host, temp.path());
         let calls = [
             (
                 "reverse.lookup_funcs",
@@ -8546,7 +8484,6 @@ mod tests {
 
         for (method, mut args) in calls {
             args["session_id"] = session_id.clone();
-            args["reverse_session_id"] = reverse_session_id.clone();
             let response = host.handle_rpc(JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),
                 id: Some(json!(3)),
@@ -8610,13 +8547,12 @@ mod tests {
     fn reverse_core_functions_cover_pagination_empty_and_invalid_input() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
-        let (session_id, reverse_session_id) = open_reverse_session(&host, temp.path());
+        let session_id = open_reverse_session(&host, temp.path());
 
         let page = reverse_core_rpc(
             &host,
             "reverse.list_funcs",
             session_id.clone(),
-            reverse_session_id.clone(),
             json!({ "offset": 1, "count": 2 }),
         );
         assert!(page.error.is_none(), "{:?}", page.error);
@@ -8629,7 +8565,6 @@ mod tests {
             &host,
             "reverse.list_funcs",
             session_id.clone(),
-            reverse_session_id.clone(),
             json!({ "filter": "does-not-exist" }),
         );
         assert!(empty.error.is_none(), "{:?}", empty.error);
@@ -8639,7 +8574,6 @@ mod tests {
             &host,
             "reverse.list_strings",
             session_id.clone(),
-            reverse_session_id.clone(),
             json!({ "offset": 10, "count": 2 }),
         );
         assert!(empty_strings.error.is_none(), "{:?}", empty_strings.error);
@@ -8662,13 +8596,7 @@ mod tests {
                 json!({ "addr": "0x140040000", "size": 3 }),
             ),
         ] {
-            let invalid = reverse_core_rpc(
-                &host,
-                method,
-                session_id.clone(),
-                reverse_session_id.clone(),
-                args,
-            );
+            let invalid = reverse_core_rpc(&host, method, session_id.clone(), args);
             assert!(invalid.error.is_some(), "{method} accepted invalid input");
         }
 
@@ -8676,7 +8604,6 @@ mod tests {
             &host,
             "reverse.decompile",
             session_id,
-            reverse_session_id,
             json!({ "addr": "not-an-address" }),
         );
         assert!(invalid.error.is_some());
@@ -8686,13 +8613,12 @@ mod tests {
     fn failed_reverse_core_function_records_adapter_error_artifact() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::new(Arc::new(FailingReverseCoreSupervisor));
-        let (session_id, reverse_session_id) = open_reverse_session(&host, temp.path());
+        let session_id = open_reverse_session(&host, temp.path());
 
         let response = reverse_core_rpc(
             &host,
             "reverse.decompile",
             session_id,
-            reverse_session_id,
             json!({ "addr": "0x140001000" }),
         );
         assert!(response.error.is_some());
@@ -8713,13 +8639,42 @@ mod tests {
     }
 
     #[test]
+    fn debug_and_reverse_sessions_reject_cross_capability_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let debug_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+        let reverse_id = open_reverse_session(&host, temp.path());
+
+        let reverse_with_debug_session = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "reverse.list_funcs".to_string(),
+            params: Some(json!({
+                "session_id": debug_id,
+                "count": 1
+            })),
+        });
+        assert!(reverse_with_debug_session.error.is_some());
+
+        let debug_with_reverse_session = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "debug.eval".to_string(),
+            params: Some(json!({
+                "session_id": reverse_id,
+                "command": ".echo wrong-domain"
+            })),
+        });
+        assert!(debug_with_reverse_session.error.is_some());
+    }
+
+    #[test]
     fn failed_reverse_open_records_adapter_error_artifact() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("sample.exe");
         fs::write(&database, b"sample").unwrap();
         let host = ServiceHost::new(Arc::new(FailingReverseOpenSupervisor));
-        let session_id =
-            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
 
         let open = host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -8727,7 +8682,6 @@ mod tests {
             method: "reverse.session.open".to_string(),
             params: Some(json!({
                 "project_root": temp.path(),
-                "session_id": session_id,
                 "database_path": database
             })),
         });
@@ -8754,27 +8708,23 @@ mod tests {
         let database = temp.path().join("sample.exe");
         fs::write(&database, b"sample").unwrap();
         let host = ServiceHost::new(Arc::new(FailingReverseCloseSupervisor));
-        let session_id =
-            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
         let open = host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(2)),
             method: "reverse.session.open".to_string(),
             params: Some(json!({
                 "project_root": temp.path(),
-                "session_id": session_id,
                 "database_path": database
             })),
         });
         let open_result = open.result.unwrap();
-        let reverse_session_id = open_result["reverse_session_id"].clone();
         let session_id = open_result["session_id"].clone();
 
         let close = host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(3)),
             method: "reverse.session.close".to_string(),
-            params: Some(json!({ "reverse_session_id": reverse_session_id })),
+            params: Some(json!({ "session_id": session_id })),
         });
         assert!(close.error.is_some());
 
@@ -8784,7 +8734,6 @@ mod tests {
             method: "reverse.lookup_function".to_string(),
             params: Some(json!({
                 "session_id": session_id,
-                "reverse_session_id": reverse_session_id,
                 "runtime_address": 0x180001000u64,
                 "runtime_module_base": 0x180000000u64,
                 "ida_image_base": 0x140000000u64
@@ -8803,28 +8752,17 @@ mod tests {
     }
 
     #[test]
-    fn closing_debug_session_drops_reverse_sessions_from_service_state() {
+    fn closing_reverse_session_removes_session_from_service_state() {
         let temp = tempfile::tempdir().unwrap();
-        let database = temp.path().join("sample.exe");
-        fs::write(&database, b"sample").unwrap();
         let host = ServiceHost::with_mock_workers();
-        let session_id =
-            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
-        let open = host.handle_rpc(JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(2)),
-            method: "reverse.session.open".to_string(),
-            params: Some(json!({
-                "project_root": temp.path(),
-                "session_id": session_id,
-                "database_path": database
-            })),
-        });
-        let open_result = open.result.unwrap();
-        let reverse_session_id = open_result["reverse_session_id"].clone();
-        let session_id = open_result["session_id"].clone();
+        let session_id = open_reverse_session(&host, temp.path());
 
-        let close = close_request(&host, session_id.clone());
+        let close = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "reverse.session.close".to_string(),
+            params: Some(json!({ "session_id": session_id.clone() })),
+        });
         assert!(close.error.is_none(), "{:?}", close.error);
 
         let lookup = host.handle_rpc(JsonRpcRequest {
@@ -8833,7 +8771,6 @@ mod tests {
             method: "reverse.lookup_function".to_string(),
             params: Some(json!({
                 "session_id": session_id,
-                "reverse_session_id": reverse_session_id,
                 "runtime_address": 0x180001000u64,
                 "runtime_module_base": 0x180000000u64,
                 "ida_image_base": 0x140000000u64
@@ -9525,13 +9462,12 @@ mod tests {
                 "target": { "kind": "dump", "path": "sample.dmp" }
             }),
         );
-        let session_id = create["session_id"].clone();
+        assert!(create.get("session_id").is_some());
         let open = mcp_tool_call(
             server.endpoint,
             "reverse.session.open",
             json!({
                 "project_root": temp.path(),
-                "session_id": session_id,
                 "database_path": database
             }),
         );
@@ -9540,7 +9476,6 @@ mod tests {
             "reverse.list_funcs",
             json!({
                 "session_id": open["session_id"],
-                "reverse_session_id": open["reverse_session_id"],
                 "offset": 0,
                 "count": 1
             }),
@@ -9782,38 +9717,30 @@ mod tests {
         })
     }
 
-    fn open_reverse_session(host: &ServiceHost, project_root: &Path) -> (Value, Value) {
+    fn open_reverse_session(host: &ServiceHost, project_root: &Path) -> Value {
         let database = project_root.join("sample.exe");
         fs::write(&database, b"sample").unwrap();
-        let session_id =
-            create_debug_session(host, project_root).result.unwrap()["session_id"].clone();
         let open = host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(2)),
             method: "reverse.session.open".to_string(),
             params: Some(json!({
                 "project_root": project_root,
-                "session_id": session_id,
                 "database_path": database
             })),
         });
         assert!(open.error.is_none(), "{:?}", open.error);
         let result = open.result.unwrap();
-        (
-            result["session_id"].clone(),
-            result["reverse_session_id"].clone(),
-        )
+        result["session_id"].clone()
     }
 
     fn reverse_core_rpc(
         host: &ServiceHost,
         method: &str,
         session_id: Value,
-        reverse_session_id: Value,
         mut arguments: Value,
     ) -> JsonRpcResponse {
         arguments["session_id"] = session_id;
-        arguments["reverse_session_id"] = reverse_session_id;
         host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(3)),
@@ -9891,7 +9818,7 @@ mod tests {
     struct FailingReverseCoreSupervisor;
 
     impl WorkerSupervisor for FailingStartSupervisor {
-        fn create_debug_worker(
+        fn create_worker(
             &self,
             request: WorkerCreateRequest,
         ) -> Result<WorkerHandle, ServiceError> {
@@ -9938,7 +9865,7 @@ mod tests {
     }
 
     impl WorkerSupervisor for FailingEvalSupervisor {
-        fn create_debug_worker(
+        fn create_worker(
             &self,
             request: WorkerCreateRequest,
         ) -> Result<WorkerHandle, ServiceError> {
@@ -9985,7 +9912,7 @@ mod tests {
     }
 
     impl WorkerSupervisor for FailingReverseOpenSupervisor {
-        fn create_debug_worker(
+        fn create_worker(
             &self,
             request: WorkerCreateRequest,
         ) -> Result<WorkerHandle, ServiceError> {
@@ -10026,7 +9953,7 @@ mod tests {
     }
 
     impl WorkerSupervisor for FailingReverseCloseSupervisor {
-        fn create_debug_worker(
+        fn create_worker(
             &self,
             request: WorkerCreateRequest,
         ) -> Result<WorkerHandle, ServiceError> {
@@ -10067,7 +9994,7 @@ mod tests {
     }
 
     impl WorkerSupervisor for FailingReverseCoreSupervisor {
-        fn create_debug_worker(
+        fn create_worker(
             &self,
             request: WorkerCreateRequest,
         ) -> Result<WorkerHandle, ServiceError> {
@@ -10168,7 +10095,7 @@ mod tests {
     }
 
     impl WorkerSupervisor for InstrumentedWorkerSupervisor {
-        fn create_debug_worker(
+        fn create_worker(
             &self,
             request: WorkerCreateRequest,
         ) -> Result<WorkerHandle, ServiceError> {
