@@ -15,12 +15,11 @@ MCP、CLI 和后续 UI 都是入口层，不是架构核心。底层 Windows nat
 ```text
 dbgatlas/
   AGENTS.md
-  GOALS.md                  # milestone task list：完成 feature 后同步更新
   Cargo.toml
   CMakePresets.json
   README.md
 
-  crates/                 # Rust crate：core、model、record、CLI、MCP、safe wrapper、*-sys binding
+  crates/                 # Rust crate：core、model、recording、CLI、service、safe wrapper、*-sys binding
   native/                 # 项目自有 C++：native adapter、C ABI header、CMake、内部 helper
   3rdpart/                # C++ 第三方依赖：vendored source、prebuilt、patch、license、CMake glue
   docs/                   # 架构、FFI、adapter、timeline/evidence、roadmap 等设计文档
@@ -79,8 +78,8 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 4. `core` 层不得直接散落 unsafe FFI。
 5. CLI、MCP 和后续 UI 必须调用 Rust core / wrapper 层，不得绕过 core 重复实现底层调试逻辑。
 6. 项目命名、模块命名和目录结构不得绑定到 MCP、IDA、WinDbg、TTD 任一单点能力。
-7. MVP 阶段不要过早设计完整 GUI、完整 DbgEng wrapper 或复杂序列化框架。
-8. 持久化优先服务 AI 输入、审计和复现；具体格式随功能演进，初期可优先考虑 JSONL。
+7. 在真实使用体验和需求边界明确前，不要过早设计完整 GUI、完整 DbgEng wrapper 或复杂序列化框架。
+8. 持久化优先服务 AI 输入、审计和复现；具体格式随功能演进，优先保持可读、可审计、可迁移。
 
 ## 工程协作要求
 
@@ -92,7 +91,7 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 
 `script/` 用于放置开发者可直接运行的本机脚本，例如 release 构建、安装、服务 lifecycle 辅助脚本。跨平台、可组合、面向 CI/发布流水线的工程自动化优先放入 `xtask/`。
 
-`GOALS.md` 是项目的 milestone task list。完成一个 feature 后，应在同一个变更中更新对应 checkbox；只有实现、文档和验证都完成后才标记为已完成。如果 feature 改变了里程碑范围，应先同步调整 `GOALS.md`，再继续实现。
+本仓库的 MVP 开发目标已经达成。后续工作应按真实调试、逆向、录制、安装和 agent 使用体验中的具体问题推进；不要为了延续路线图而保留或新增 speculative checklist、空模块、空 schema 或尚未验证的 report/workflow 抽象。
 
 完成非平凡代码、构建、schema 或测试改动后，应运行最相关且范围最小的验证命令。若无法运行，应说明原因和已完成的替代检查。
 
