@@ -45,6 +45,7 @@ DEFINE_GUID(DA_StackWalkGuid, 0xdef2fe46, 0x7bd6, 0x4b80, 0xbd, 0x94, 0xf5, 0x7f
 #include <memory>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -147,8 +148,20 @@ std::string wide_to_utf8(const wchar_t* value) {
     if (utf8_len <= 1) {
         return {};
     }
-    std::string text(static_cast<size_t>(utf8_len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value, -1, text.data(), utf8_len, nullptr, nullptr);
+    std::string text(static_cast<size_t>(utf8_len), '\0');
+    const int written = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value,
+        -1,
+        text.data(),
+        utf8_len,
+        nullptr,
+        nullptr);
+    if (written != utf8_len) {
+        throw std::runtime_error("failed to convert UTF-16 text to UTF-8");
+    }
+    text.pop_back();
     return text;
 }
 
@@ -160,8 +173,12 @@ std::wstring utf8_to_wide(const char* value) {
     if (wide_len <= 1) {
         return {};
     }
-    std::wstring text(static_cast<size_t>(wide_len - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value, -1, text.data(), wide_len);
+    std::wstring text(static_cast<size_t>(wide_len), L'\0');
+    const int written = MultiByteToWideChar(CP_UTF8, 0, value, -1, text.data(), wide_len);
+    if (written != wide_len) {
+        throw std::runtime_error("failed to convert UTF-8 text to UTF-16");
+    }
+    text.pop_back();
     return text;
 }
 

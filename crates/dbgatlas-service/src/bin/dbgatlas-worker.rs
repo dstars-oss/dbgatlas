@@ -84,26 +84,15 @@ impl WorkerState {
     }
 
     fn handle_request(&mut self, request: WorkerRequest) -> WorkerResponse {
-        let session_id = match request_session_id(&request) {
-            Some(session_id) => session_id,
-            None => {
-                return WorkerResponse::Failed {
-                    code: "invalid_request".to_string(),
-                    message: "request is missing session id".to_string(),
-                    writes: Vec::new(),
-                };
-            }
-        };
-        if session_id.id.as_str() != self.expected_session_id {
-            return WorkerResponse::Failed {
-                code: "session_mismatch".to_string(),
-                message: format!(
+        if request.session_id().id.as_str() != self.expected_session_id {
+            return WorkerResponse::failed(
+                "session_mismatch",
+                format!(
                     "worker session is {}, request was for {}",
                     self.expected_session_id,
-                    session_id.id.as_str()
+                    request.session_id().id.as_str()
                 ),
-                writes: Vec::new(),
-            };
+            );
         }
 
         match request {
@@ -199,23 +188,16 @@ impl WorkerState {
             WorkerRequest::CloseSession { .. } => {
                 self.session = None;
                 self.reverse_session = None;
-                WorkerResponse::Ok {
-                    summary: "debug session closed".to_string(),
-                    writes: Vec::new(),
-                }
+                WorkerResponse::ok("debug session closed")
             }
             WorkerRequest::KillSession { .. } => {
                 self.session = None;
                 self.reverse_session = None;
-                WorkerResponse::Ok {
-                    summary: "debug session killed".to_string(),
-                    writes: Vec::new(),
-                }
+                WorkerResponse::ok("debug session killed")
             }
-            WorkerRequest::CancelOperation { .. } => WorkerResponse::Ok {
-                summary: "operation cancel acknowledged".to_string(),
-                writes: Vec::new(),
-            },
+            WorkerRequest::CancelOperation { .. } => {
+                WorkerResponse::ok("operation cancel acknowledged")
+            }
         }
     }
 
@@ -224,11 +206,10 @@ impl WorkerState {
             DebugTarget::Dump { path } => DbgEngSession::open_dump(path),
             DebugTarget::Attach { pid } => DbgEngSession::attach(pid),
             DebugTarget::Launch { .. } => {
-                return WorkerResponse::Failed {
-                    code: "unsupported_target".to_string(),
-                    message: "launch targets are not supported in MVP1".to_string(),
-                    writes: Vec::new(),
-                };
+                return WorkerResponse::failed(
+                    "unsupported_target",
+                    "launch targets are not supported in MVP1",
+                );
             }
         };
 
@@ -238,16 +219,9 @@ impl WorkerState {
                 let writes = write_session_event(artifact_dir, &self.expected_session_id, "ready")
                     .map(|write| vec![write])
                     .unwrap_or_default();
-                WorkerResponse::Ok {
-                    summary: "debug session started".to_string(),
-                    writes,
-                }
+                WorkerResponse::ok_with_writes("debug session started", writes)
             }
-            Err(error) => WorkerResponse::Failed {
-                code: "start_failed".to_string(),
-                message: error.to_string(),
-                writes: Vec::new(),
-            },
+            Err(error) => WorkerResponse::failed("start_failed", error.to_string()),
         }
     }
 
@@ -257,22 +231,17 @@ impl WorkerState {
         database_path: PathBuf,
     ) -> WorkerResponse {
         if self.reverse_session.is_some() {
-            return WorkerResponse::Failed {
-                code: "reverse_session_exists".to_string(),
-                message: "reverse session already exists".to_string(),
-                writes: Vec::new(),
-            };
+            return WorkerResponse::failed(
+                "reverse_session_exists",
+                "reverse session already exists",
+            );
         }
         match dbgatlas_ida::IdaSession::open(ida_install_dir, database_path) {
             Ok(session) => {
                 self.reverse_session = Some(session);
                 WorkerResponse::ReverseSessionOpened { writes: Vec::new() }
             }
-            Err(error) => WorkerResponse::Failed {
-                code: "reverse_open_failed".to_string(),
-                message: error.to_string(),
-                writes: Vec::new(),
-            },
+            Err(error) => WorkerResponse::failed("reverse_open_failed", error.to_string()),
         }
     }
 
@@ -283,11 +252,10 @@ impl WorkerState {
         ida_image_base: u64,
     ) -> WorkerResponse {
         let Some(session) = self.reverse_session.as_ref() else {
-            return WorkerResponse::Failed {
-                code: "reverse_session_not_found".to_string(),
-                message: "reverse session is not open".to_string(),
-                writes: Vec::new(),
-            };
+            return WorkerResponse::failed(
+                "reverse_session_not_found",
+                "reverse session is not open",
+            );
         };
         match session.lookup_function(runtime_address, runtime_module_base, ida_image_base) {
             Ok(result) => WorkerResponse::ReverseFunctionLookup {
@@ -304,34 +272,22 @@ impl WorkerState {
                 },
                 writes: Vec::new(),
             },
-            Err(error) => WorkerResponse::Failed {
-                code: "reverse_lookup_failed".to_string(),
-                message: error.to_string(),
-                writes: Vec::new(),
-            },
+            Err(error) => WorkerResponse::failed("reverse_lookup_failed", error.to_string()),
         }
     }
 
     fn close_reverse_session(&mut self) -> WorkerResponse {
         let Some(session) = self.reverse_session.as_mut() else {
-            return WorkerResponse::Failed {
-                code: "reverse_session_not_found".to_string(),
-                message: "reverse session is not open".to_string(),
-                writes: Vec::new(),
-            };
+            return WorkerResponse::failed(
+                "reverse_session_not_found",
+                "reverse session is not open",
+            );
         };
         if let Err(error) = session.try_close() {
-            return WorkerResponse::Failed {
-                code: "reverse_close_failed".to_string(),
-                message: error.to_string(),
-                writes: Vec::new(),
-            };
+            return WorkerResponse::failed("reverse_close_failed", error.to_string());
         }
         self.reverse_session = None;
-        WorkerResponse::Ok {
-            summary: "reverse session closed".to_string(),
-            writes: Vec::new(),
-        }
+        WorkerResponse::ok("reverse session closed")
     }
 
     fn reverse_core_function(
@@ -340,11 +296,10 @@ impl WorkerState {
         arguments: serde_json::Value,
     ) -> WorkerResponse {
         let Some(session) = self.reverse_session.as_ref() else {
-            return WorkerResponse::Failed {
-                code: "reverse_session_not_found".to_string(),
-                message: "reverse session is not open".to_string(),
-                writes: Vec::new(),
-            };
+            return WorkerResponse::failed(
+                "reverse_session_not_found",
+                "reverse session is not open",
+            );
         };
         match session.core_function(function, arguments) {
             Ok(result) => WorkerResponse::ReverseCoreFunction {
@@ -355,11 +310,7 @@ impl WorkerState {
                 },
                 writes: Vec::new(),
             },
-            Err(error) => WorkerResponse::Failed {
-                code: "reverse_core_failed".to_string(),
-                message: error.to_string(),
-                writes: Vec::new(),
-            },
+            Err(error) => WorkerResponse::failed("reverse_core_failed", error.to_string()),
         }
     }
 
@@ -368,36 +319,12 @@ impl WorkerState {
         F: FnOnce(&DbgEngSession) -> Result<WorkerResponse, std::io::Error>,
     {
         let Some(session) = self.session.as_ref() else {
-            return WorkerResponse::Failed {
-                code: "session_not_started".to_string(),
-                message: "debug session has not started".to_string(),
-                writes: Vec::new(),
-            };
+            return WorkerResponse::failed("session_not_started", "debug session has not started");
         };
         match f(session) {
             Ok(response) => response,
-            Err(error) => WorkerResponse::Failed {
-                code: "operation_failed".to_string(),
-                message: error.to_string(),
-                writes: Vec::new(),
-            },
+            Err(error) => WorkerResponse::failed("operation_failed", error.to_string()),
         }
-    }
-}
-
-fn request_session_id(request: &WorkerRequest) -> Option<&SessionRef> {
-    match request {
-        WorkerRequest::StartDebugSession { session_id, .. }
-        | WorkerRequest::EvalDebugCommand { session_id, .. }
-        | WorkerRequest::AddSymbols { session_id, .. }
-        | WorkerRequest::ReadMemory { session_id, .. }
-        | WorkerRequest::OpenReverseSession { session_id, .. }
-        | WorkerRequest::LookupReverseFunction { session_id, .. }
-        | WorkerRequest::ReverseCoreFunction { session_id, .. }
-        | WorkerRequest::CloseReverseSession { session_id, .. }
-        | WorkerRequest::CloseSession { session_id }
-        | WorkerRequest::KillSession { session_id }
-        | WorkerRequest::CancelOperation { session_id, .. } => Some(session_id),
     }
 }
 

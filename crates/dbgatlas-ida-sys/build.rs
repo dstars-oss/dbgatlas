@@ -13,6 +13,7 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    ensure_msvc_target();
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let native_dir = manifest_dir.join("..").join("..").join("native");
@@ -85,6 +86,14 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
     copy_runtime_dlls(&out_dir, &runtime_dlls);
+}
+
+fn ensure_msvc_target() {
+    let target = env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_env != "msvc" && !target.ends_with("-msvc") {
+        panic!("dbgatlas native adapters must be built for a Windows MSVC target; got `{target}`");
+    }
 }
 
 fn run(mut command: Command, description: &str) {

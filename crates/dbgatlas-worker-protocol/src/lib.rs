@@ -88,6 +88,24 @@ pub enum WorkerRequest {
     },
 }
 
+impl WorkerRequest {
+    pub fn session_id(&self) -> &SessionRef {
+        match self {
+            WorkerRequest::StartDebugSession { session_id, .. }
+            | WorkerRequest::EvalDebugCommand { session_id, .. }
+            | WorkerRequest::AddSymbols { session_id, .. }
+            | WorkerRequest::ReadMemory { session_id, .. }
+            | WorkerRequest::OpenReverseSession { session_id, .. }
+            | WorkerRequest::LookupReverseFunction { session_id, .. }
+            | WorkerRequest::ReverseCoreFunction { session_id, .. }
+            | WorkerRequest::CloseReverseSession { session_id }
+            | WorkerRequest::CloseSession { session_id }
+            | WorkerRequest::KillSession { session_id }
+            | WorkerRequest::CancelOperation { session_id, .. } => session_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum WorkerResponse {
@@ -119,6 +137,42 @@ pub enum WorkerResponse {
         message: String,
         writes: Vec<WorkerArtifactWrite>,
     },
+}
+
+impl WorkerResponse {
+    pub fn ok(summary: impl Into<String>) -> Self {
+        Self::Ok {
+            summary: summary.into(),
+            writes: Vec::new(),
+        }
+    }
+
+    pub fn ok_with_writes(summary: impl Into<String>, writes: Vec<WorkerArtifactWrite>) -> Self {
+        Self::Ok {
+            summary: summary.into(),
+            writes,
+        }
+    }
+
+    pub fn failed(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Failed {
+            code: code.into(),
+            message: message.into(),
+            writes: Vec::new(),
+        }
+    }
+
+    pub fn writes(&self) -> &[WorkerArtifactWrite] {
+        match self {
+            WorkerResponse::Ok { writes, .. }
+            | WorkerResponse::DebugCommand { writes, .. }
+            | WorkerResponse::DebugMemory { writes, .. }
+            | WorkerResponse::ReverseSessionOpened { writes }
+            | WorkerResponse::ReverseFunctionLookup { writes, .. }
+            | WorkerResponse::ReverseCoreFunction { writes, .. }
+            | WorkerResponse::Failed { writes, .. } => writes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -362,6 +416,79 @@ mod tests {
         let encoded = encode_jsonl(&request).unwrap();
         let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn request_session_id_helper_reads_every_variant() {
+        let session_id = SessionRef::new(Id::new("session-001").unwrap());
+        let operation_id = OperationRef::new(Id::new("op-001").unwrap());
+        let requests = vec![
+            WorkerRequest::StartDebugSession {
+                session_id: session_id.clone(),
+                target: DebugTarget::Dump {
+                    path: PathBuf::from("sample.dmp"),
+                },
+                artifact_dir: PathBuf::from("artifacts"),
+            },
+            WorkerRequest::EvalDebugCommand {
+                session_id: session_id.clone(),
+                operation_id: operation_id.clone(),
+                command: ".echo hi".to_string(),
+                artifact_dir: PathBuf::from("artifacts"),
+            },
+            WorkerRequest::AddSymbols {
+                session_id: session_id.clone(),
+                operation_id: operation_id.clone(),
+                symbol_path: "srv*".to_string(),
+                reload: false,
+                artifact_dir: PathBuf::from("artifacts"),
+            },
+            WorkerRequest::ReadMemory {
+                session_id: session_id.clone(),
+                operation_id: operation_id.clone(),
+                address: 0x1000,
+                length: 16,
+                artifact_dir: PathBuf::from("artifacts"),
+            },
+            WorkerRequest::OpenReverseSession {
+                session_id: session_id.clone(),
+                ida_install_dir: PathBuf::from("ida"),
+                database_path: PathBuf::from("sample.i64"),
+                artifact_dir: PathBuf::from("artifacts"),
+            },
+            WorkerRequest::LookupReverseFunction {
+                session_id: session_id.clone(),
+                operation_id: operation_id.clone(),
+                runtime_address: 0x180001000,
+                runtime_module_base: 0x180000000,
+                ida_image_base: 0x140000000,
+                artifact_dir: PathBuf::from("artifacts"),
+            },
+            WorkerRequest::ReverseCoreFunction {
+                session_id: session_id.clone(),
+                operation_id,
+                function: "list_funcs".to_string(),
+                arguments: serde_json::json!({}),
+                artifact_dir: PathBuf::from("artifacts"),
+            },
+            WorkerRequest::CloseReverseSession {
+                session_id: session_id.clone(),
+            },
+            WorkerRequest::CloseSession {
+                session_id: session_id.clone(),
+            },
+            WorkerRequest::KillSession {
+                session_id: session_id.clone(),
+            },
+            WorkerRequest::CancelOperation {
+                session_id: session_id.clone(),
+                operation_id: OperationRef::new(Id::new("op-002").unwrap()),
+            },
+        ];
+
+        for request in requests {
+            assert_eq!(request.session_id(), &session_id);
+        }
     }
 
     #[test]
