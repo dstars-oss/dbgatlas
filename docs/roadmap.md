@@ -49,14 +49,12 @@
 - 过滤后 ETL、recording metadata 和按 category 拆分的事件 JSONL。
 - 低层事件材料作为后续 timeline/report/reverse workflow 输入。
 
-## MVP 4: IDA Bridge
+## MVP 4: IDA Core Functions
 
-- IDA database target。
-- native IDA adapter dynamic loading。
-- explicit runtime address / module base / IDA image base -> IDA function mapping。
-- stack frame -> module/symbol -> IDA function mapping。
-- IDA navigation/comment API。
-- reverse workflow artifact / operation records。
+- 已有基础链路：IDA database target、native IDA adapter dynamic loading、active interactive user worker 中的 reverse session、explicit runtime address / module base / IDA image base -> IDA function mapping。
+- 对标 `ida-pro-mcp` Core Functions：`lookup_funcs`、`int_convert`、`list_funcs`、`list_globals`、`imports`、`decompile`、`disasm`、`xrefs_to`、`xrefs_to_field`、`callees`。
+- Core Functions 通过 service RPC 和 MCP tools 暴露，保持稳定 JSON 返回结构。
+- reverse workflow 低层输出、operation records 和 artifact metadata 可被 `analysis/` 中的 reverse notes 引用。
 
 ## MVP 5: Report And AI Workflow
 

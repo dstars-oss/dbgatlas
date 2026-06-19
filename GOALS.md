@@ -120,31 +120,44 @@ Acceptance:
 - [x] failed / canceled / killed recording operation 有可审计状态，已产生 artifact 不被丢弃。
 - [x] 事件材料可被 Markdown 报告引用。
 
-## MVP 4: IDA Bridge
+## MVP 4: IDA Core Functions
 
-目标：在 recording 事实层和可复现 artifact 机制更稳定后，把 debug session 中的 module、symbol、stack frame 与 IDA database 的函数、地址、注释工作流连接起来。
+目标：在已完成的 IDA reverse session、worker 隔离、artifact 和 operation 审计基础上，对标 `ida-pro-mcp` 的 Core Functions，为 AI / CLI / MCP 提供常用 IDA 查询、反编译、反汇编和引用分析能力。
 
 Tasks:
+
+Foundation:
 
 - [x] 定义 IDA database target。
 - [x] 明确 IDA native adapter 动态加载集成方式。
 - [x] 将 IDA reverse session 放入 active interactive user worker 进程，避免安装态 LocalSystem 直接加载 IDALib。
 - [x] 实现显式 runtime address / module base / IDA image base -> IDA function mapping。
-- [ ] 实现 stack frame -> module/symbol -> IDA function mapping。
-- [ ] 实现 IDA navigation API。
-- [ ] 实现 IDA comment API。
 - [x] 将 reverse workflow 低层输出写入 `artifacts/reverse_sessions/<session_id>/`。
 - [x] 登记 IDA 操作的 operation record 和 artifact metadata。
 - [x] 增加显式地址到 IDA function 的端到端 service 测试。
-- [ ] 增加 debug stack frame 到 IDA function 的端到端测试。
+
+Core Functions:
+
+- [ ] 实现 `lookup_funcs(queries)`：按地址或名称查询 function，自动识别输入类型，支持 list 或 comma-separated string。
+- [ ] 实现 `int_convert(inputs)`：转换 decimal、hex、bytes、ASCII、binary 等数值表示。
+- [ ] 实现 `list_funcs(queries)`：分页、过滤列出 functions。
+- [ ] 实现 `list_globals(queries)`：分页、过滤列出 global variables。
+- [ ] 实现 `imports(offset, count)`：分页列出 imported symbols 和 module names。
+- [ ] 实现 `decompile(addr)`：反编译指定地址所在 function。
+- [ ] 实现 `disasm(addr)`：反汇编指定地址所在 function，并输出 arguments、stack frame 等细节。
+- [ ] 实现 `xrefs_to(addrs)`：查询一个或多个地址的 cross-references。
+- [ ] 实现 `xrefs_to_field(queries)`：查询 struct field 的 cross-references。
+- [ ] 实现 `callees(addrs)`：查询一个或多个 function 调用的 callees。
+- [ ] 为 Core Functions 增加端到端 service / MCP 测试，覆盖成功、空结果、分页、非法输入和 adapter error。
 
 Non-goals:
 
-- 不在第一条 MVP 链路写 IDA comment 或保存 IDB。
+- 不在 MVP 4 写 IDA comment、修改 IDB 或保存 IDB。
 - 不把 IDA 数据库内容大块塞入 FFI。
 - 不在 DbgAtlas 内部重建完整反编译器模型。
+- 不要求完全复刻 `ida-pro-mcp` 的所有边缘行为；MVP 4 只覆盖 Core Functions 的稳定 DbgAtlas 语义。
 
-MVP 4 minimal chain acceptance:
+MVP 4 foundation acceptance:
 
 - [x] 从显式 runtime address / module base / IDA image base 可定位到 IDA function。
 - [x] IDA lookup 操作有 operation record 和 artifact metadata。
@@ -152,9 +165,10 @@ MVP 4 minimal chain acceptance:
 
 Full MVP 4 acceptance:
 
-- [ ] 从 debug stack frame 可跳转或定位到 IDA function。
-- [ ] IDA 操作有 operation record 和 artifact metadata。
-- [ ] 人/模型可基于 workspace artifact 在 `analysis/` 写 reverse notes。
+- [ ] `lookup_funcs`、`int_convert`、`list_funcs`、`list_globals`、`imports`、`decompile`、`disasm`、`xrefs_to`、`xrefs_to_field`、`callees` 均可通过 service RPC 和 MCP tools 调用。
+- [ ] 所有 Core Functions 的输入支持文档化，返回 JSON 结构稳定，并能被 Markdown reverse notes 引用。
+- [ ] IDA Core Functions 的低层输出写入 `artifacts/reverse_sessions/<session_id>/`，并登记 operation record 和 artifact metadata。
+- [ ] 端到端测试覆盖 Core Functions 的主要成功路径、分页/过滤、批量输入和错误路径。
 
 ## MVP 5: Report And AI Workflow
 
