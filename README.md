@@ -42,6 +42,17 @@ cargo run -p dbgatlas-cli -- debug read-memory <session-id> --address 0x1000 --l
 cargo run -p dbgatlas-cli -- debug session close <session-id>
 ```
 
+The installed service can update its own runtime payload through JSON-RPC or
+MCP by calling `service.update` with a built payload directory:
+
+```json
+{
+  "source_dir": "D:\\Repos\\Project\\dbgatlas\\target\\release",
+  "restart": true,
+  "timeout_ms": 60000
+}
+```
+
 Codex can connect to the service-hosted HTTP MCP endpoint with a bearer token
 kept in the local environment:
 

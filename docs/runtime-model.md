@@ -56,6 +56,8 @@ analysis-workspace/
 
 SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe`，不指向开发目录下的 `target\debug` 或 `target\release`。`dbgatlas service install` 从当前 executable 所在目录复制 runtime payload；若发现旧布局中的 `%ProgramData%\DbgAtlas\runtime.toml` 或 `%ProgramData%\DbgAtlas\token`，会迁移到 `etc\`。`dbgatlas service uninstall` 默认只删除 `bin\` 和 SCM entry，保留 `etc\` 与 `var\log\`，`--purge` 才删除整个 install root。
 
+安装态 service 还暴露 `service.update` JSON-RPC/MCP 方法，接收一个已经构建好的 payload 目录。该方法只完成校验并启动独立 updater 进程，然后异步返回 accepted；updater 会先复制到 `bin.next-*`，停止服务，使用 rename 将旧 `bin` 移到 `bin.old-*` 并把新 payload 放到 `bin`，最后按请求重启服务并 best-effort 清理旧目录。更新结果写入 service 日志。
+
 安装态 service 日志写入 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 
 开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。

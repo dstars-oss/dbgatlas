@@ -20,10 +20,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const INTERNAL_WORKSPACE_DIR: &str = "dbgatlas";
@@ -40,6 +40,8 @@ pub const WINDOWS_SERVICE_LOG_DIR: &str = "log";
 pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
 pub const WINDOWS_SERVICE_TOKEN_FILE: &str = "token";
 pub const WINDOWS_SERVICE_LOG_RETENTION_DAYS: i64 = 7;
+pub const DEFAULT_SERVICE_UPDATE_TIMEOUT_MS: u64 = 60_000;
+pub const SERVICE_UPDATE_DELAY_MS: u64 = 500;
 pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
     "dbgatlas.exe",
     "dbgatlas-worker.exe",
@@ -182,6 +184,7 @@ impl ServiceHost {
         let result = match request.method.as_str() {
             "service.health" => self.service_health(),
             "service.info" => self.service_info(),
+            "service.update" => self.service_update(request.params),
             "operation.get" => self.operation_get(request.params),
             "operation.cancel" => self.operation_cancel(request.params),
             "operation.stream" => self.operation_stream(request.params),
@@ -265,6 +268,7 @@ impl ServiceHost {
         match name {
             "service.health"
             | "service.info"
+            | "service.update"
             | "operation.get"
             | "operation.cancel"
             | "operation.stream"
@@ -331,6 +335,16 @@ impl ServiceHost {
             "operation_count": state.operations.len(),
             "external_api": "json-rpc-2.0-over-http",
         }))
+    }
+
+    fn service_update(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: ServiceUpdateParams = parse_params(params)?;
+        let accepted = request_windows_service_update(WindowsServiceUpdateOptions {
+            source_dir: params.source_dir,
+            restart: params.restart,
+            timeout_ms: params.timeout_ms,
+        })?;
+        Ok(serde_json::to_value(accepted)?)
     }
 
     fn operation_get(&self, params: Option<Value>) -> Result<Value, ServiceError> {
@@ -3703,6 +3717,20 @@ pub struct WindowsServiceUninstallOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct WindowsServiceUpdateOptions {
+    pub source_dir: PathBuf,
+    pub restart: bool,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowsServiceApplyUpdateOptions {
+    pub source_dir: PathBuf,
+    pub restart: bool,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct WindowsServiceRunOptions {
     pub config_path: PathBuf,
     pub token_file: PathBuf,
@@ -3720,6 +3748,24 @@ pub struct WindowsServiceCommandResult {
     pub log_dir: PathBuf,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub payload: Vec<ServicePayloadFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WindowsServiceUpdateAccepted {
+    pub status: String,
+    pub source_dir: PathBuf,
+    pub service_name: String,
+    pub installed_binary: PathBuf,
+    pub log_dir: PathBuf,
+    pub payload: Vec<ServicePayloadFile>,
+    pub restart: bool,
+}
+
+#[derive(Debug)]
+struct PreparedServiceUpdate {
+    source_dir: PathBuf,
+    payload: Vec<ServicePayloadFile>,
+    response: WindowsServiceUpdateAccepted,
 }
 
 pub fn default_windows_service_paths() -> ServiceInstallPaths {
@@ -3806,6 +3852,18 @@ pub fn uninstall_windows_service(
     windows_service_control::uninstall(options)
 }
 
+pub fn request_windows_service_update(
+    options: WindowsServiceUpdateOptions,
+) -> Result<WindowsServiceUpdateAccepted, ServiceError> {
+    windows_service_control::request_update(options)
+}
+
+pub fn apply_windows_service_update(
+    options: WindowsServiceApplyUpdateOptions,
+) -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::apply_update(options)
+}
+
 pub fn run_windows_service_dispatcher(
     options: WindowsServiceRunOptions,
 ) -> Result<(), ServiceError> {
@@ -3864,6 +3922,129 @@ fn install_payload(
     Ok(())
 }
 
+fn validate_update_timeout(timeout_ms: u64) -> Result<Duration, ServiceError> {
+    if timeout_ms == 0 {
+        return Err(ServiceError::Rpc(
+            "timeout_ms must be greater than 0".to_string(),
+        ));
+    }
+    Ok(Duration::from_millis(timeout_ms))
+}
+
+fn prepare_service_update(
+    source_dir: &Path,
+    paths: &ServiceInstallPaths,
+    restart: bool,
+) -> Result<PreparedServiceUpdate, ServiceError> {
+    let source_dir = fs::canonicalize(source_dir)?;
+    if !source_dir.is_dir() {
+        return Err(ServiceError::Rpc(format!(
+            "source_dir is not a directory: {}",
+            source_dir.display()
+        )));
+    }
+    if source_is_installed_bin(&source_dir, paths) {
+        return Err(ServiceError::ServiceControl(
+            "cannot update service from the installed bin directory; pass a development or release payload directory".to_string(),
+        ));
+    }
+    let payload = discover_service_payload(&source_dir, &paths.bin_dir)?;
+    let response = WindowsServiceUpdateAccepted {
+        status: "accepted".to_string(),
+        source_dir: source_dir.clone(),
+        service_name: WINDOWS_SERVICE_NAME.to_string(),
+        installed_binary: paths.installed_exe.clone(),
+        log_dir: paths.log_dir.clone(),
+        payload: payload.clone(),
+        restart,
+    };
+    Ok(PreparedServiceUpdate {
+        source_dir,
+        payload,
+        response,
+    })
+}
+
+fn copy_update_payload_to_staging(
+    payload: &[ServicePayloadFile],
+    staging_dir: &Path,
+) -> Result<(), ServiceError> {
+    if staging_dir.exists() {
+        fs::remove_dir_all(staging_dir)?;
+    }
+    fs::create_dir_all(staging_dir)?;
+    for file in payload {
+        fs::copy(&file.source, staging_dir.join(&file.file_name))?;
+    }
+    Ok(())
+}
+
+fn replace_installed_bin_with_staging(
+    paths: &ServiceInstallPaths,
+    staging_dir: &Path,
+    suffix: &str,
+    timeout: Duration,
+) -> Result<PathBuf, ServiceError> {
+    let old_dir = paths.root_dir.join(format!("bin.old-{suffix}"));
+    if old_dir.exists() {
+        fs::remove_dir_all(&old_dir)?;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let result = replace_installed_bin_once(paths, staging_dir, &old_dir);
+        match result {
+            Ok(()) => return Ok(old_dir),
+            Err(_error) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+                if !paths.bin_dir.exists() && old_dir.exists() {
+                    let _ = fs::rename(&old_dir, &paths.bin_dir);
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn replace_installed_bin_once(
+    paths: &ServiceInstallPaths,
+    staging_dir: &Path,
+    old_dir: &Path,
+) -> Result<(), ServiceError> {
+    if !old_dir.exists() && paths.bin_dir.exists() {
+        fs::rename(&paths.bin_dir, old_dir)?;
+    }
+    match fs::rename(staging_dir, &paths.bin_dir) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if old_dir.exists() && !paths.bin_dir.exists() {
+                let _ = fs::rename(old_dir, &paths.bin_dir);
+            }
+            Err(error.into())
+        }
+    }
+}
+
+fn cleanup_update_dirs(paths: &ServiceInstallPaths) -> Result<(), ServiceError> {
+    if !paths.root_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&paths.root_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("bin.old-") || name.starts_with("bin.next-") || name == "bin.staging" {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
 fn source_is_installed_bin(source_dir: &Path, paths: &ServiceInstallPaths) -> bool {
     let Ok(source) = fs::canonicalize(source_dir) else {
         return false;
@@ -3898,6 +4079,18 @@ mod windows_service_control {
 
     pub fn uninstall(
         _options: WindowsServiceUninstallOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+
+    pub fn request_update(
+        _options: WindowsServiceUpdateOptions,
+    ) -> Result<WindowsServiceUpdateAccepted, ServiceError> {
+        Err(ServiceError::ServiceControlUnsupported)
+    }
+
+    pub fn apply_update(
+        _options: WindowsServiceApplyUpdateOptions,
     ) -> Result<WindowsServiceCommandResult, ServiceError> {
         Err(ServiceError::ServiceControlUnsupported)
     }
@@ -4053,6 +4246,96 @@ mod windows_service_control {
         Ok(result("uninstalled", None, paths, Vec::new()))
     }
 
+    pub fn request_update(
+        options: WindowsServiceUpdateOptions,
+    ) -> Result<WindowsServiceUpdateAccepted, ServiceError> {
+        validate_update_timeout(options.timeout_ms)?;
+        let paths = default_windows_service_paths();
+        let prepared = prepare_service_update(&options.source_dir, &paths, options.restart)?;
+        let updater_exe = prepared.source_dir.join("dbgatlas.exe");
+        let mut command = Command::new(updater_exe);
+        command
+            .arg("service")
+            .arg("apply-update")
+            .arg("--source-dir")
+            .arg(&prepared.source_dir)
+            .arg("--timeout-ms")
+            .arg(options.timeout_ms.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if !options.restart {
+            command.arg("--no-restart");
+        }
+        let child = command.spawn()?;
+        append_service_log(&format!(
+            "accepted service.update from {}; updater pid={}",
+            prepared.source_dir.display(),
+            child.id()
+        ));
+        Ok(prepared.response)
+    }
+
+    pub fn apply_update(
+        options: WindowsServiceApplyUpdateOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        let timeout = validate_update_timeout(options.timeout_ms)?;
+        let deadline = Instant::now() + timeout;
+        let paths = default_windows_service_paths();
+        prepare_install_layout(&paths)?;
+        let prepared = prepare_service_update(&options.source_dir, &paths, options.restart)?;
+        let suffix = update_dir_suffix();
+        let staging_dir = paths.root_dir.join(format!("bin.next-{suffix}"));
+        append_service_log(&format!(
+            "starting service apply-update from {}; staging {}",
+            prepared.source_dir.display(),
+            staging_dir.display()
+        ));
+        copy_update_payload_to_staging(&prepared.payload, &staging_dir)?;
+
+        std::thread::sleep(Duration::from_millis(SERVICE_UPDATE_DELAY_MS));
+        let manager = manager(ServiceManagerAccess::CONNECT)?;
+        let service = open_required(
+            &manager,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+        )?;
+        stop_service_with_timeout(&service, remaining_update_timeout(deadline)?)?;
+        append_service_log("service stopped for apply-update");
+
+        let old_dir = replace_installed_bin_with_staging(
+            &paths,
+            &staging_dir,
+            &suffix,
+            remaining_update_timeout(deadline)?,
+        )?;
+        append_service_log(&format!(
+            "service payload replaced; previous bin at {}",
+            old_dir.display()
+        ));
+
+        if options.restart {
+            start_service_with_timeout(&service, remaining_update_timeout(deadline)?)?;
+            append_service_log("service restarted after apply-update");
+        } else {
+            append_service_log("service restart skipped after apply-update");
+        }
+
+        if let Err(error) = cleanup_update_dirs(&paths) {
+            append_service_log(&format!("service update cleanup failed: {error}"));
+        }
+
+        Ok(result(
+            if options.restart {
+                "running"
+            } else {
+                "stopped"
+            },
+            installed_endpoint(&paths).ok().flatten(),
+            paths,
+            prepared.payload,
+        ))
+    }
+
     pub fn run_dispatcher(options: WindowsServiceRunOptions) -> Result<(), ServiceError> {
         append_service_log("starting Windows service dispatcher");
         RUN_OPTIONS.set(options).map_err(|_| {
@@ -4194,22 +4477,51 @@ mod windows_service_control {
     }
 
     fn stop_service(service: &windows_service::service::Service) -> Result<(), ServiceError> {
+        stop_service_with_timeout(service, Duration::from_secs(15))
+    }
+
+    fn stop_service_with_timeout(
+        service: &windows_service::service::Service,
+        timeout: Duration,
+    ) -> Result<(), ServiceError> {
         let status = service.query_status().map_err(map_windows_service_error)?;
         if status.current_state == ServiceState::Stopped {
             return Ok(());
         }
         match service.stop() {
-            Ok(_) => wait_for_state(service, ServiceState::Stopped),
+            Ok(_) => wait_for_state_with_timeout(service, ServiceState::Stopped, timeout),
             Err(error) if is_service_not_active(&error) => Ok(()),
             Err(error) => Err(map_windows_service_error(error)),
         }
+    }
+
+    fn start_service_with_timeout(
+        service: &windows_service::service::Service,
+        timeout: Duration,
+    ) -> Result<(), ServiceError> {
+        let status = service.query_status().map_err(map_windows_service_error)?;
+        if status.current_state == ServiceState::Running {
+            return Ok(());
+        }
+        service
+            .start::<OsString>(&[])
+            .map_err(map_windows_service_error)?;
+        wait_for_state_with_timeout(service, ServiceState::Running, timeout)
     }
 
     fn wait_for_state(
         service: &windows_service::service::Service,
         expected: ServiceState,
     ) -> Result<(), ServiceError> {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        wait_for_state_with_timeout(service, expected, Duration::from_secs(15))
+    }
+
+    fn wait_for_state_with_timeout(
+        service: &windows_service::service::Service,
+        expected: ServiceState,
+        timeout: Duration,
+    ) -> Result<(), ServiceError> {
+        let deadline = Instant::now() + timeout;
         loop {
             let status = service.query_status().map_err(map_windows_service_error)?;
             if status.current_state == expected {
@@ -4224,6 +4536,18 @@ mod windows_service_control {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
+    }
+
+    fn remaining_update_timeout(deadline: Instant) -> Result<Duration, ServiceError> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                ServiceError::ServiceControl("timed out applying service update".to_string())
+            })
+    }
+
+    fn update_dir_suffix() -> String {
+        format!("{}-{}", Timestamp::now().unix_millis, std::process::id())
     }
 
     fn set_status(
@@ -4907,6 +5231,19 @@ fn mcp_tool_descriptors() -> Vec<Value> {
             json!({}),
         ),
         mcp_tool(
+            "service.update",
+            "Update the installed DbgAtlas service from a built payload directory.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source_dir": { "type": "string" },
+                    "restart": { "type": "boolean", "default": true },
+                    "timeout_ms": { "type": "integer", "default": DEFAULT_SERVICE_UPDATE_TIMEOUT_MS }
+                },
+                "required": ["source_dir"]
+            }),
+        ),
+        mcp_tool(
             "debug.session.create",
             "Create a debug session from a dump or attach target.",
             json!({
@@ -5163,6 +5500,15 @@ struct ReverseSessionCloseParams {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ServiceUpdateParams {
+    source_dir: PathBuf,
+    #[serde(default = "default_service_update_restart")]
+    restart: bool,
+    #[serde(default = "default_service_update_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct OperationGetParams {
     operation_id: OperationRef,
 }
@@ -5177,6 +5523,14 @@ struct ToolCallParams {
 #[derive(Debug, Deserialize)]
 struct WorkspaceFactsParams {
     path: PathBuf,
+}
+
+fn default_service_update_restart() -> bool {
+    true
+}
+
+fn default_service_update_timeout_ms() -> u64 {
+    DEFAULT_SERVICE_UPDATE_TIMEOUT_MS
 }
 
 #[derive(Clone, Copy)]
@@ -6137,6 +6491,92 @@ mod tests {
             file.file_name == "dbgatlas_dbgeng.dll"
                 && file.destination == destination.join("dbgatlas_dbgeng.dll")
         }));
+    }
+
+    #[test]
+    fn service_update_rejects_incomplete_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::write(temp.path().join("dbgatlas.exe"), "").unwrap();
+
+        let error = prepare_service_update(temp.path(), &paths, true).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("service install payload is incomplete")
+        );
+    }
+
+    #[test]
+    fn service_update_rejects_installed_bin_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+
+        let error = prepare_service_update(&paths.bin_dir, &paths, true).unwrap_err();
+
+        assert!(matches!(error, ServiceError::ServiceControl(_)));
+        assert!(error.to_string().contains("installed bin directory"));
+    }
+
+    #[test]
+    fn service_update_accepted_response_maps_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("payload");
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&source).unwrap();
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(source.join(file_name), file_name).unwrap();
+        }
+
+        let prepared = prepare_service_update(&source, &paths, false).unwrap();
+
+        assert_eq!(prepared.response.status, "accepted");
+        assert_eq!(prepared.response.restart, false);
+        assert_eq!(prepared.response.service_name, WINDOWS_SERVICE_NAME);
+        assert_eq!(prepared.response.installed_binary, paths.installed_exe);
+        assert_eq!(prepared.response.log_dir, paths.log_dir);
+        assert_eq!(
+            prepared.response.source_dir,
+            fs::canonicalize(&source).unwrap()
+        );
+        assert_eq!(
+            prepared.response.payload.len(),
+            WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len()
+        );
+        assert!(prepared.response.payload.iter().any(|file| {
+            file.file_name == "dbgatlas.exe"
+                && file.destination == paths.bin_dir.join("dbgatlas.exe")
+        }));
+    }
+
+    #[test]
+    fn service_update_replace_helper_swaps_and_cleans_update_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        let staging = paths.root_dir.join("bin.next-test");
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(paths.bin_dir.join("dbgatlas.exe"), "old").unwrap();
+        fs::write(staging.join("dbgatlas.exe"), "new").unwrap();
+
+        let old_dir =
+            replace_installed_bin_with_staging(&paths, &staging, "test", Duration::from_secs(1))
+                .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(paths.bin_dir.join("dbgatlas.exe")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(old_dir.join("dbgatlas.exe")).unwrap(),
+            "old"
+        );
+        cleanup_update_dirs(&paths).unwrap();
+        assert!(paths.bin_dir.is_dir());
+        assert!(!old_dir.exists());
+        assert!(!staging.exists());
     }
 
     #[test]
@@ -7509,6 +7949,18 @@ mod tests {
         let body = http_body_json(&response);
         let tools = body["result"]["tools"].as_array().unwrap();
         assert!(tools.iter().any(|tool| tool["name"] == "debug.eval"));
+        let service_update = tools
+            .iter()
+            .find(|tool| tool["name"] == "service.update")
+            .expect("service.update tool is listed");
+        assert_eq!(
+            service_update["inputSchema"]["properties"]["source_dir"]["type"],
+            "string"
+        );
+        assert_eq!(
+            service_update["inputSchema"]["properties"]["restart"]["default"],
+            true
+        );
         assert!(tools.iter().any(|tool| tool["name"] == "workspace.facts"));
         assert!(!tools.iter().any(|tool| tool["name"] == "recording.start"));
         server.stop();

@@ -3,8 +3,9 @@ use clap::{Parser, Subcommand};
 use dbgatlas_debug::DebugTarget;
 use dbgatlas_recording::RecordingTarget;
 use dbgatlas_service::{
-    JsonRpcRequest, ServiceConfig, ServiceHost, WindowsServiceInstallOptions,
-    WindowsServiceRunOptions, WindowsServiceUninstallOptions, install_windows_service,
+    DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcRequest, ServiceConfig, ServiceHost,
+    WindowsServiceApplyUpdateOptions, WindowsServiceInstallOptions, WindowsServiceRunOptions,
+    WindowsServiceUninstallOptions, apply_windows_service_update, install_windows_service,
     installed_client_config, invoke_http_json_rpc, run_http_service,
     run_windows_service_dispatcher, start_windows_service, status_windows_service,
     stop_windows_service, uninstall_windows_service,
@@ -101,6 +102,15 @@ enum ServiceCommand {
     Uninstall {
         #[arg(long)]
         purge: bool,
+    },
+    #[command(hide = true)]
+    ApplyUpdate {
+        #[arg(long)]
+        source_dir: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_SERVICE_UPDATE_TIMEOUT_MS)]
+        timeout_ms: u64,
+        #[arg(long)]
+        no_restart: bool,
     },
 }
 
@@ -337,7 +347,10 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
                 bearer_token: token,
             };
             if !as_json {
-                println!("DbgAtlas service RPC listening on http://{}/rpc", config.bind);
+                println!(
+                    "DbgAtlas service RPC listening on http://{}/rpc",
+                    config.bind
+                );
                 println!("DbgAtlas MCP listening on http://{}/mcp", config.bind);
             }
             run_http_service(config, ServiceHost::with_process_workers()?)?;
@@ -368,6 +381,18 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
         }
         ServiceCommand::Uninstall { purge } => {
             let result = uninstall_windows_service(WindowsServiceUninstallOptions { purge })?;
+            print_service_command_result(result, as_json)?;
+        }
+        ServiceCommand::ApplyUpdate {
+            source_dir,
+            timeout_ms,
+            no_restart,
+        } => {
+            let result = apply_windows_service_update(WindowsServiceApplyUpdateOptions {
+                source_dir,
+                restart: !no_restart,
+                timeout_ms,
+            })?;
             print_service_command_result(result, as_json)?;
         }
     }

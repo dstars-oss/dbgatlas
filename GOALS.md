@@ -76,6 +76,7 @@ Tasks:
 - [x] MCP server 只调用 core / domain manager，不复制 debug/recording 业务逻辑，不提供独立 stdio MCP 进程。
 - [x] 为 CLI 与 MCP 共享 workflow 增加测试。
 - [x] 文档说明 AI agent 如何读取 workspace facts 并引用 artifact / operation id。
+- [x] 新增安装态 service self-update RPC/MCP 接口，支持从构建好的 payload 目录异步更新 `%ProgramData%\DbgAtlas\bin`。
 
 Non-goals:
 
