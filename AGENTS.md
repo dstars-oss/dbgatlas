@@ -91,7 +91,7 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 
 `script/` 用于放置开发者可直接运行的本机脚本，例如 release 构建、安装、服务 lifecycle 辅助脚本。跨平台、可组合、面向 CI/发布流水线的工程自动化优先放入 `xtask/`。
 
-本仓库的 MVP 开发目标已经达成。后续工作应按真实调试、逆向、录制、安装和 agent 使用体验中的具体问题推进；不要为了延续路线图而保留或新增 speculative checklist、空模块、空 schema 或尚未验证的 report/workflow 抽象。
+更新已安装服务的 runtime payload 时，优先通过已运行服务暴露的 MCP / JSON-RPC `service.update`，传入已构建好的 payload 目录（例如 `target\release`）并使用默认 `restart: true`。该路径会由安装态服务的独立 updater 完成校验、staging、stop、rename swap、restart 和日志记录，不需要手动停止服务或重新执行安装流程。更新后检查 `service.health`。
 
 完成非平凡代码、构建、schema 或测试改动后，应运行最相关且范围最小的验证命令。若无法运行，应说明原因和已完成的替代检查。
 
@@ -100,15 +100,3 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 `dbgatlas service` 是当前安装态和开发态的主入口。它在同一个 loopback HTTP listener 上暴露两个 endpoint：`/rpc` 是 DbgAtlas 自有 JSON-RPC API，`/mcp` 是 Codex 等 MCP 客户端使用的 HTTP MCP endpoint。项目不再维护独立的 stdio MCP server 或 `dbgatlas-mcp` crate。
 
 `/rpc` 和 `/mcp` 共享 bearer token、loopback bind 限制和浏览器类客户端的 `Origin` 校验。Codex 项目配置可放在本地 `.codex/config.toml`，但 `.codex/` 应保持 ignored，不提交；token 通过 `DBGATLAS_TOKEN` 等本机环境变量传入，不写进仓库。
-
-`dbgatlas service install` 不应覆盖已有 `%ProgramData%\DbgAtlas\etc\runtime.toml` 或 `%ProgramData%\DbgAtlas\etc\token`。`--force` 只用于更新 installed payload 和 Windows service entry，不重置 token/config。
-
-涉及 service、MCP、CLI HTTP client 或安装态行为的改动，优先运行：
-
-```powershell
-cargo test -p dbgatlas-service
-cargo test -p dbgatlas-cli
-cargo test --workspace
-```
-
-验证安装态 service / MCP 时，优先检查 `dbgatlas service status --json`、`%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，以及相关 analysis workspace 的 `artifacts/operations.jsonl` 和 `artifacts/command_audit.jsonl`。
