@@ -1,6 +1,8 @@
 /target/
 /build/
 /scratch-workspace/
+/temp/*
+!/temp/.gitkeep
 /.codex/
 *.pdb
 *.ilk
