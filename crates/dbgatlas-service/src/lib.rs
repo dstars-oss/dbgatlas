@@ -204,6 +204,10 @@ impl ServiceHost {
             "reverse.list_funcs" => self.reverse_core_function("list_funcs", request.params),
             "reverse.list_globals" => self.reverse_core_function("list_globals", request.params),
             "reverse.imports" => self.reverse_core_function("imports", request.params),
+            "reverse.list_strings" => self.reverse_core_function("list_strings", request.params),
+            "reverse.get_string" => self.reverse_core_function("get_string", request.params),
+            "reverse.get_bytes" => self.reverse_core_function("get_bytes", request.params),
+            "reverse.get_int" => self.reverse_core_function("get_int", request.params),
             "reverse.decompile" => self.reverse_core_function("decompile", request.params),
             "reverse.disasm" => self.reverse_core_function("disasm", request.params),
             "reverse.xrefs_to" => self.reverse_core_function("xrefs_to", request.params),
@@ -300,6 +304,10 @@ impl ServiceHost {
             | "reverse.list_funcs"
             | "reverse.list_globals"
             | "reverse.imports"
+            | "reverse.list_strings"
+            | "reverse.get_string"
+            | "reverse.get_bytes"
+            | "reverse.get_int"
             | "reverse.decompile"
             | "reverse.disasm"
             | "reverse.xrefs_to"
@@ -3625,6 +3633,10 @@ fn mock_reverse_core_response(
         "list_funcs" => mock_list_funcs(&arguments)?,
         "list_globals" => mock_list_globals(&arguments)?,
         "imports" => mock_imports(&arguments)?,
+        "list_strings" => mock_list_strings(&arguments)?,
+        "get_string" => mock_get_string(&arguments)?,
+        "get_bytes" => mock_get_bytes(&arguments)?,
+        "get_int" => mock_get_int(&arguments)?,
         "decompile" => mock_decompile(&arguments)?,
         "disasm" => mock_disasm(&arguments)?,
         "xrefs_to" => mock_xrefs_to(&arguments)?,
@@ -3744,6 +3756,93 @@ fn mock_imports(arguments: &Value) -> Result<Value, ServiceError> {
     paginate_filtered(rows, arguments)
 }
 
+fn mock_list_strings(arguments: &Value) -> Result<Value, ServiceError> {
+    let rows = vec![
+        json!({ "address": 0x140040000u64, "length": 18, "type": 0, "text": "https://example.test" }),
+        json!({ "address": 0x140040020u64, "length": 13, "type": 0, "text": "config_path" }),
+        json!({ "address": 0x140040040u64, "length": 17, "type": 0, "text": "CreateFileW failed" }),
+    ];
+    paginate_filtered(rows, arguments)
+}
+
+fn mock_get_string(arguments: &Value) -> Result<Value, ServiceError> {
+    let addr = required_u64_argument(arguments, "addr")?;
+    let length = optional_u64_argument(arguments, "length")?;
+    if let Some(length) = length
+        && (length == 0 || length > 4096)
+    {
+        return Err(ServiceError::Rpc(
+            "length must be between 1 and 4096 bytes".to_string(),
+        ));
+    }
+    let string_type = optional_u64_argument(arguments, "type")?.unwrap_or(0);
+    let text = match addr {
+        0x140040000 => Some("https://example.test"),
+        0x140040020 => Some("config_path"),
+        0x140040040 => Some("CreateFileW failed"),
+        _ => None,
+    };
+    Ok(json!({
+        "address": addr,
+        "found": text.is_some(),
+        "length": length.unwrap_or_else(|| text.map_or(0, str::len) as u64),
+        "type": string_type,
+        "text": text
+    }))
+}
+
+fn mock_get_bytes(arguments: &Value) -> Result<Value, ServiceError> {
+    let addr = required_u64_argument(arguments, "addr")?;
+    let length = required_u64_argument(arguments, "length")?;
+    let bytes = mock_idb_bytes(addr, length)?;
+    Ok(json!({
+        "address": addr,
+        "requested_length": length,
+        "read_length": bytes.len(),
+        "complete": bytes.len() as u64 == length,
+        "bytes_hex": hex_encode(&bytes)
+    }))
+}
+
+fn mock_get_int(arguments: &Value) -> Result<Value, ServiceError> {
+    let addr = required_u64_argument(arguments, "addr")?;
+    let size = optional_u64_argument(arguments, "size")?.unwrap_or(8);
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return Err(ServiceError::Rpc(
+            "size must be one of 1, 2, 4, or 8 bytes".to_string(),
+        ));
+    }
+    let endian = arguments
+        .get("endian")
+        .and_then(Value::as_str)
+        .unwrap_or("little");
+    if !matches!(endian, "little" | "big") {
+        return Err(ServiceError::Rpc(
+            "endian must be `little` or `big`".to_string(),
+        ));
+    }
+    let bytes = mock_idb_bytes(addr, size)?;
+    let mut value = 0u64;
+    if endian == "little" {
+        for (index, byte) in bytes.iter().enumerate() {
+            value |= (*byte as u64) << (index * 8);
+        }
+    } else {
+        for byte in &bytes {
+            value = (value << 8) | (*byte as u64);
+        }
+    }
+    Ok(json!({
+        "address": addr,
+        "size": size,
+        "endian": endian,
+        "complete": true,
+        "bytes_hex": hex_encode(&bytes),
+        "decimal": value.to_string(),
+        "hex": format!("0x{value:x}")
+    }))
+}
+
 fn mock_decompile(arguments: &Value) -> Result<Value, ServiceError> {
     let addr = required_u64_argument(arguments, "addr")?;
     let start = addr & !0xff;
@@ -3823,6 +3922,27 @@ fn mock_callees(arguments: &Value) -> Result<Value, ServiceError> {
     }
     let count = items.len();
     Ok(json!({ "items": items, "count": count }))
+}
+
+fn mock_idb_bytes(addr: u64, length: u64) -> Result<Vec<u8>, ServiceError> {
+    if length == 0 || length > 4096 {
+        return Err(ServiceError::Rpc(
+            "length must be between 1 and 4096 bytes".to_string(),
+        ));
+    }
+    Ok((0..length)
+        .map(|offset| addr.wrapping_add(offset) as u8)
+        .collect())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
 }
 
 fn paginate_filtered(rows: Vec<Value>, arguments: &Value) -> Result<Value, ServiceError> {
@@ -5984,6 +6104,54 @@ fn mcp_tool_descriptors() -> Vec<Value> {
             })),
         ),
         mcp_tool(
+            "reverse.list_strings",
+            "List IDA strings with pagination and optional substring filtering.",
+            mcp_reverse_core_schema(json!({
+                "offset": { "type": "integer" },
+                "count": { "type": "integer" },
+                "filter": { "type": "string" }
+            })),
+        ),
+        mcp_tool(
+            "reverse.get_string",
+            "Read an IDA string at an address.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "addr": {},
+                    "length": { "type": "integer" },
+                    "type": { "type": "integer" }
+                }),
+                &["addr"],
+            ),
+        ),
+        mcp_tool(
+            "reverse.get_bytes",
+            "Read IDB bytes at an address.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "addr": {},
+                    "length": { "type": "integer" }
+                }),
+                &["addr", "length"],
+            ),
+        ),
+        mcp_tool(
+            "reverse.get_int",
+            "Read an integer from IDB bytes at an address.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "addr": {},
+                    "size": { "type": "integer" },
+                    "endian": {
+                        "type": "string",
+                        "enum": ["little", "big"],
+                        "default": "little"
+                    }
+                }),
+                &["addr"],
+            ),
+        ),
+        mcp_tool(
             "reverse.decompile",
             "Decompile the function containing an IDA address.",
             mcp_reverse_core_schema_required(json!({ "addr": {} }), &["addr"]),
@@ -7990,6 +8158,19 @@ mod tests {
             ),
             ("reverse.list_globals", json!({ "offset": 0, "count": 10 })),
             ("reverse.imports", json!({ "offset": 1, "count": 1 })),
+            (
+                "reverse.list_strings",
+                json!({ "offset": 0, "count": 2, "filter": "config" }),
+            ),
+            ("reverse.get_string", json!({ "addr": "0x140040000" })),
+            (
+                "reverse.get_bytes",
+                json!({ "addr": "0x140040000", "length": 8 }),
+            ),
+            (
+                "reverse.get_int",
+                json!({ "addr": "0x140040000", "size": 4, "endian": "little" }),
+            ),
             ("reverse.decompile", json!({ "addr": "0x140001234" })),
             ("reverse.disasm", json!({ "addr": "0x140001234" })),
             (
@@ -8026,7 +8207,7 @@ mod tests {
                 .iter()
                 .filter(|artifact| artifact.kind == "reverse.core")
                 .count()
-                >= 10
+                >= 14
         );
         let operations = workspace.list_operations().unwrap();
         for capability in [
@@ -8035,6 +8216,10 @@ mod tests {
             "reverse.list_funcs",
             "reverse.list_globals",
             "reverse.imports",
+            "reverse.list_strings",
+            "reverse.get_string",
+            "reverse.get_bytes",
+            "reverse.get_int",
             "reverse.decompile",
             "reverse.disasm",
             "reverse.xrefs_to",
@@ -8078,6 +8263,43 @@ mod tests {
         );
         assert!(empty.error.is_none(), "{:?}", empty.error);
         assert_eq!(empty.result.unwrap()["result"]["total"], 0);
+
+        let empty_strings = reverse_core_rpc(
+            &host,
+            "reverse.list_strings",
+            session_id.clone(),
+            reverse_session_id.clone(),
+            json!({ "offset": 10, "count": 2 }),
+        );
+        assert!(empty_strings.error.is_none(), "{:?}", empty_strings.error);
+        let result = empty_strings.result.unwrap();
+        assert_eq!(result["result"]["offset"], 10);
+        assert_eq!(result["result"]["count"], 0);
+        assert_eq!(result["result"]["total"], 3);
+
+        for (method, args) in [
+            (
+                "reverse.get_bytes",
+                json!({ "addr": "0x140040000", "length": 0 }),
+            ),
+            (
+                "reverse.get_bytes",
+                json!({ "addr": "0x140040000", "length": 4097 }),
+            ),
+            (
+                "reverse.get_int",
+                json!({ "addr": "0x140040000", "size": 3 }),
+            ),
+        ] {
+            let invalid = reverse_core_rpc(
+                &host,
+                method,
+                session_id.clone(),
+                reverse_session_id.clone(),
+                args,
+            );
+            assert!(invalid.error.is_some(), "{method} accepted invalid input");
+        }
 
         let invalid = reverse_core_rpc(
             &host,
@@ -8818,6 +9040,10 @@ mod tests {
             "reverse.list_funcs",
             "reverse.list_globals",
             "reverse.imports",
+            "reverse.list_strings",
+            "reverse.get_string",
+            "reverse.get_bytes",
+            "reverse.get_int",
             "reverse.decompile",
             "reverse.disasm",
             "reverse.xrefs_to",

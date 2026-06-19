@@ -16,6 +16,7 @@
 #include <lines.hpp>
 #include <name.hpp>
 #include <nalt.hpp>
+#include <strlist.hpp>
 #include <xref.hpp>
 
 #include <algorithm>
@@ -29,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -39,6 +41,7 @@ bool g_active_session = false;
 struct IdaSessionHandleImpl {
     std::thread::id owner_thread;
     bool database_open = false;
+    bool strings_built = false;
 };
 
 struct TextOwner {
@@ -316,6 +319,20 @@ uint64_t required_json_u64_arg(const std::string& args, const std::string& key) 
     return parsed;
 }
 
+bool optional_json_u64_arg(const std::string& args, const std::string& key, uint64_t* out) {
+    std::string value = find_json_value(args, key);
+    if (value.empty()) {
+        return false;
+    }
+    value = unquote_json_string(value);
+    uint64_t parsed = 0;
+    if (!parse_u64_text(value, &parsed)) {
+        throw std::invalid_argument(key + " must be an unsigned integer or address string");
+    }
+    *out = parsed;
+    return true;
+}
+
 std::string json_string_arg(const std::string& args, const std::string& key) {
     return unquote_json_string(find_json_value(args, key));
 }
@@ -385,6 +402,77 @@ std::string function_json(func_t* function) {
         << ",\"size\":" << json_u64(static_cast<uint64_t>(function->end_ea - function->start_ea))
         << ",\"name\":" << json_string(qstring_to_string(name)) << "}";
     return out.str();
+}
+
+std::string bytes_hex(const std::vector<uint8_t>& bytes) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t byte : bytes) {
+        out.push_back(hex[(byte >> 4) & 0xf]);
+        out.push_back(hex[byte & 0xf]);
+    }
+    return out;
+}
+
+std::string to_lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+void ensure_string_list(IdaSessionHandleImpl* handle) {
+    if (!handle->strings_built) {
+        build_strlist();
+        handle->strings_built = true;
+    }
+}
+
+bool get_string_list_item_at(ea_t ea, string_info_t* out) {
+    size_t qty = get_strlist_qty();
+    for (size_t i = 0; i < qty; ++i) {
+        string_info_t item;
+        if (get_strlist_item(&item, i) && item.ea == ea) {
+            *out = item;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string string_info_json(const string_info_t& item, const std::string& text) {
+    std::ostringstream out;
+    out << "{\"address\":" << json_u64(static_cast<uint64_t>(item.ea))
+        << ",\"length\":" << json_u64(item.length > 0 ? static_cast<uint64_t>(item.length) : 0)
+        << ",\"type\":" << item.type
+        << ",\"text\":" << json_string(text) << "}";
+    return out.str();
+}
+
+bool read_string_text(ea_t ea, size_t length, int32 type, std::string* out) {
+    qstring text;
+    ssize_t result = get_strlit_contents(&text, ea, length, type, nullptr, STRCONV_ESCAPE);
+    if (result < 0) {
+        return false;
+    }
+    *out = qstring_to_string(text);
+    return true;
+}
+
+std::vector<uint8_t> read_idb_bytes(ea_t ea, uint64_t length) {
+    if (length == 0 || length > 4096) {
+        throw std::invalid_argument("length must be between 1 and 4096 bytes");
+    }
+    std::vector<uint8_t> bytes;
+    bytes.reserve(static_cast<size_t>(length));
+    for (uint64_t i = 0; i < length; ++i) {
+        uint8_t byte = 0;
+        ssize_t read = get_bytes(&byte, 1, ea + static_cast<ea_t>(i));
+        if (read != 1) {
+            break;
+        }
+        bytes.push_back(byte);
+    }
+    return bytes;
 }
 
 std::string core_int_convert(const std::string& args) {
@@ -623,6 +711,156 @@ std::string core_imports(const std::string& args) {
     return out.str();
 }
 
+std::string core_list_strings(IdaSessionHandleImpl* handle, const std::string& args) {
+    ensure_string_list(handle);
+    uint64_t offset = json_u64_arg(args, "offset", 0);
+    uint64_t count = std::min<uint64_t>(json_u64_arg(args, "count", 50), 1000);
+    std::string filter = to_lower_copy(json_string_arg(args, "filter"));
+    std::ostringstream out;
+    out << "{\"offset\":" << offset << ",\"items\":[";
+    size_t total = 0;
+    size_t emitted = 0;
+    bool first = true;
+    size_t qty = get_strlist_qty();
+    for (size_t i = 0; i < qty; ++i) {
+        string_info_t item;
+        if (!get_strlist_item(&item, i)) {
+            continue;
+        }
+        size_t length = item.length > 0 ? static_cast<size_t>(item.length) : size_t(-1);
+        if (length != size_t(-1)) {
+            length = std::min<size_t>(length, 4096);
+        }
+        std::string text;
+        if (!read_string_text(item.ea, length, item.type, &text)) {
+            continue;
+        }
+        if (!filter.empty() && to_lower_copy(text).find(filter) == std::string::npos) {
+            continue;
+        }
+        if (total++ < offset) {
+            continue;
+        }
+        if (emitted >= count) {
+            continue;
+        }
+        if (!first) out << ",";
+        first = false;
+        out << string_info_json(item, text);
+        ++emitted;
+    }
+    out << "],\"count\":" << emitted << ",\"total\":" << total << "}";
+    return out.str();
+}
+
+std::string core_get_string(IdaSessionHandleImpl* handle, const std::string& args) {
+    ensure_string_list(handle);
+    uint64_t addr = required_json_u64_arg(args, "addr");
+    ea_t ea = static_cast<ea_t>(addr);
+
+    string_info_t item;
+    bool from_list = get_string_list_item_at(ea, &item);
+    uint64_t length_arg = 0;
+    bool has_length = optional_json_u64_arg(args, "length", &length_arg);
+    if (has_length) {
+        if (length_arg == 0 || length_arg > 4096) {
+            throw std::invalid_argument("length must be between 1 and 4096 bytes");
+        }
+    }
+    uint64_t type_arg = 0;
+    bool has_type = optional_json_u64_arg(args, "type", &type_arg);
+
+    size_t length = size_t(-1);
+    int32 type = STRTYPE_C;
+    if (from_list) {
+        length = item.length > 0 ? static_cast<size_t>(item.length) : size_t(-1);
+        type = item.type;
+    }
+    if (has_length) {
+        length = static_cast<size_t>(length_arg);
+    } else if (length != size_t(-1)) {
+        length = std::min<size_t>(length, 4096);
+    }
+    if (has_type) {
+        type = static_cast<int32>(type_arg);
+    } else if (!from_list) {
+        type = static_cast<int32>(get_str_type(ea));
+    }
+
+    std::string text;
+    bool found = read_string_text(ea, length, type, &text);
+    std::ostringstream out;
+    out << "{\"address\":" << json_u64(addr)
+        << ",\"found\":" << (found ? "true" : "false")
+        << ",\"length\":" << (length == size_t(-1) ? "null" : json_u64(static_cast<uint64_t>(length)))
+        << ",\"type\":" << type;
+    if (found) {
+        out << ",\"text\":" << json_string(text);
+    } else {
+        out << ",\"text\":null";
+    }
+    out << "}";
+    return out.str();
+}
+
+std::string core_get_bytes(const std::string& args) {
+    uint64_t addr = required_json_u64_arg(args, "addr");
+    uint64_t length = required_json_u64_arg(args, "length");
+    std::vector<uint8_t> bytes = read_idb_bytes(static_cast<ea_t>(addr), length);
+    std::ostringstream out;
+    out << "{\"address\":" << json_u64(addr)
+        << ",\"requested_length\":" << json_u64(length)
+        << ",\"read_length\":" << json_u64(static_cast<uint64_t>(bytes.size()))
+        << ",\"complete\":" << (bytes.size() == length ? "true" : "false")
+        << ",\"bytes_hex\":" << json_string(bytes_hex(bytes)) << "}";
+    return out.str();
+}
+
+std::string core_get_int(const std::string& args) {
+    uint64_t addr = required_json_u64_arg(args, "addr");
+    uint64_t size = 8;
+    optional_json_u64_arg(args, "size", &size);
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        throw std::invalid_argument("size must be one of 1, 2, 4, or 8 bytes");
+    }
+    std::string endian = json_string_arg(args, "endian");
+    if (endian.empty()) {
+        endian = "little";
+    }
+    if (endian != "little" && endian != "big") {
+        throw std::invalid_argument("endian must be `little` or `big`");
+    }
+
+    std::vector<uint8_t> bytes = read_idb_bytes(static_cast<ea_t>(addr), size);
+    bool complete = bytes.size() == size;
+    std::ostringstream out;
+    out << "{\"address\":" << json_u64(addr)
+        << ",\"size\":" << json_u64(size)
+        << ",\"endian\":" << json_string(endian)
+        << ",\"complete\":" << (complete ? "true" : "false")
+        << ",\"bytes_hex\":" << json_string(bytes_hex(bytes));
+    if (complete) {
+        uint64_t value = 0;
+        if (endian == "little") {
+            for (size_t i = 0; i < bytes.size(); ++i) {
+                value |= static_cast<uint64_t>(bytes[i]) << (i * 8);
+            }
+        } else {
+            for (uint8_t byte : bytes) {
+                value = (value << 8) | byte;
+            }
+        }
+        std::ostringstream hex;
+        hex << "0x" << std::hex << value;
+        out << ",\"decimal\":" << json_string(std::to_string(value))
+            << ",\"hex\":" << json_string(hex.str());
+    } else {
+        out << ",\"decimal\":null,\"hex\":null";
+    }
+    out << "}";
+    return out.str();
+}
+
 std::string core_decompile(const std::string& args) {
     uint64_t addr = required_json_u64_arg(args, "addr");
     func_t* function = get_func(static_cast<ea_t>(addr));
@@ -809,12 +1047,16 @@ std::string core_callees(const std::string& args) {
     return out.str();
 }
 
-std::string execute_core_function(const std::string& function, const std::string& args) {
+std::string execute_core_function(IdaSessionHandleImpl* handle, const std::string& function, const std::string& args) {
     if (function == "lookup_funcs") return core_lookup_funcs(args);
     if (function == "int_convert") return core_int_convert(args);
     if (function == "list_funcs") return core_list_funcs(args);
     if (function == "list_globals") return core_list_globals(args);
     if (function == "imports") return core_imports(args);
+    if (function == "list_strings") return core_list_strings(handle, args);
+    if (function == "get_string") return core_get_string(handle, args);
+    if (function == "get_bytes") return core_get_bytes(args);
+    if (function == "get_int") return core_get_int(args);
     if (function == "decompile") return core_decompile(args);
     if (function == "disasm") return core_disasm(args);
     if (function == "xrefs_to") return core_xrefs_to(args);
@@ -1000,7 +1242,7 @@ DA_IDA_EXPORT int32_t da_ida_core_function(
         ensure_owner_thread(impl);
         std::string function = utf8_string(function_utf8, "function");
         std::string arguments_json = utf8_string(arguments_json_utf8, "arguments_json");
-        std::string result_json = execute_core_function(function, arguments_json);
+        std::string result_json = execute_core_function(impl, function, arguments_json);
         out->flags = 0;
         out->result_json = make_text_view(result_json);
         return DA_IDA_OK;

@@ -11,6 +11,10 @@ active debug `session_id` and IDA `reverse_session_id`.
 - `reverse.list_funcs`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
 - `reverse.list_globals`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
 - `reverse.imports`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
+- `reverse.list_strings`: `{ session_id, reverse_session_id, offset?, count?, filter? }`
+- `reverse.get_string`: `{ session_id, reverse_session_id, addr, length?, type? }`
+- `reverse.get_bytes`: `{ session_id, reverse_session_id, addr, length }`
+- `reverse.get_int`: `{ session_id, reverse_session_id, addr, size?, endian? }`
 - `reverse.decompile`: `{ session_id, reverse_session_id, addr }`
 - `reverse.disasm`: `{ session_id, reverse_session_id, addr }`
 - `reverse.xrefs_to`: `{ session_id, reverse_session_id, addrs }`
@@ -20,6 +24,12 @@ active debug `session_id` and IDA `reverse_session_id`.
 List inputs accept either a JSON array or a comma-separated string. Integer inputs accept
 JSON numbers, decimal strings, `0x` hex strings, and `0b` binary strings. `int_convert`
 also accepts `bytes:` / `bytes_le:` little-endian byte lists and `ascii:` strings.
+
+`reverse.list_strings`, `reverse.get_string`, `reverse.get_bytes`, and
+`reverse.get_int` are read-only IDB context helpers. They read bytes and string
+metadata from the IDA database, not live debugger process memory. Use
+`debug.read_memory` for target virtual memory. `reverse.list_strings` uses
+case-insensitive substring filtering; regex string search is intentionally deferred.
 
 ## Result shape
 
