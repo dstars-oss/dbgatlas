@@ -92,9 +92,12 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 
 `script/` 用于放置开发者可直接运行的本机脚本，例如 release 构建、安装、服务 lifecycle 辅助脚本。跨平台、可组合、面向 CI/发布流水线的工程自动化优先放入 `xtask/`。
 
-构建 release 版本或准备安装态 service payload 时，必须使用 `script/` 下维护的 release 构建/安装脚本作为入口；不要手工拼接 `cargo build --release`、CMake 构建和 DLL 复制流程来替代脚本。
+完成 feature 后，除先运行与改动最相关的窄范围测试外，还应执行一次安装态端到端验证：
 
-更新已安装服务的 runtime payload 时，优先通过已运行服务暴露的 MCP / JSON-RPC `service.update`，传入已构建好的 payload 目录（例如 `target\release`）并使用默认 `restart: true`。该路径会由安装态服务的独立 updater 完成校验、staging、stop、rename swap、restart 和日志记录，不需要手动停止服务或重新执行安装流程。更新后检查 `service.health`。
+1. 使用维护脚本构建 release payload：从仓库根目录运行 `.\script\build-release-install.ps1 -BuildOnly`，并确保生成的 `target\release` payload 完整。
+2. 通过 Codex 连接的 DbgAtlas MCP 调用 `service.update`，传入 `source_dir` 为当前仓库的绝对 `target\release` 路径，并使用 `restart: true`。不要用手动停止服务、复制文件或重新执行安装脚本替代这一步，除非当前机器还没有安装态服务；这种情况下应先说明前置条件缺失。
+3. 服务重启后，通过 MCP 调用 `service.health` 确认安装态服务可用。
+4. 针对刚完成的 feature，优先通过安装态服务暴露的 MCP 能力做一个最小冒烟验证；若该 feature 没有对应 MCP 入口，应说明已完成到 release 构建和安装态服务更新为止，以及剩余未覆盖的验证面。
 
 完成非平凡代码、构建、schema 或测试改动后，应运行最相关且范围最小的验证命令。若无法运行，应说明原因和已完成的替代检查。
 

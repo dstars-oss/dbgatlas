@@ -160,6 +160,12 @@ pub enum ServiceError {
 pub struct ServiceHost {
     state: Arc<Mutex<ServiceState>>,
     supervisor: Arc<dyn WorkerSupervisor>,
+    capabilities: ServiceCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServiceCapabilities {
+    pub ida_py_eval: bool,
 }
 
 impl ServiceHost {
@@ -167,6 +173,7 @@ impl ServiceHost {
         Self {
             state: Arc::new(Mutex::new(ServiceState::default())),
             supervisor,
+            capabilities: ServiceCapabilities::default(),
         }
     }
 
@@ -182,6 +189,16 @@ impl ServiceHost {
         Ok(Self::new(Arc::new(
             ProcessWorkerSupervisor::new_installed_service()?,
         )))
+    }
+
+    pub fn with_ida_py_eval(mut self, enabled: bool) -> Self {
+        self.capabilities.ida_py_eval = enabled;
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: ServiceCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     pub fn handle_rpc(&self, request: JsonRpcRequest) -> JsonRpcResponse {
@@ -228,6 +245,7 @@ impl ServiceHost {
                 self.reverse_core_function("force_recompile", request.params)
             }
             "reverse.idb_save" => self.reverse_core_function("idb_save", request.params),
+            "reverse.py_eval" => self.reverse_py_eval(request.params),
             "reverse.find_bytes" => self.reverse_core_function("find_bytes", request.params),
             "reverse.search_text" => self.reverse_core_function("search_text", request.params),
             "reverse.xref_query" => self.reverse_core_function("xref_query", request.params),
@@ -274,7 +292,7 @@ impl ServiceHost {
             })),
             "ping" => Ok(json!({})),
             "notifications/initialized" => Ok(json!(null)),
-            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors() })),
+            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors(self.capabilities) })),
             "tools/call" => {
                 let params: ToolCallParams =
                     serde_json::from_value(request.params.unwrap_or_else(|| json!({})))?;
@@ -343,6 +361,10 @@ impl ServiceHost {
             | "reverse.func_query"
             | "reverse.entity_query"
             | "reverse.session.close" => self.call_mcp_service_tool(name, arguments),
+            "reverse.py_eval" => {
+                self.ensure_ida_py_eval_enabled()?;
+                self.call_mcp_service_tool(name, arguments)
+            }
             "workspace.facts" => Ok(ToolCallOutput::success(
                 self.mcp_workspace_facts(arguments)?,
             )),
@@ -369,6 +391,21 @@ impl ServiceHost {
             params: Some(arguments),
         });
         Ok(mcp_service_response_result(response))
+    }
+
+    fn reverse_py_eval(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        self.ensure_ida_py_eval_enabled()?;
+        self.reverse_core_function("py_eval", params)
+    }
+
+    fn ensure_ida_py_eval_enabled(&self) -> Result<(), ServiceError> {
+        if self.capabilities.ida_py_eval {
+            Ok(())
+        } else {
+            Err(ServiceError::Rpc(
+                "reverse.py_eval is disabled by runtime policy".to_string(),
+            ))
+        }
     }
 
     fn mcp_workspace_facts(&self, arguments: Value) -> Result<Value, ServiceError> {
@@ -2363,6 +2400,14 @@ impl ServiceHost {
     }
 }
 
+impl ServiceCapabilities {
+    pub fn from_runtime_config(runtime: &RuntimeConfig) -> Self {
+        Self {
+            ida_py_eval: runtime.tools.ida.allow_py_eval,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ServiceState {
     sessions: HashMap<String, ManagedSession>,
@@ -3630,6 +3675,7 @@ fn mock_reverse_core_response(
         "declare_type" => mock_declare_type(&arguments),
         "force_recompile" => mock_force_recompile(&arguments),
         "idb_save" => mock_idb_save(&arguments),
+        "py_eval" => mock_py_eval(&arguments),
         "find_bytes" => mock_find_bytes(&arguments)?,
         "search_text" => mock_search_text(&arguments)?,
         "xref_query" => mock_xref_query(&arguments)?,
@@ -3975,6 +4021,19 @@ fn mock_idb_save(arguments: &Value) -> Value {
         "ok": true,
         "path": arguments.get("path").cloned().unwrap_or(Value::Null),
         "changed_count": 1
+    })
+}
+
+fn mock_py_eval(arguments: &Value) -> Value {
+    let code = arguments
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "ok": true,
+        "stdout": if code.contains("print") { "mock py_eval\n" } else { "" },
+        "stderr": "",
+        "error": Value::Null
     })
 }
 
@@ -5248,7 +5307,8 @@ mod windows_service_control {
         append_service_log(&format!("reported running on {}", config.bind));
         let result = run_http_service_until(
             config,
-            ServiceHost::with_installed_process_workers()?,
+            ServiceHost::with_installed_process_workers()?
+                .with_capabilities(ServiceCapabilities::from_runtime_config(&runtime)),
             shutdown,
         );
         set_status(&status_handle, ServiceState::Stopped)?;
@@ -6073,8 +6133,8 @@ fn mcp_service_response_result(response: JsonRpcResponse) -> ToolCallOutput {
     ToolCallOutput::success(response.result.unwrap_or_else(|| json!(null)))
 }
 
-fn mcp_tool_descriptors() -> Vec<Value> {
-    vec![
+fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
+    let mut tools = vec![
         mcp_tool(
             "service.health",
             "Return DbgAtlas service health.",
@@ -6463,7 +6523,20 @@ fn mcp_tool_descriptors() -> Vec<Value> {
                 "required": ["path"]
             }),
         ),
-    ]
+    ];
+    if capabilities.ida_py_eval {
+        let py_eval = mcp_tool(
+            "reverse.py_eval",
+            "Execute Python code in the IDA context.",
+            mcp_reverse_core_schema_required(json!({ "code": { "type": "string" } }), &["code"]),
+        );
+        let insert_at = tools
+            .iter()
+            .position(|tool| tool["name"] == "reverse.find_bytes")
+            .unwrap_or(tools.len());
+        tools.insert(insert_at, py_eval);
+    }
+    tools
 }
 
 fn mcp_tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -7737,6 +7810,23 @@ mod tests {
     }
 
     #[test]
+    fn service_capabilities_read_ida_py_eval_runtime_policy() {
+        let runtime = RuntimeConfig::from_toml_str(
+            r#"
+version = 1
+
+[tools.ida]
+allow_py_eval = true
+"#,
+        )
+        .unwrap();
+
+        let capabilities = ServiceCapabilities::from_runtime_config(&runtime);
+
+        assert!(capabilities.ida_py_eval);
+    }
+
+    #[test]
     fn installed_client_config_ignores_stale_config_without_installed_binary() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
@@ -8394,7 +8484,7 @@ mod tests {
     #[test]
     fn reverse_core_functions_record_artifacts_and_operations() {
         let temp = tempfile::tempdir().unwrap();
-        let host = ServiceHost::with_mock_workers();
+        let host = ServiceHost::with_mock_workers().with_ida_py_eval(true);
         let session_id = open_reverse_session(&host, temp.path());
         let calls = [
             (
@@ -8469,6 +8559,10 @@ mod tests {
                 json!({ "query": "config", "scope": "all", "limit": 2 }),
             ),
             (
+                "reverse.py_eval",
+                json!({ "code": "print('hello from dbgatlas')" }),
+            ),
+            (
                 "reverse.xref_query",
                 json!({ "target": "0x140001000", "direction": "to", "xref_type": "all" }),
             ),
@@ -8530,6 +8624,7 @@ mod tests {
             "reverse.idb_save",
             "reverse.find_bytes",
             "reverse.search_text",
+            "reverse.py_eval",
             "reverse.xref_query",
             "reverse.func_query",
             "reverse.entity_query",
@@ -8541,6 +8636,22 @@ mod tests {
                 "{capability} was not recorded"
             );
         }
+    }
+
+    #[test]
+    fn reverse_py_eval_is_disabled_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id = open_reverse_session(&host, temp.path());
+        let response = reverse_core_rpc(
+            &host,
+            "reverse.py_eval",
+            session_id,
+            json!({ "code": "print('should not run')" }),
+        );
+
+        let error = response.error.expect("reverse.py_eval is rejected");
+        assert!(error.message.contains("disabled by runtime policy"));
     }
 
     #[test]
@@ -9375,7 +9486,66 @@ mod tests {
             );
         }
         assert!(tools.iter().any(|tool| tool["name"] == "workspace.facts"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "reverse.py_eval"));
         assert!(!tools.iter().any(|tool| tool["name"] == "recording.start"));
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_tools_list_includes_py_eval_when_enabled() {
+        let server = start_mock_http_service_with_host(
+            ServiceHost::with_mock_workers().with_ida_py_eval(true),
+        );
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(http_status(&response), 200);
+        let body = http_body_json(&response);
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "reverse.py_eval"));
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_py_eval_call_is_disabled_by_default() {
+        let server = start_mock_http_service();
+        let response = post_json(
+            server.endpoint,
+            "/mcp",
+            Some("test-token"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "reverse.py_eval",
+                    "arguments": {
+                        "session_id": { "kind": "reverse", "id": "reverse-1" },
+                        "code": "print('should not run')"
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(http_status(&response), 200);
+        let body = http_body_json(&response);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("disabled by runtime policy")
+        );
         server.stop();
     }
 
@@ -9604,6 +9774,10 @@ mod tests {
     }
 
     fn start_mock_http_service() -> TestServer {
+        start_mock_http_service_with_host(ServiceHost::with_mock_workers())
+    }
+
+    fn start_mock_http_service_with_host(host: ServiceHost) -> TestServer {
         let endpoint = unused_loopback_endpoint();
         let shutdown = ServiceShutdown::new();
         let server_shutdown = shutdown.clone();
@@ -9613,7 +9787,7 @@ mod tests {
                     bind: endpoint,
                     bearer_token: "test-token".to_string(),
                 },
-                ServiceHost::with_mock_workers(),
+                host,
                 server_shutdown,
             )
         });

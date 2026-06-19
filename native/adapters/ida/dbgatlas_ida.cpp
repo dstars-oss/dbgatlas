@@ -9,6 +9,7 @@
 #include <ida.hpp>
 #include <auto.hpp>
 #include <bytes.hpp>
+#include <expr.hpp>
 #include <frame.hpp>
 #include <funcs.hpp>
 #include <hexrays.hpp>
@@ -1462,6 +1463,58 @@ std::string core_idb_save(const std::string& args) {
     return out.str();
 }
 
+std::string core_py_eval(const std::string& args) {
+    std::string code = json_string_arg(args, "code");
+    if (code.empty()) {
+        throw std::invalid_argument("code is required");
+    }
+
+    extlang_object_t python = find_extlang_by_name("Python");
+    if (python == nullptr) {
+        python = find_extlang_by_ext("py");
+    }
+    if (python == nullptr || python->eval_snippet == nullptr || python->eval_expr == nullptr) {
+        throw std::runtime_error("IDAPython external language is not available");
+    }
+
+    std::ostringstream wrapper;
+    wrapper
+        << "def __dbgatlas_py_eval_run():\n"
+        << "    import contextlib, io, json, traceback\n"
+        << "    _json_dumps = json.dumps\n"
+        << "    _format_exc = traceback.format_exc\n"
+        << "    _stdout = io.StringIO()\n"
+        << "    _stderr = io.StringIO()\n"
+        << "    _error = None\n"
+        << "    try:\n"
+        << "        with contextlib.redirect_stdout(_stdout), contextlib.redirect_stderr(_stderr):\n"
+        << "            exec(" << json_string(code) << ", globals(), globals())\n"
+        << "    except BaseException:\n"
+        << "        _error = _format_exc()\n"
+        << "    return _json_dumps({\n"
+        << "        'ok': _error is None,\n"
+        << "        'stdout': _stdout.getvalue(),\n"
+        << "        'stderr': _stderr.getvalue(),\n"
+        << "        'error': _error,\n"
+        << "    })\n"
+        << "__dbgatlas_py_eval_result = __dbgatlas_py_eval_run()\n";
+
+    qstring errbuf;
+    if (!python->eval_snippet(wrapper.str().c_str(), &errbuf)) {
+        throw std::runtime_error("IDAPython eval_snippet failed: " + qstring_to_string(errbuf));
+    }
+
+    idc_value_t result;
+    qstring result_err;
+    if (!python->eval_expr(&result, BADADDR, "__dbgatlas_py_eval_result", &result_err)) {
+        throw std::runtime_error("IDAPython result retrieval failed: " + qstring_to_string(result_err));
+    }
+    if (result.vtype != VT_STR) {
+        throw std::runtime_error("IDAPython result retrieval returned a non-string value");
+    }
+    return result.c_str();
+}
+
 struct BytePattern {
     std::vector<uint8_t> bytes;
     std::vector<bool> wildcard;
@@ -1800,6 +1853,7 @@ std::string execute_core_function(IdaSessionHandleImpl* handle, const std::strin
     if (function == "declare_type") return core_declare_type(args);
     if (function == "force_recompile") return core_force_recompile(args);
     if (function == "idb_save") return core_idb_save(args);
+    if (function == "py_eval") return core_py_eval(args);
     if (function == "find_bytes") return core_find_bytes(args);
     if (function == "search_text") return core_search_text(handle, args);
     if (function == "xref_query") return core_xref_query(args);

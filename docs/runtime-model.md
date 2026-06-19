@@ -30,6 +30,7 @@ analysis-workspace/
 - `tools.ida.install_dir`
 - `tools.ida.python_executable`
 - `tools.ida.vendor_src_dir`（仅用于本机开发/构建 IDA native adapter 的 SDK include/lib 定位；运行时打开 reverse session 不依赖该路径）
+- `tools.ida.allow_py_eval`（默认 `false`；显式开启高权限 `reverse.py_eval` / IDAPython 执行能力）
 - `process.child_identity`
 - `process.fallback_child_identity`
 - `process.elevate_if_admin`
@@ -60,7 +61,7 @@ SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe
 
 安装态 service 日志写入 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 
-开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。
+开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。开发态如需暴露高权限 IDAPython 执行能力，必须显式传入 `--allow-ida-py-eval`。
 
 ## Recording Runtime
 

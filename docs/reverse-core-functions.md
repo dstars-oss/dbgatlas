@@ -28,6 +28,7 @@ Function call requires that reverse `session_id`.
 - `reverse.declare_type`: `{ session_id, decls }`
 - `reverse.force_recompile`: `{ session_id, addrs? }`
 - `reverse.idb_save`: `{ session_id, path? }`
+- `reverse.py_eval`: `{ session_id, code }`
 - `reverse.find_bytes`: `{ session_id, patterns, offset?, limit? }`
 - `reverse.search_text`: `{ session_id, query, scope?, offset?, limit? }`
 - `reverse.xref_query`: `{ session_id, target, direction?, xref_type?, offset?, limit? }`
@@ -50,6 +51,15 @@ the open IDA database by default. The first write-capable batch only supports
 function/global/address-level edits. Local variable rename, stack frame edits,
 append-comment mode, operand/struct-field typing, and regex text search are
 intentionally deferred.
+
+`reverse.py_eval` is a prototype high-privilege escape hatch that executes
+Python code in the open IDA context through IDAPython's external language
+interface. It captures `stdout`, `stderr`, and traceback text in the tool result,
+and is disabled by default at the service layer. Hosts must explicitly enable the
+IDA `py_eval` capability before this RPC is accepted or listed through MCP. In
+installed service mode this is controlled by `[tools.ida] allow_py_eval = true`
+in `runtime.toml`; in development service mode it is controlled by
+`dbgatlas service run --allow-ida-py-eval`.
 
 `reverse.search_text` performs case-insensitive substring search over `strings`,
 `names`, `disasm`, `comments`, or `all`. `reverse.find_bytes` supports byte
