@@ -20,6 +20,17 @@ active debug `session_id` and IDA `reverse_session_id`.
 - `reverse.xrefs_to`: `{ session_id, reverse_session_id, addrs }`
 - `reverse.xrefs_to_field`: `{ session_id, reverse_session_id, queries }`
 - `reverse.callees`: `{ session_id, reverse_session_id, addrs }`
+- `reverse.rename`: `{ session_id, reverse_session_id, items }`
+- `reverse.set_comments`: `{ session_id, reverse_session_id, items }`
+- `reverse.set_type`: `{ session_id, reverse_session_id, items }`
+- `reverse.declare_type`: `{ session_id, reverse_session_id, decls }`
+- `reverse.force_recompile`: `{ session_id, reverse_session_id, addrs? }`
+- `reverse.idb_save`: `{ session_id, reverse_session_id, path? }`
+- `reverse.find_bytes`: `{ session_id, reverse_session_id, patterns, offset?, limit? }`
+- `reverse.search_text`: `{ session_id, reverse_session_id, query, scope?, offset?, limit? }`
+- `reverse.xref_query`: `{ session_id, reverse_session_id, target, direction?, xref_type?, offset?, limit? }`
+- `reverse.func_query`: `{ session_id, reverse_session_id, filter?, name_regex?, min_size?, max_size?, has_type?, sort_by?, descending?, offset?, count? }`
+- `reverse.entity_query`: `{ session_id, reverse_session_id, kind, filter?, fields?, offset?, count? }`
 
 List inputs accept either a JSON array or a comma-separated string. Integer inputs accept
 JSON numbers, decimal strings, `0x` hex strings, and `0b` binary strings. `int_convert`
@@ -30,6 +41,21 @@ also accepts `bytes:` / `bytes_le:` little-endian byte lists and `ascii:` string
 metadata from the IDA database, not live debugger process memory. Use
 `debug.read_memory` for target virtual memory. `reverse.list_strings` uses
 case-insensitive substring filtering; regex string search is intentionally deferred.
+
+`reverse.rename`, `reverse.set_comments`, `reverse.set_type`,
+`reverse.declare_type`, `reverse.force_recompile`, and `reverse.idb_save` modify
+the open IDA database by default. The first write-capable batch only supports
+function/global/address-level edits. Local variable rename, stack frame edits,
+append-comment mode, operand/struct-field typing, and regex text search are
+intentionally deferred.
+
+`reverse.search_text` performs case-insensitive substring search over `strings`,
+`names`, `disasm`, `comments`, or `all`. `reverse.find_bytes` supports byte
+patterns such as `48 8B ?? ??`. Search-style tools return `items`, `offset`,
+`count`, `total`, and `next_offset`. `reverse.find_bytes` stops scanning after it
+has enough matches to answer the requested page plus `next_offset`; when
+`next_offset` is non-null, `total` is the observed lower bound rather than an
+exact database-wide total.
 
 ## Result shape
 

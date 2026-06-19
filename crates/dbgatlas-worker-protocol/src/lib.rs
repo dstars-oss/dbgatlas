@@ -290,8 +290,14 @@ mod tests {
                 session_id: SessionRef::new(Id::new("session-001").unwrap()),
                 reverse_session_id: SessionRef::new(Id::new("reverse-001").unwrap()),
                 operation_id: OperationRef::new(Id::new("op-001").unwrap()),
-                function: "list_funcs".to_string(),
-                arguments: serde_json::json!({ "offset": 0, "count": 10 }),
+                function: "rename".to_string(),
+                arguments: serde_json::json!({
+                    "items": [{
+                        "kind": "function",
+                        "addr": "0x140001000",
+                        "new_name": "dbgatlas_main"
+                    }]
+                }),
                 artifact_dir: PathBuf::from(
                     r"C:\case\dbgatlas\artifacts\reverse_sessions\session-001",
                 ),

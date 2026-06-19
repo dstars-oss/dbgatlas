@@ -58,8 +58,9 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 
 1. Rust 使用当前 stable toolchain，edition 以后续 `Cargo.toml` 为准。
 2. C++ 使用 C++20 标准。
-3. C++ 代码优先使用 RAII 管理内部资源，但不得把 C++ 类型暴露到 C ABI。
-4. 对外 C ABI header 使用 C-compatible 类型和固定宽度整数类型。
+3. Windows native / C++ adapter 的开发、验证、release payload 和安装态服务更新必须使用 MSVC toolchain 构建；除非任务明确要求调查兼容性，不要使用 MinGW / UCRT 产物作为提交前构建或安装验证依据。
+4. C++ 代码优先使用 RAII 管理内部资源，但不得把 C++ 类型暴露到 C ABI。
+5. 对外 C ABI header 使用 C-compatible 类型和固定宽度整数类型。
 
 跨语言边界规则：
 
@@ -90,6 +91,8 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 临时文件、一次性测试输入/输出、生成的 scratch 数据、临时 IDA 数据库、临时 workspace 和只为当前任务服务的辅助工具，应默认放在仓库根目录的 `temp/` 下。除非外部工具强制要求使用系统临时目录，不要把开发或验证产物写入系统 `%TEMP%` / `/tmp`；若必须使用系统临时目录，应在完成后清理或在结果说明中标明。需要长期维护、可复用或应提交的脚本不要放在 `temp/`，应按职责放入 `script/` 或 `xtask/`。
 
 `script/` 用于放置开发者可直接运行的本机脚本，例如 release 构建、安装、服务 lifecycle 辅助脚本。跨平台、可组合、面向 CI/发布流水线的工程自动化优先放入 `xtask/`。
+
+构建 release 版本或准备安装态 service payload 时，必须使用 `script/` 下维护的 release 构建/安装脚本作为入口；不要手工拼接 `cargo build --release`、CMake 构建和 DLL 复制流程来替代脚本。
 
 更新已安装服务的 runtime payload 时，优先通过已运行服务暴露的 MCP / JSON-RPC `service.update`，传入已构建好的 payload 目录（例如 `target\release`）并使用默认 `restart: true`。该路径会由安装态服务的独立 updater 完成校验、staging、stop、rename swap、restart 和日志记录，不需要手动停止服务或重新执行安装流程。更新后检查 `service.health`。
 

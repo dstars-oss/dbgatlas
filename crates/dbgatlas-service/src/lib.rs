@@ -49,6 +49,11 @@ pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
     "dbgatlas_etw.dll",
     "dbgatlas_ida.dll",
 ];
+pub const WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES: &[&str] = &[
+    "libgcc_s_seh-1.dll",
+    "libstdc++-6.dll",
+    "libwinpthread-1.dll",
+];
 pub const DEFAULT_IDA_INSTALL_DIR: &str = r"C:\Program Files\IDA Professional 9.3";
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -215,6 +220,19 @@ impl ServiceHost {
                 self.reverse_core_function("xrefs_to_field", request.params)
             }
             "reverse.callees" => self.reverse_core_function("callees", request.params),
+            "reverse.rename" => self.reverse_core_function("rename", request.params),
+            "reverse.set_comments" => self.reverse_core_function("set_comments", request.params),
+            "reverse.set_type" => self.reverse_core_function("set_type", request.params),
+            "reverse.declare_type" => self.reverse_core_function("declare_type", request.params),
+            "reverse.force_recompile" => {
+                self.reverse_core_function("force_recompile", request.params)
+            }
+            "reverse.idb_save" => self.reverse_core_function("idb_save", request.params),
+            "reverse.find_bytes" => self.reverse_core_function("find_bytes", request.params),
+            "reverse.search_text" => self.reverse_core_function("search_text", request.params),
+            "reverse.xref_query" => self.reverse_core_function("xref_query", request.params),
+            "reverse.func_query" => self.reverse_core_function("func_query", request.params),
+            "reverse.entity_query" => self.reverse_core_function("entity_query", request.params),
             "reverse.session.close" => self.reverse_session_close(request.params),
             "recording.start" => self.recording_start(request.params),
             "recording.status" => self.recording_status(request.params),
@@ -313,6 +331,17 @@ impl ServiceHost {
             | "reverse.xrefs_to"
             | "reverse.xrefs_to_field"
             | "reverse.callees"
+            | "reverse.rename"
+            | "reverse.set_comments"
+            | "reverse.set_type"
+            | "reverse.declare_type"
+            | "reverse.force_recompile"
+            | "reverse.idb_save"
+            | "reverse.find_bytes"
+            | "reverse.search_text"
+            | "reverse.xref_query"
+            | "reverse.func_query"
+            | "reverse.entity_query"
             | "reverse.session.close" => self.call_mcp_service_tool(name, arguments),
             "workspace.facts" => Ok(ToolCallOutput::success(
                 self.mcp_workspace_facts(arguments)?,
@@ -3642,6 +3671,17 @@ fn mock_reverse_core_response(
         "xrefs_to" => mock_xrefs_to(&arguments)?,
         "xrefs_to_field" => mock_xrefs_to_field(&arguments)?,
         "callees" => mock_callees(&arguments)?,
+        "rename" => mock_batch_write_result(&arguments, "items"),
+        "set_comments" => mock_batch_write_result(&arguments, "items"),
+        "set_type" => mock_batch_write_result(&arguments, "items"),
+        "declare_type" => mock_declare_type(&arguments),
+        "force_recompile" => mock_force_recompile(&arguments),
+        "idb_save" => mock_idb_save(&arguments),
+        "find_bytes" => mock_find_bytes(&arguments)?,
+        "search_text" => mock_search_text(&arguments)?,
+        "xref_query" => mock_xref_query(&arguments)?,
+        "func_query" => mock_func_query(&arguments)?,
+        "entity_query" => mock_entity_query(&arguments)?,
         other => {
             return Ok(WorkerResponse::Failed {
                 code: "reverse_core_failed".to_string(),
@@ -3924,6 +3964,140 @@ fn mock_callees(arguments: &Value) -> Result<Value, ServiceError> {
     Ok(json!({ "items": items, "count": count }))
 }
 
+fn mock_batch_write_result(arguments: &Value, field: &'static str) -> Value {
+    let items = arguments
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            arguments
+                .get(field)
+                .map(|value| vec![value.clone()])
+                .unwrap_or_default()
+        });
+    let results: Vec<Value> = items
+        .into_iter()
+        .map(|item| {
+            json!({
+                "input": item,
+                "ok": true
+            })
+        })
+        .collect();
+    let count = results.len();
+    json!({
+        "items": results,
+        "count": count,
+        "changed_count": count
+    })
+}
+
+fn mock_declare_type(arguments: &Value) -> Value {
+    let decls = normalize_core_list(arguments.get("decls").unwrap_or(&Value::Null));
+    json!({
+        "ok": true,
+        "count": decls.len(),
+        "changed_count": decls.len(),
+        "errors": 0
+    })
+}
+
+fn mock_force_recompile(arguments: &Value) -> Value {
+    let addrs = normalize_core_list(arguments.get("addrs").unwrap_or(&Value::Null));
+    let items: Vec<Value> = addrs
+        .into_iter()
+        .map(|addr| json!({ "query": addr, "ea": 0x140001000u64, "ok": true }))
+        .collect();
+    let count = items.len();
+    json!({
+        "items": items,
+        "count": count,
+        "changed_count": count,
+        "all": count == 0
+    })
+}
+
+fn mock_idb_save(arguments: &Value) -> Value {
+    json!({
+        "ok": true,
+        "path": arguments.get("path").cloned().unwrap_or(Value::Null),
+        "changed_count": 1
+    })
+}
+
+fn mock_find_bytes(arguments: &Value) -> Result<Value, ServiceError> {
+    let patterns = normalize_core_list(arguments.get("patterns").unwrap_or(&Value::Null));
+    let rows: Vec<Value> = patterns
+        .into_iter()
+        .enumerate()
+        .map(|(index, pattern)| {
+            json!({
+                "pattern": pattern,
+                "ea": 0x140050000u64 + index as u64
+            })
+        })
+        .collect();
+    paginate_filtered(rows, arguments)
+}
+
+fn mock_search_text(arguments: &Value) -> Result<Value, ServiceError> {
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let rows = vec![
+        json!({ "scope": "strings", "ea": 0x140040020u64, "text": "config_path" }),
+        json!({ "scope": "names", "ea": 0x140001100u64, "text": "parse_args" }),
+        json!({ "scope": "comments", "ea": 0x140001200u64, "text": "dispatch command handler" }),
+    ]
+    .into_iter()
+    .filter(|row| query.is_empty() || row.to_string().to_ascii_lowercase().contains(&query))
+    .collect();
+    paginate_filtered(rows, arguments)
+}
+
+fn mock_xref_query(arguments: &Value) -> Result<Value, ServiceError> {
+    let target = arguments.get("target").cloned().unwrap_or(Value::Null);
+    let rows = vec![
+        json!({
+            "direction": arguments.get("direction").and_then(Value::as_str).unwrap_or("to"),
+            "type": "code",
+            "from": 0x140001220u64,
+            "to": target.clone(),
+            "function": { "address": 0x140001200u64, "name": "dispatch_command" }
+        }),
+        json!({
+            "direction": arguments.get("direction").and_then(Value::as_str).unwrap_or("to"),
+            "type": "data",
+            "from": 0x140020000u64,
+            "to": target,
+            "function": Value::Null
+        }),
+    ];
+    paginate_filtered(rows, arguments)
+}
+
+fn mock_func_query(arguments: &Value) -> Result<Value, ServiceError> {
+    mock_list_funcs(arguments)
+}
+
+fn mock_entity_query(arguments: &Value) -> Result<Value, ServiceError> {
+    match arguments
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("functions")
+    {
+        "functions" => mock_list_funcs(arguments),
+        "globals" | "names" => mock_list_globals(arguments),
+        "imports" => mock_imports(arguments),
+        "strings" => mock_list_strings(arguments),
+        other => Err(ServiceError::Rpc(format!(
+            "unsupported entity_query kind `{other}`"
+        ))),
+    }
+}
+
 fn mock_idb_bytes(addr: u64, length: u64) -> Result<Vec<u8>, ServiceError> {
     if length == 0 || length > 4096 {
         return Err(ServiceError::Rpc(
@@ -3948,6 +4122,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn paginate_filtered(rows: Vec<Value>, arguments: &Value) -> Result<Value, ServiceError> {
     let offset = optional_u64_argument(arguments, "offset")?.unwrap_or(0) as usize;
     let count = optional_u64_argument(arguments, "count")?
+        .or(optional_u64_argument(arguments, "limit")?)
         .unwrap_or(50)
         .min(1_000) as usize;
     let filter = arguments
@@ -4510,6 +4685,17 @@ pub fn discover_service_payload(
             source,
         });
     }
+    for file_name in WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES {
+        let source = source_dir.join(file_name);
+        if !source.is_file() {
+            continue;
+        }
+        payload.push(ServicePayloadFile {
+            file_name: (*file_name).to_string(),
+            destination: destination_dir.join(file_name),
+            source,
+        });
+    }
     if !missing.is_empty() {
         let files = missing
             .iter()
@@ -4517,7 +4703,7 @@ pub fn discover_service_payload(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(ServiceError::IncompleteInstallPayload(format!(
-            "missing {files}; build dbgatlas, dbgatlas-worker, and dbgatlas_dbgeng.dll with the MSVC native build first"
+            "missing {files}; build or assemble the complete release payload before installing or updating the service"
         )));
     }
     Ok(payload)
@@ -6177,6 +6363,110 @@ fn mcp_tool_descriptors() -> Vec<Value> {
             mcp_reverse_core_schema_required(json!({ "addrs": {} }), &["addrs"]),
         ),
         mcp_tool(
+            "reverse.rename",
+            "Rename IDA functions or globals.",
+            mcp_reverse_core_schema_required(json!({ "items": {} }), &["items"]),
+        ),
+        mcp_tool(
+            "reverse.set_comments",
+            "Set IDA comments at addresses.",
+            mcp_reverse_core_schema_required(json!({ "items": {} }), &["items"]),
+        ),
+        mcp_tool(
+            "reverse.set_type",
+            "Apply C types to IDA functions, globals, or addresses.",
+            mcp_reverse_core_schema_required(json!({ "items": {} }), &["items"]),
+        ),
+        mcp_tool(
+            "reverse.declare_type",
+            "Declare C types in the IDA local type library.",
+            mcp_reverse_core_schema_required(json!({ "decls": {} }), &["decls"]),
+        ),
+        mcp_tool(
+            "reverse.force_recompile",
+            "Invalidate Hex-Rays cached decompilation for functions or all functions.",
+            mcp_reverse_core_schema(json!({ "addrs": {} })),
+        ),
+        mcp_tool(
+            "reverse.idb_save",
+            "Save the current IDA database.",
+            mcp_reverse_core_schema(json!({ "path": { "type": "string" } })),
+        ),
+        mcp_tool(
+            "reverse.find_bytes",
+            "Find byte patterns in the IDA database.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "patterns": {},
+                    "offset": { "type": "integer" },
+                    "limit": { "type": "integer" }
+                }),
+                &["patterns"],
+            ),
+        ),
+        mcp_tool(
+            "reverse.search_text",
+            "Search IDA strings, names, disassembly, and comments by substring.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "query": { "type": "string" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["strings", "names", "disasm", "comments", "all"]
+                    },
+                    "offset": { "type": "integer" },
+                    "limit": { "type": "integer" }
+                }),
+                &["query"],
+            ),
+        ),
+        mcp_tool(
+            "reverse.xref_query",
+            "Query cross-references to or from an address or name.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "target": {},
+                    "direction": { "type": "string", "enum": ["to", "from"] },
+                    "xref_type": { "type": "string", "enum": ["code", "data", "all"] },
+                    "offset": { "type": "integer" },
+                    "limit": { "type": "integer" }
+                }),
+                &["target"],
+            ),
+        ),
+        mcp_tool(
+            "reverse.func_query",
+            "Query IDA functions with richer filtering and sorting.",
+            mcp_reverse_core_schema(json!({
+                "filter": { "type": "string" },
+                "name_regex": { "type": "string" },
+                "min_size": { "type": "integer" },
+                "max_size": { "type": "integer" },
+                "has_type": { "type": "boolean" },
+                "sort_by": { "type": "string", "enum": ["addr", "name", "size"] },
+                "descending": { "type": "boolean" },
+                "offset": { "type": "integer" },
+                "count": { "type": "integer" }
+            })),
+        ),
+        mcp_tool(
+            "reverse.entity_query",
+            "Query IDB entities with filtering and pagination.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "kind": {
+                        "type": "string",
+                        "enum": ["functions", "globals", "imports", "strings", "names"]
+                    },
+                    "filter": { "type": "string" },
+                    "fields": {},
+                    "offset": { "type": "integer" },
+                    "count": { "type": "integer" }
+                }),
+                &["kind"],
+            ),
+        ),
+        mcp_tool(
             "reverse.session.close",
             "Close an IDA reverse session.",
             json!({
@@ -7345,10 +7635,17 @@ mod tests {
         for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
             fs::write(temp.path().join(file_name), "").unwrap();
         }
+        for file_name in WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES {
+            fs::write(temp.path().join(file_name), "").unwrap();
+        }
 
         let payload = discover_service_payload(temp.path(), &destination).unwrap();
 
-        assert_eq!(payload.len(), WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len());
+        assert_eq!(
+            payload.len(),
+            WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len()
+                + WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES.len()
+        );
         assert!(payload.iter().any(|file| {
             file.file_name == "dbgatlas-worker.exe"
                 && file.destination == destination.join("dbgatlas-worker.exe")
@@ -7357,6 +7654,28 @@ mod tests {
             file.file_name == "dbgatlas_dbgeng.dll"
                 && file.destination == destination.join("dbgatlas_dbgeng.dll")
         }));
+        assert!(payload.iter().any(|file| {
+            file.file_name == "libstdc++-6.dll"
+                && file.destination == destination.join("libstdc++-6.dll")
+        }));
+    }
+
+    #[test]
+    fn payload_discovery_accepts_payload_without_optional_runtime_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("install-bin");
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(temp.path().join(file_name), "").unwrap();
+        }
+
+        let payload = discover_service_payload(temp.path(), &destination).unwrap();
+
+        assert_eq!(payload.len(), WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len());
+        assert!(
+            !payload
+                .iter()
+                .any(|file| file.file_name == "libstdc++-6.dll")
+        );
     }
 
     #[test]
@@ -8182,6 +8501,47 @@ mod tests {
                 json!({ "queries": "MY_STRUCT.field_0" }),
             ),
             ("reverse.callees", json!({ "addrs": ["0x140001000"] })),
+            (
+                "reverse.rename",
+                json!({ "items": [{ "kind": "function", "addr": "0x140001000", "new_name": "dbgatlas_main" }] }),
+            ),
+            (
+                "reverse.set_comments",
+                json!({ "items": [{ "addr": "0x140001000", "text": "entry point" }] }),
+            ),
+            (
+                "reverse.set_type",
+                json!({ "items": [{ "kind": "function", "addr": "0x140001000", "type": "int dbgatlas_main(void)" }] }),
+            ),
+            (
+                "reverse.declare_type",
+                json!({ "decls": "struct DbgAtlasContext { int state; };" }),
+            ),
+            (
+                "reverse.force_recompile",
+                json!({ "addrs": ["0x140001000"] }),
+            ),
+            ("reverse.idb_save", json!({})),
+            (
+                "reverse.find_bytes",
+                json!({ "patterns": ["48 8B ?? ??"], "limit": 2 }),
+            ),
+            (
+                "reverse.search_text",
+                json!({ "query": "config", "scope": "all", "limit": 2 }),
+            ),
+            (
+                "reverse.xref_query",
+                json!({ "target": "0x140001000", "direction": "to", "xref_type": "all" }),
+            ),
+            (
+                "reverse.func_query",
+                json!({ "filter": "parse", "sort_by": "name" }),
+            ),
+            (
+                "reverse.entity_query",
+                json!({ "kind": "functions", "filter": "main" }),
+            ),
         ];
 
         for (method, mut args) in calls {
@@ -8207,7 +8567,7 @@ mod tests {
                 .iter()
                 .filter(|artifact| artifact.kind == "reverse.core")
                 .count()
-                >= 14
+                >= 25
         );
         let operations = workspace.list_operations().unwrap();
         for capability in [
@@ -8225,6 +8585,17 @@ mod tests {
             "reverse.xrefs_to",
             "reverse.xrefs_to_field",
             "reverse.callees",
+            "reverse.rename",
+            "reverse.set_comments",
+            "reverse.set_type",
+            "reverse.declare_type",
+            "reverse.force_recompile",
+            "reverse.idb_save",
+            "reverse.find_bytes",
+            "reverse.search_text",
+            "reverse.xref_query",
+            "reverse.func_query",
+            "reverse.entity_query",
         ] {
             assert!(
                 operations
@@ -9049,6 +9420,17 @@ mod tests {
             "reverse.xrefs_to",
             "reverse.xrefs_to_field",
             "reverse.callees",
+            "reverse.rename",
+            "reverse.set_comments",
+            "reverse.set_type",
+            "reverse.declare_type",
+            "reverse.force_recompile",
+            "reverse.idb_save",
+            "reverse.find_bytes",
+            "reverse.search_text",
+            "reverse.xref_query",
+            "reverse.func_query",
+            "reverse.entity_query",
         ] {
             assert!(
                 tools.iter().any(|tool| tool["name"] == tool_name),

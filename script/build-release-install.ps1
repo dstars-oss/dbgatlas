@@ -47,6 +47,36 @@ function Assert-ReleasePayload {
     }
 }
 
+function Copy-OptionalRuntimePayload {
+    param([Parameter(Mandatory = $true)][string]$ReleaseDir)
+
+    $runtimeNames = @(
+        "libgcc_s_seh-1.dll",
+        "libstdc++-6.dll",
+        "libwinpthread-1.dll"
+    )
+    $pathDirs = $env:Path -split ";" | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
+
+    foreach ($name in $runtimeNames) {
+        $destination = Join-Path $ReleaseDir $name
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            continue
+        }
+        $source = $null
+        foreach ($dir in $pathDirs) {
+            $candidate = Join-Path $dir $name
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $source = $candidate
+                break
+            }
+        }
+        if ($source) {
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+            Write-Host "Copied optional runtime payload: $name"
+        }
+    }
+}
+
 function Quote-ProcessArgument {
     param([Parameter(Mandatory = $true)][string]$Argument)
 
@@ -81,6 +111,7 @@ finally {
     Pop-Location
 }
 
+Copy-OptionalRuntimePayload -ReleaseDir $releaseDir
 Assert-ReleasePayload -ReleaseDir $releaseDir
 Write-Host "Release payload is ready: $releaseDir"
 
