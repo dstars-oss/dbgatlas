@@ -76,7 +76,7 @@ flowchart LR
 
 MVP 2 引入 service-hosted HTTP MCP 入口。它通过现有 service/domain workflow 暴露 MCP tools，不复制 debug/session/recording 业务逻辑，也不提供独立 stdio MCP 进程。
 
-IDA 路线走 DbgAtlas 自有 C++ native adapter 主线。`dbgatlas_ida.dll` 通过 runtime config 或请求参数提供的 IDA install dir 动态加载 `ida.dll` / `idalib.dll`，SDK header 只在 adapter 内部按需源码集成；Rust 侧通过 `dbgatlas-ida-sys` 和 safe wrapper 暴露最小能力，不把 IDA C++ 类型穿过 C ABI。安装态 service 通过 active interactive user worker 执行 IDA open/lookup/close，避免 LocalSystem 直接加载 IDALib。
+IDA 路线走 DbgAtlas 自有 C++ native adapter 主线。Rust safe wrapper 通过 runtime config 或请求参数提供的 IDA install dir 配置 DLL search path，并运行时加载 `dbgatlas_ida.dll`；adapter 正常链接 `ida.dll` / `idalib.dll` 并在内部使用 IDA SDK / Hex-Rays SDK。Rust 侧通过 `dbgatlas-ida-sys` ABI 类型和 safe wrapper 暴露最小能力，不把 IDA C++ 类型穿过 C ABI。安装态 service 通过 active interactive user worker 执行 IDA open、lookup、Core Functions 和 close，避免 LocalSystem 直接加载 IDALib。
 
 ETW recording 路线优先走 C++ adapter + Rust safe wrapper：ETW session、provider enable、实时消费、预处理和过滤留在 native adapter 内部，Rust 侧负责安全封装、worker 编排、artifact 登记和 service/CLI/MCP 入口。WPR/WPAExport 不作为 MVP 3 主线。
 

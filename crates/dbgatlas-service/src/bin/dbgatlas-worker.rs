@@ -2,8 +2,8 @@ use dbgatlas_dbgeng::DbgEngSession;
 use dbgatlas_debug::{DebugCommandResult, DebugMemoryResult, DebugSessionState, DebugTarget};
 use dbgatlas_model::{OperationRef, SessionRef, Timestamp};
 use dbgatlas_worker_protocol::{
-    ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope, WorkerRequest,
-    WorkerResponse, decode_jsonl, encode_jsonl,
+    ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
+    WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
 };
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -195,6 +195,12 @@ impl WorkerState {
                 runtime_module_base,
                 ida_image_base,
             ),
+            WorkerRequest::ReverseCoreFunction {
+                reverse_session_id,
+                function,
+                arguments,
+                ..
+            } => self.reverse_core_function(reverse_session_id, function, arguments),
             WorkerRequest::CloseReverseSession {
                 reverse_session_id, ..
             } => self.close_reverse_session(reverse_session_id),
@@ -344,6 +350,37 @@ impl WorkerState {
         }
     }
 
+    fn reverse_core_function(
+        &mut self,
+        reverse_session_id: SessionRef,
+        function: String,
+        arguments: serde_json::Value,
+    ) -> WorkerResponse {
+        let key = reverse_session_id.id.as_str();
+        let Some(session) = self.reverse_sessions.get(key) else {
+            return WorkerResponse::Failed {
+                code: "reverse_session_not_found".to_string(),
+                message: format!("reverse session {reverse_session_id} is not open"),
+                writes: Vec::new(),
+            };
+        };
+        match session.core_function(function, arguments) {
+            Ok(result) => WorkerResponse::ReverseCoreFunction {
+                result: ReverseCoreFunctionResult {
+                    function: result.function,
+                    result: result.result,
+                    warnings: result.warnings,
+                },
+                writes: Vec::new(),
+            },
+            Err(error) => WorkerResponse::Failed {
+                code: "reverse_core_failed".to_string(),
+                message: error.to_string(),
+                writes: Vec::new(),
+            },
+        }
+    }
+
     fn with_session<F>(&mut self, f: F) -> WorkerResponse
     where
         F: FnOnce(&DbgEngSession) -> Result<WorkerResponse, std::io::Error>,
@@ -374,6 +411,7 @@ fn request_session_id(request: &WorkerRequest) -> Option<&SessionRef> {
         | WorkerRequest::ReadMemory { session_id, .. }
         | WorkerRequest::OpenReverseSession { session_id, .. }
         | WorkerRequest::LookupReverseFunction { session_id, .. }
+        | WorkerRequest::ReverseCoreFunction { session_id, .. }
         | WorkerRequest::CloseReverseSession { session_id, .. }
         | WorkerRequest::CloseSession { session_id }
         | WorkerRequest::KillSession { session_id }

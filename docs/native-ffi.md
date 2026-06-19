@@ -52,13 +52,14 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 ## IDA native adapter ABI
 
-IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。`dbgatlas_ida.dll` 内部动态加载 IDA install dir 下的 `ida.dll` / `idalib.dll`，并按需使用 SDK header；导出边界只暴露 opaque handle、固定宽度整数和 text view。
+IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。Rust safe wrapper 根据请求中的 IDA install dir 配置 Windows DLL search path，再运行时加载 `dbgatlas_ida.dll`；adapter 正常链接 `ida.dll` / `idalib.dll` 并按需使用 IDA SDK / Hex-Rays SDK header。导出边界只暴露 opaque handle、固定宽度整数和 text view。
 
 当前最小 ABI：
 
 - `da_ida_abi_version(out)`
 - `da_ida_session_open(install_dir_utf8, database_path_utf8, out_handle)`
 - `da_ida_lookup_function(handle, runtime_address, runtime_module_base, ida_image_base, out)`
+- `da_ida_core_function(handle, function_utf8, arguments_json_utf8, out)`
 - `da_ida_session_close(handle)`
 - `da_ida_last_error(buffer, buffer_len, required_len)`
 - `da_ida_release_view(owner)`

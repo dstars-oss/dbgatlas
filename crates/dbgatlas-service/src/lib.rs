@@ -6,8 +6,8 @@ use dbgatlas_model::{ArtifactRef, Id, OperationRef, RecordingRef, SessionRef, Ti
 use dbgatlas_recording::{RecordingPreset, RecordingState, RecordingTarget, StartRecording};
 use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
-    ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError,
-    WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
+    ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
+    WorkerProtocolError, WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
 };
 use dbgatlas_workspace::{
     ArtifactMetadata, CommandAuditRecord, OperationRecord, OperationStatus, Workspace,
@@ -199,6 +199,18 @@ impl ServiceHost {
             "debug.read_memory" => self.debug_read_memory(request.params),
             "reverse.session.open" => self.reverse_session_open(request.params),
             "reverse.lookup_function" => self.reverse_lookup_function(request.params),
+            "reverse.lookup_funcs" => self.reverse_core_function("lookup_funcs", request.params),
+            "reverse.int_convert" => self.reverse_core_function("int_convert", request.params),
+            "reverse.list_funcs" => self.reverse_core_function("list_funcs", request.params),
+            "reverse.list_globals" => self.reverse_core_function("list_globals", request.params),
+            "reverse.imports" => self.reverse_core_function("imports", request.params),
+            "reverse.decompile" => self.reverse_core_function("decompile", request.params),
+            "reverse.disasm" => self.reverse_core_function("disasm", request.params),
+            "reverse.xrefs_to" => self.reverse_core_function("xrefs_to", request.params),
+            "reverse.xrefs_to_field" => {
+                self.reverse_core_function("xrefs_to_field", request.params)
+            }
+            "reverse.callees" => self.reverse_core_function("callees", request.params),
             "reverse.session.close" => self.reverse_session_close(request.params),
             "recording.start" => self.recording_start(request.params),
             "recording.status" => self.recording_status(request.params),
@@ -283,6 +295,16 @@ impl ServiceHost {
             | "debug.read_memory"
             | "reverse.session.open"
             | "reverse.lookup_function"
+            | "reverse.lookup_funcs"
+            | "reverse.int_convert"
+            | "reverse.list_funcs"
+            | "reverse.list_globals"
+            | "reverse.imports"
+            | "reverse.decompile"
+            | "reverse.disasm"
+            | "reverse.xrefs_to"
+            | "reverse.xrefs_to_field"
+            | "reverse.callees"
             | "reverse.session.close" => self.call_mcp_service_tool(name, arguments),
             "workspace.facts" => Ok(ToolCallOutput::success(
                 self.mcp_workspace_facts(arguments)?,
@@ -1407,6 +1429,153 @@ impl ServiceHost {
                 "raw_output_ref": null
             }
         }))
+    }
+
+    fn reverse_core_function(
+        &self,
+        function: &'static str,
+        params: Option<Value>,
+    ) -> Result<Value, ServiceError> {
+        let params: ReverseCoreFunctionParams = parse_params(params)?;
+        let reverse_session = {
+            let state = self.lock_state()?;
+            state
+                .reverse_sessions
+                .get(params.reverse_session_id.id.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    ServiceError::SessionNotFound(params.reverse_session_id.to_string())
+                })?
+        };
+        if reverse_session.debug_session_id != params.session_id {
+            return Err(ServiceError::Rpc(format!(
+                "reverse session {} belongs to session {}",
+                params.reverse_session_id, reverse_session.debug_session_id
+            )));
+        }
+
+        let operation_id = next_operation_ref();
+        let workspace = Workspace::open(&reverse_session.internal_workspace_root)?;
+        let arguments = Value::Object(params.arguments.into_iter().collect());
+        let capability = format!("reverse.{function}");
+        let core = {
+            let _request_guard = reverse_session
+                .request_lock
+                .lock()
+                .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+            self.supervisor.request_worker(
+                &reverse_session.worker,
+                WorkerRequest::ReverseCoreFunction {
+                    session_id: params.session_id.clone(),
+                    reverse_session_id: params.reverse_session_id.clone(),
+                    operation_id: operation_id.clone(),
+                    function: function.to_string(),
+                    arguments: arguments.clone(),
+                    artifact_dir: reverse_session.artifact_dir.clone(),
+                },
+            )
+        };
+        let core = match core {
+            Ok(WorkerResponse::ReverseCoreFunction { result, .. }) => result,
+            Ok(WorkerResponse::Failed { code, message, .. }) => {
+                let error = worker_failed_message(code, message);
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    &capability,
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: capability.clone(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Ok(other) => {
+                let error = format!("unexpected reverse core response: {other:?}");
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    &capability,
+                    &error,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: capability.clone(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: error.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    error.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(error));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &reverse_session.artifact_dir,
+                    &operation_id,
+                    &capability,
+                    &message,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: capability.clone(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    message,
+                    artifacts,
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+        record_successful_reverse_core_operation(
+            self,
+            &workspace,
+            &reverse_session,
+            &params.session_id,
+            &params.reverse_session_id,
+            &operation_id,
+            &capability,
+            arguments,
+            core,
+        )
     }
 
     fn reverse_session_close(&self, params: Option<Value>) -> Result<Value, ServiceError> {
@@ -3224,6 +3393,88 @@ fn record_failed_reverse_operation(
     Ok(vec![artifact_id])
 }
 
+fn record_successful_reverse_core_operation(
+    host: &ServiceHost,
+    workspace: &Workspace,
+    reverse_session: &ManagedReverseSession,
+    session_id: &SessionRef,
+    reverse_session_id: &SessionRef,
+    operation_id: &OperationRef,
+    capability: &str,
+    arguments: Value,
+    core: ReverseCoreFunctionResult,
+) -> Result<Value, ServiceError> {
+    let now = Timestamp::now();
+    let event = json!({
+        "operation_id": operation_id,
+        "reverse_session_id": reverse_session_id,
+        "session_id": session_id,
+        "created_at": now,
+        "function": core.function,
+        "arguments": arguments,
+        "result": core.result,
+        "warnings": core.warnings,
+    });
+    let core_file = format!("core/{}.jsonl", operation_id.id.as_str());
+    let byte_len = write_jsonl_file(&reverse_session.artifact_dir.join(&core_file), &event)?;
+    let artifact_id = next_artifact_ref();
+    workspace.register_artifact(&ArtifactMetadata {
+        artifact_id: artifact_id.clone(),
+        kind: "reverse.core".to_string(),
+        relative_path: reverse_relative_path(session_id, &core_file),
+        created_at: now,
+        operation_id: Some(operation_id.clone()),
+        byte_len: Some(byte_len),
+        description: Some(format!("IDA Core Function {} result", core.function)),
+    })?;
+    workspace.append_operation(&OperationRecord {
+        operation_id: operation_id.clone(),
+        adapter_id: "ida".to_string(),
+        capability: capability.to_string(),
+        status: OperationStatus::Success,
+        created_at: now,
+        summary: format!("IDA Core Function {} completed", core.function),
+        artifacts: vec![artifact_id.clone()],
+        raw_output: None,
+    })?;
+
+    let mut operation = ServiceOperation::success(
+        operation_id.clone(),
+        capability,
+        Some(session_id.clone()),
+        "reverse core function completed",
+    );
+    operation.artifacts = vec![artifact_id.clone()];
+    let mut state = host.lock_state()?;
+    state
+        .operations
+        .insert(operation_id.id.as_str().to_string(), operation);
+    if let Some(session) = state
+        .reverse_sessions
+        .get_mut(reverse_session_id.id.as_str())
+    {
+        session.updated_at = now;
+        session.last_operation = Some(operation_id.clone());
+        session.artifacts.push(artifact_id.clone());
+    }
+
+    Ok(json!({
+        "session_id": session_id,
+        "reverse_session_id": reverse_session_id,
+        "operation_id": operation_id,
+        "operation_status": "success",
+        "artifact_refs": [artifact_id],
+        "function": core.function,
+        "result": core.result,
+        "warnings": core.warnings,
+        "operation": {
+            "status": "success",
+            "artifact_refs": [artifact_id],
+            "raw_output_ref": null
+        }
+    }))
+}
+
 fn recording_response(
     recording: &ManagedRecording,
     operation_id: &OperationRef,
@@ -3340,6 +3591,11 @@ fn mock_worker_response(request: WorkerRequest) -> Result<WorkerResponse, Servic
                 writes: Vec::new(),
             })
         }
+        WorkerRequest::ReverseCoreFunction {
+            function,
+            arguments,
+            ..
+        } => mock_reverse_core_response(function, arguments),
         WorkerRequest::CloseReverseSession { .. } => Ok(WorkerResponse::Ok {
             summary: "reverse session closed by mock worker".to_string(),
             writes: Vec::new(),
@@ -3357,6 +3613,346 @@ fn mock_worker_response(request: WorkerRequest) -> Result<WorkerResponse, Servic
             writes: Vec::new(),
         }),
     }
+}
+
+fn mock_reverse_core_response(
+    function: String,
+    arguments: Value,
+) -> Result<WorkerResponse, ServiceError> {
+    let result = match function.as_str() {
+        "lookup_funcs" => mock_lookup_funcs(&arguments)?,
+        "int_convert" => mock_int_convert(&arguments),
+        "list_funcs" => mock_list_funcs(&arguments)?,
+        "list_globals" => mock_list_globals(&arguments)?,
+        "imports" => mock_imports(&arguments)?,
+        "decompile" => mock_decompile(&arguments)?,
+        "disasm" => mock_disasm(&arguments)?,
+        "xrefs_to" => mock_xrefs_to(&arguments)?,
+        "xrefs_to_field" => mock_xrefs_to_field(&arguments)?,
+        "callees" => mock_callees(&arguments)?,
+        other => {
+            return Ok(WorkerResponse::Failed {
+                code: "reverse_core_failed".to_string(),
+                message: format!("unsupported IDA Core Function `{other}`"),
+                writes: Vec::new(),
+            });
+        }
+    };
+    Ok(WorkerResponse::ReverseCoreFunction {
+        result: ReverseCoreFunctionResult {
+            function,
+            result,
+            warnings: Vec::new(),
+        },
+        writes: Vec::new(),
+    })
+}
+
+fn mock_lookup_funcs(arguments: &Value) -> Result<Value, ServiceError> {
+    let queries = normalize_core_list(arguments.get("queries").unwrap_or(&Value::Null));
+    let runtime_module_base = optional_u64_argument(arguments, "runtime_module_base")?.unwrap_or(0);
+    let ida_image_base = optional_u64_argument(arguments, "ida_image_base")?.unwrap_or(0);
+    let mut items = Vec::new();
+    for query in queries {
+        if let Some(address) = parse_optional_u64_text(&query) {
+            if address < runtime_module_base {
+                return Err(ServiceError::Rpc(
+                    "runtime address is below runtime_module_base".to_string(),
+                ));
+            }
+            let rva = address - runtime_module_base;
+            let ida_ea = ida_image_base
+                .checked_add(rva)
+                .ok_or_else(|| ServiceError::Rpc("ida_ea overflow".to_string()))?;
+            let start = ida_ea & !0xff;
+            items.push(json!({
+                "query": query,
+                "input_type": "address",
+                "found": true,
+                "runtime_address": address,
+                "runtime_module_base": runtime_module_base,
+                "rva": rva,
+                "ida_image_base": ida_image_base,
+                "ida_ea": ida_ea,
+                "function_start": start,
+                "function_end": start + 0x100,
+                "function_name": format!("mock_function_{start:x}")
+            }));
+        } else {
+            let found = !query.contains("missing");
+            items.push(json!({
+                "query": query,
+                "input_type": "name",
+                "found": found,
+                "function_start": if found { json!(0x140001000u64) } else { Value::Null },
+                "function_end": if found { json!(0x140001100u64) } else { Value::Null },
+                "function_name": if found { json!(query) } else { Value::Null }
+            }));
+        }
+    }
+    let count = items.len();
+    Ok(json!({ "items": items, "count": count }))
+}
+
+fn mock_int_convert(arguments: &Value) -> Value {
+    let inputs = normalize_core_list(arguments.get("inputs").unwrap_or(arguments));
+    let items: Vec<Value> = inputs
+        .into_iter()
+        .map(|input| match parse_core_integer(&input) {
+            Some(value) => json!({
+                "input": input,
+                "decimal": value.to_string(),
+                "hex": format!("0x{value:x}"),
+                "binary": format!("0b{value:b}"),
+                "bytes_le": value.to_le_bytes().to_vec(),
+                "ascii": ascii_from_core_integer(value)
+            }),
+            None => json!({
+                "input": input,
+                "error": "not a supported integer, hex, binary, bytes, or ASCII representation"
+            }),
+        })
+        .collect();
+    let count = items.len();
+    json!({ "items": items, "count": count })
+}
+
+fn mock_list_funcs(arguments: &Value) -> Result<Value, ServiceError> {
+    let rows = vec![
+        json!({ "address": 0x140001000u64, "name": "main", "size": 0x80 }),
+        json!({ "address": 0x140001100u64, "name": "parse_args", "size": 0x60 }),
+        json!({ "address": 0x140001200u64, "name": "dispatch_command", "size": 0xa0 }),
+        json!({ "address": 0x140001300u64, "name": "cleanup", "size": 0x40 }),
+    ];
+    paginate_filtered(rows, arguments)
+}
+
+fn mock_list_globals(arguments: &Value) -> Result<Value, ServiceError> {
+    let rows = vec![
+        json!({ "address": 0x140020000u64, "name": "g_runtime_config", "type": "struct RuntimeConfig" }),
+        json!({ "address": 0x140020080u64, "name": "g_worker_state", "type": "struct WorkerState" }),
+    ];
+    paginate_filtered(rows, arguments)
+}
+
+fn mock_imports(arguments: &Value) -> Result<Value, ServiceError> {
+    let rows = vec![
+        json!({ "module": "KERNEL32.dll", "name": "CreateFileW", "ordinal": Value::Null, "iat_ea": 0x140030000u64 }),
+        json!({ "module": "KERNEL32.dll", "name": "ReadFile", "ordinal": Value::Null, "iat_ea": 0x140030008u64 }),
+        json!({ "module": "USER32.dll", "name": "MessageBoxW", "ordinal": Value::Null, "iat_ea": 0x140030010u64 }),
+    ];
+    paginate_filtered(rows, arguments)
+}
+
+fn mock_decompile(arguments: &Value) -> Result<Value, ServiceError> {
+    let addr = required_u64_argument(arguments, "addr")?;
+    let start = addr & !0xff;
+    Ok(json!({
+        "addr": addr,
+        "function_start": start,
+        "function_name": format!("mock_function_{start:x}"),
+        "language": "c",
+        "pseudocode": format!("int mock_function_{start:x}(void) {{\n    return 0;\n}}")
+    }))
+}
+
+fn mock_disasm(arguments: &Value) -> Result<Value, ServiceError> {
+    let addr = required_u64_argument(arguments, "addr")?;
+    let start = addr & !0xff;
+    Ok(json!({
+        "addr": addr,
+        "function_start": start,
+        "function_name": format!("mock_function_{start:x}"),
+        "arguments": [{ "name": "arg_0", "location": "rcx", "type": "uint64_t" }],
+        "stack_frame": { "size": 0x40, "locals": [{ "name": "var_8", "offset": -8, "size": 8 }] },
+        "instructions": [
+            { "ea": start, "text": "push rbp" },
+            { "ea": start + 1, "text": "mov rbp, rsp" },
+            { "ea": start + 4, "text": "ret" }
+        ]
+    }))
+}
+
+fn mock_xrefs_to(arguments: &Value) -> Result<Value, ServiceError> {
+    let addrs = normalize_core_list(arguments.get("addrs").unwrap_or(&Value::Null));
+    let mut items = Vec::new();
+    for addr in addrs {
+        let ea = parse_optional_u64_text(&addr)
+            .ok_or_else(|| ServiceError::Rpc("xrefs_to addrs must be addresses".to_string()))?;
+        items.push(json!({
+            "to": ea,
+            "xrefs": [
+                { "from": ea.saturating_sub(0x20), "type": "code", "function": format!("mock_function_{:x}", ea.saturating_sub(0x20) & !0xff) }
+            ]
+        }));
+    }
+    let count = items.len();
+    Ok(json!({ "items": items, "count": count }))
+}
+
+fn mock_xrefs_to_field(arguments: &Value) -> Result<Value, ServiceError> {
+    let queries = normalize_core_list(arguments.get("queries").unwrap_or(&Value::Null));
+    let items: Vec<Value> = queries
+        .into_iter()
+        .map(|query| {
+            json!({
+                "query": query,
+                "xrefs": [
+                    { "from": 0x140001240u64, "operand": 1, "access": "read" }
+                ]
+            })
+        })
+        .collect();
+    let count = items.len();
+    Ok(json!({ "items": items, "count": count }))
+}
+
+fn mock_callees(arguments: &Value) -> Result<Value, ServiceError> {
+    let addrs = normalize_core_list(arguments.get("addrs").unwrap_or(&Value::Null));
+    let mut items = Vec::new();
+    for addr in addrs {
+        let ea = parse_optional_u64_text(&addr)
+            .ok_or_else(|| ServiceError::Rpc("callees addrs must be addresses".to_string()))?;
+        items.push(json!({
+            "function": ea,
+            "callees": [
+                { "ea": 0x140001100u64, "name": "parse_args" },
+                { "ea": 0x140001200u64, "name": "dispatch_command" }
+            ]
+        }));
+    }
+    let count = items.len();
+    Ok(json!({ "items": items, "count": count }))
+}
+
+fn paginate_filtered(rows: Vec<Value>, arguments: &Value) -> Result<Value, ServiceError> {
+    let offset = optional_u64_argument(arguments, "offset")?.unwrap_or(0) as usize;
+    let count = optional_u64_argument(arguments, "count")?
+        .unwrap_or(50)
+        .min(1_000) as usize;
+    let filter = arguments
+        .get("filter")
+        .or_else(|| arguments.get("query"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let filtered: Vec<Value> = rows
+        .into_iter()
+        .filter(|row| {
+            filter
+                .as_ref()
+                .is_none_or(|needle| row.to_string().to_ascii_lowercase().contains(needle))
+        })
+        .collect();
+    let total = filtered.len();
+    let items: Vec<Value> = filtered.into_iter().skip(offset).take(count).collect();
+    Ok(json!({
+        "offset": offset,
+        "count": items.len(),
+        "total": total,
+        "items": items
+    }))
+}
+
+fn normalize_core_list(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(text) => text.trim().to_string(),
+                other => other.to_string(),
+            })
+            .filter(|item| !item.is_empty())
+            .collect(),
+        Value::String(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Value::Null => Vec::new(),
+        other => vec![other.to_string()],
+    }
+}
+
+fn required_u64_argument(arguments: &Value, field: &'static str) -> Result<u64, ServiceError> {
+    arguments
+        .get(field)
+        .and_then(parse_u64_value)
+        .ok_or_else(|| ServiceError::Rpc(format!("{field} must be an address")))
+}
+
+fn optional_u64_argument(
+    arguments: &Value,
+    field: &'static str,
+) -> Result<Option<u64>, ServiceError> {
+    match arguments.get(field) {
+        Some(value) => parse_u64_value(value)
+            .map(Some)
+            .ok_or_else(|| ServiceError::Rpc(format!("{field} must be an unsigned integer"))),
+        None => Ok(None),
+    }
+}
+
+fn parse_u64_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => parse_optional_u64_text(text),
+        _ => None,
+    }
+}
+
+fn parse_optional_u64_text(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else if let Some(binary) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+        u64::from_str_radix(binary, 2).ok()
+    } else {
+        text.parse::<u64>().ok()
+    }
+}
+
+fn parse_core_integer(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Some(bytes) = text
+        .strip_prefix("bytes:")
+        .or_else(|| text.strip_prefix("bytes_le:"))
+    {
+        let mut value = 0u64;
+        for (index, byte) in bytes
+            .split([' ', ',', '-'])
+            .filter(|part| !part.is_empty())
+            .take(8)
+            .enumerate()
+        {
+            let byte = u8::from_str_radix(byte.trim_start_matches("0x"), 16).ok()?;
+            value |= (byte as u64) << (index * 8);
+        }
+        Some(value)
+    } else if let Some(ascii) = text.strip_prefix("ascii:") {
+        let mut value = 0u64;
+        for (index, byte) in ascii.as_bytes().iter().take(8).enumerate() {
+            value |= (*byte as u64) << (index * 8);
+        }
+        Some(value)
+    } else {
+        parse_optional_u64_text(text)
+    }
+}
+
+fn ascii_from_core_integer(value: u64) -> String {
+    value
+        .to_le_bytes()
+        .into_iter()
+        .take_while(|byte| *byte != 0)
+        .map(|byte| {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 fn write_mock_eval_response(
@@ -5344,6 +5940,75 @@ fn mcp_tool_descriptors() -> Vec<Value> {
             }),
         ),
         mcp_tool(
+            "reverse.lookup_funcs",
+            "Lookup IDA functions by address or name.",
+            mcp_reverse_core_schema_required(
+                json!({
+                "queries": {},
+                "runtime_module_base": {},
+                "ida_image_base": {}
+                }),
+                &["queries"],
+            ),
+        ),
+        mcp_tool(
+            "reverse.int_convert",
+            "Convert decimal, hex, bytes, ASCII, and binary integer representations.",
+            mcp_reverse_core_schema_required(json!({ "inputs": {} }), &["inputs"]),
+        ),
+        mcp_tool(
+            "reverse.list_funcs",
+            "List IDA functions with pagination and optional filtering.",
+            mcp_reverse_core_schema(json!({
+                "offset": { "type": "integer" },
+                "count": { "type": "integer" },
+                "filter": { "type": "string" }
+            })),
+        ),
+        mcp_tool(
+            "reverse.list_globals",
+            "List IDA global variables with pagination and optional filtering.",
+            mcp_reverse_core_schema(json!({
+                "offset": { "type": "integer" },
+                "count": { "type": "integer" },
+                "filter": { "type": "string" }
+            })),
+        ),
+        mcp_tool(
+            "reverse.imports",
+            "List imported symbols and module names with pagination.",
+            mcp_reverse_core_schema(json!({
+                "offset": { "type": "integer" },
+                "count": { "type": "integer" },
+                "filter": { "type": "string" }
+            })),
+        ),
+        mcp_tool(
+            "reverse.decompile",
+            "Decompile the function containing an IDA address.",
+            mcp_reverse_core_schema_required(json!({ "addr": {} }), &["addr"]),
+        ),
+        mcp_tool(
+            "reverse.disasm",
+            "Disassemble the function containing an IDA address.",
+            mcp_reverse_core_schema_required(json!({ "addr": {} }), &["addr"]),
+        ),
+        mcp_tool(
+            "reverse.xrefs_to",
+            "Find cross-references to one or more IDA addresses.",
+            mcp_reverse_core_schema_required(json!({ "addrs": {} }), &["addrs"]),
+        ),
+        mcp_tool(
+            "reverse.xrefs_to_field",
+            "Find cross-references to struct fields.",
+            mcp_reverse_core_schema_required(json!({ "queries": {} }), &["queries"]),
+        ),
+        mcp_tool(
+            "reverse.callees",
+            "List callees for one or more IDA functions.",
+            mcp_reverse_core_schema_required(json!({ "addrs": {} }), &["addrs"]),
+        ),
+        mcp_tool(
             "reverse.session.close",
             "Close an IDA reverse session.",
             json!({
@@ -5408,6 +6073,31 @@ fn mcp_session_schema() -> Value {
             "session_id": { "type": "object" }
         },
         "required": ["session_id"]
+    })
+}
+
+fn mcp_reverse_core_schema(extra_properties: Value) -> Value {
+    mcp_reverse_core_schema_required(extra_properties, &[])
+}
+
+fn mcp_reverse_core_schema_required(extra_properties: Value, extra_required: &[&str]) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert("session_id".to_string(), json!({ "type": "object" }));
+    properties.insert(
+        "reverse_session_id".to_string(),
+        json!({ "type": "object" }),
+    );
+    if let Value::Object(extra) = extra_properties {
+        for (key, value) in extra {
+            properties.insert(key, value);
+        }
+    }
+    let mut required = vec![json!("session_id"), json!("reverse_session_id")];
+    required.extend(extra_required.iter().map(|field| json!(field)));
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required
     })
 }
 
@@ -5492,6 +6182,14 @@ struct ReverseLookupFunctionParams {
     runtime_address: Value,
     runtime_module_base: Value,
     ida_image_base: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ReverseCoreFunctionParams {
+    session_id: SessionRef,
+    reverse_session_id: SessionRef,
+    #[serde(flatten)]
+    arguments: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -7269,6 +7967,159 @@ mod tests {
     }
 
     #[test]
+    fn reverse_core_functions_record_artifacts_and_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let (session_id, reverse_session_id) = open_reverse_session(&host, temp.path());
+        let calls = [
+            (
+                "reverse.lookup_funcs",
+                json!({
+                    "queries": ["0x140001234", "main"],
+                    "runtime_module_base": 0,
+                    "ida_image_base": 0
+                }),
+            ),
+            (
+                "reverse.int_convert",
+                json!({ "inputs": "42, 0x2a, ascii:AB" }),
+            ),
+            (
+                "reverse.list_funcs",
+                json!({ "offset": 0, "count": 2, "filter": "parse" }),
+            ),
+            ("reverse.list_globals", json!({ "offset": 0, "count": 10 })),
+            ("reverse.imports", json!({ "offset": 1, "count": 1 })),
+            ("reverse.decompile", json!({ "addr": "0x140001234" })),
+            ("reverse.disasm", json!({ "addr": "0x140001234" })),
+            (
+                "reverse.xrefs_to",
+                json!({ "addrs": ["0x140001234", "0x140001300"] }),
+            ),
+            (
+                "reverse.xrefs_to_field",
+                json!({ "queries": "MY_STRUCT.field_0" }),
+            ),
+            ("reverse.callees", json!({ "addrs": ["0x140001000"] })),
+        ];
+
+        for (method, mut args) in calls {
+            args["session_id"] = session_id.clone();
+            args["reverse_session_id"] = reverse_session_id.clone();
+            let response = host.handle_rpc(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(3)),
+                method: method.to_string(),
+                params: Some(args),
+            });
+            assert!(response.error.is_none(), "{method}: {:?}", response.error);
+            let result = response.result.unwrap();
+            assert_eq!(result["operation_status"], "success");
+            assert!(result["artifact_refs"].as_array().unwrap().len() == 1);
+            assert!(result.get("result").is_some());
+        }
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.kind == "reverse.core")
+                .count()
+                >= 10
+        );
+        let operations = workspace.list_operations().unwrap();
+        for capability in [
+            "reverse.lookup_funcs",
+            "reverse.int_convert",
+            "reverse.list_funcs",
+            "reverse.list_globals",
+            "reverse.imports",
+            "reverse.decompile",
+            "reverse.disasm",
+            "reverse.xrefs_to",
+            "reverse.xrefs_to_field",
+            "reverse.callees",
+        ] {
+            assert!(
+                operations
+                    .iter()
+                    .any(|operation| operation.capability == capability),
+                "{capability} was not recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_core_functions_cover_pagination_empty_and_invalid_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let (session_id, reverse_session_id) = open_reverse_session(&host, temp.path());
+
+        let page = reverse_core_rpc(
+            &host,
+            "reverse.list_funcs",
+            session_id.clone(),
+            reverse_session_id.clone(),
+            json!({ "offset": 1, "count": 2 }),
+        );
+        assert!(page.error.is_none(), "{:?}", page.error);
+        let result = page.result.unwrap();
+        assert_eq!(result["result"]["offset"], 1);
+        assert_eq!(result["result"]["count"], 2);
+        assert_eq!(result["result"]["total"], 4);
+
+        let empty = reverse_core_rpc(
+            &host,
+            "reverse.list_funcs",
+            session_id.clone(),
+            reverse_session_id.clone(),
+            json!({ "filter": "does-not-exist" }),
+        );
+        assert!(empty.error.is_none(), "{:?}", empty.error);
+        assert_eq!(empty.result.unwrap()["result"]["total"], 0);
+
+        let invalid = reverse_core_rpc(
+            &host,
+            "reverse.decompile",
+            session_id,
+            reverse_session_id,
+            json!({ "addr": "not-an-address" }),
+        );
+        assert!(invalid.error.is_some());
+    }
+
+    #[test]
+    fn failed_reverse_core_function_records_adapter_error_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::new(Arc::new(FailingReverseCoreSupervisor));
+        let (session_id, reverse_session_id) = open_reverse_session(&host, temp.path());
+
+        let response = reverse_core_rpc(
+            &host,
+            "reverse.decompile",
+            session_id,
+            reverse_session_id,
+            json!({ "addr": "0x140001000" }),
+        );
+        assert!(response.error.is_some());
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "reverse.adapter_error")
+        );
+        let operations = workspace.list_operations().unwrap();
+        let failed = operations
+            .iter()
+            .find(|operation| operation.capability == "reverse.decompile")
+            .unwrap();
+        assert!(matches!(failed.status, OperationStatus::Failed));
+    }
+
+    #[test]
     fn failed_reverse_open_records_adapter_error_artifact() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("sample.exe");
@@ -7961,6 +8812,23 @@ mod tests {
             service_update["inputSchema"]["properties"]["restart"]["default"],
             true
         );
+        for tool_name in [
+            "reverse.lookup_funcs",
+            "reverse.int_convert",
+            "reverse.list_funcs",
+            "reverse.list_globals",
+            "reverse.imports",
+            "reverse.decompile",
+            "reverse.disasm",
+            "reverse.xrefs_to",
+            "reverse.xrefs_to_field",
+            "reverse.callees",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == tool_name),
+                "{tool_name} tool is listed"
+            );
+        }
         assert!(tools.iter().any(|tool| tool["name"] == "workspace.facts"));
         assert!(!tools.iter().any(|tool| tool["name"] == "recording.start"));
         server.stop();
@@ -8032,6 +8900,48 @@ mod tests {
         assert_eq!(eval["operation_status"], "success");
         assert!(eval["raw_output_ref"].get("id").is_some());
         assert_eq!(eval["artifact_refs"].as_array().unwrap().len(), 3);
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_reverse_core_function_uses_service_results_with_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let server = start_mock_http_service();
+        let create = mcp_tool_call(
+            server.endpoint,
+            "debug.session.create",
+            json!({
+                "project_root": temp.path(),
+                "target": { "kind": "dump", "path": "sample.dmp" }
+            }),
+        );
+        let session_id = create["session_id"].clone();
+        let open = mcp_tool_call(
+            server.endpoint,
+            "reverse.session.open",
+            json!({
+                "project_root": temp.path(),
+                "session_id": session_id,
+                "database_path": database
+            }),
+        );
+        let result = mcp_tool_call(
+            server.endpoint,
+            "reverse.list_funcs",
+            json!({
+                "session_id": open["session_id"],
+                "reverse_session_id": open["reverse_session_id"],
+                "offset": 0,
+                "count": 1
+            }),
+        );
+
+        assert_eq!(result["operation_status"], "success");
+        assert_eq!(result["function"], "list_funcs");
+        assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 1);
+        assert_eq!(result["result"]["count"], 1);
         server.stop();
     }
 
@@ -8264,6 +9174,46 @@ mod tests {
         })
     }
 
+    fn open_reverse_session(host: &ServiceHost, project_root: &Path) -> (Value, Value) {
+        let database = project_root.join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let session_id =
+            create_debug_session(host, project_root).result.unwrap()["session_id"].clone();
+        let open = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "reverse.session.open".to_string(),
+            params: Some(json!({
+                "project_root": project_root,
+                "session_id": session_id,
+                "database_path": database
+            })),
+        });
+        assert!(open.error.is_none(), "{:?}", open.error);
+        let result = open.result.unwrap();
+        (
+            result["session_id"].clone(),
+            result["reverse_session_id"].clone(),
+        )
+    }
+
+    fn reverse_core_rpc(
+        host: &ServiceHost,
+        method: &str,
+        session_id: Value,
+        reverse_session_id: Value,
+        mut arguments: Value,
+    ) -> JsonRpcResponse {
+        arguments["session_id"] = session_id;
+        arguments["reverse_session_id"] = reverse_session_id;
+        host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: method.to_string(),
+            params: Some(arguments),
+        })
+    }
+
     fn create_recording(host: &ServiceHost, project_root: &Path, target: Value) -> JsonRpcResponse {
         host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -8329,6 +9279,8 @@ mod tests {
     struct FailingReverseOpenSupervisor;
 
     struct FailingReverseCloseSupervisor;
+
+    struct FailingReverseCoreSupervisor;
 
     impl WorkerSupervisor for FailingStartSupervisor {
         fn create_debug_worker(
@@ -8482,6 +9434,47 @@ mod tests {
                 WorkerRequest::CloseReverseSession { .. } => Ok(WorkerResponse::Failed {
                     code: "reverse_close_failed".to_string(),
                     message: "mock IDA close failed".to_string(),
+                    writes: Vec::new(),
+                }),
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for FailingReverseCoreSupervisor {
+        fn create_debug_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Ok(test_worker_handle(request.session_id))
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::ReverseCoreFunction { .. } => Ok(WorkerResponse::Failed {
+                    code: "reverse_core_failed".to_string(),
+                    message: "mock IDA core function failed".to_string(),
                     writes: Vec::new(),
                 }),
                 other => mock_worker_response(other),

@@ -84,7 +84,6 @@ fn main() {
     for dir in &link_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
-    println!("cargo:rustc-link-lib=dylib=dbgatlas_ida");
     copy_runtime_dlls(&out_dir, &runtime_dlls);
 }
 

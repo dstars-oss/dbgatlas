@@ -1,4 +1,4 @@
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 
 pub const DA_IDA_OK: i32 = 0;
 pub const DA_IDA_ERR_INVALID_ARGUMENT: i32 = 1;
@@ -48,31 +48,29 @@ pub struct DA_IdaFunctionLookup {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_IdaCoreResult {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub result_json: DA_IdaTextView,
+}
+
+#[repr(C)]
 pub struct DA_IdaSessionHandle {
     _private: [u8; 0],
 }
 
-#[cfg(windows)]
-#[link(name = "dbgatlas_ida")]
-unsafe extern "C" {
-    pub fn da_ida_abi_version(out: *mut DA_IdaVersion) -> i32;
-    pub fn da_ida_release_view(owner: *mut std::ffi::c_void);
-    pub fn da_ida_last_error(
-        buffer: *mut c_char,
-        buffer_len: usize,
-        required_len: *mut usize,
-    ) -> i32;
-    pub fn da_ida_session_open(
-        install_dir_utf8: *const c_char,
-        database_path_utf8: *const c_char,
-        out_handle: *mut *mut DA_IdaSessionHandle,
-    ) -> i32;
-    pub fn da_ida_lookup_function(
-        handle: *mut DA_IdaSessionHandle,
-        runtime_address: u64,
-        runtime_module_base: u64,
-        ida_image_base: u64,
-        out: *mut DA_IdaFunctionLookup,
-    ) -> i32;
-    pub fn da_ida_session_close(handle: *mut DA_IdaSessionHandle) -> i32;
-}
+pub type DaIdaAbiVersionFn = unsafe extern "C" fn(*mut DA_IdaVersion) -> i32;
+pub type DaIdaReleaseViewFn = unsafe extern "C" fn(*mut c_void);
+pub type DaIdaLastErrorFn = unsafe extern "C" fn(*mut c_char, usize, *mut usize) -> i32;
+pub type DaIdaSessionOpenFn =
+    unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut DA_IdaSessionHandle) -> i32;
+pub type DaIdaLookupFunctionFn =
+    unsafe extern "C" fn(*mut DA_IdaSessionHandle, u64, u64, u64, *mut DA_IdaFunctionLookup) -> i32;
+pub type DaIdaCoreFunctionFn = unsafe extern "C" fn(
+    *mut DA_IdaSessionHandle,
+    *const c_char,
+    *const c_char,
+    *mut DA_IdaCoreResult,
+) -> i32;
+pub type DaIdaSessionCloseFn = unsafe extern "C" fn(*mut DA_IdaSessionHandle) -> i32;

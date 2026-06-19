@@ -139,17 +139,17 @@ Foundation:
 
 Core Functions:
 
-- [ ] 实现 `lookup_funcs(queries)`：按地址或名称查询 function，自动识别输入类型，支持 list 或 comma-separated string。
-- [ ] 实现 `int_convert(inputs)`：转换 decimal、hex、bytes、ASCII、binary 等数值表示。
-- [ ] 实现 `list_funcs(queries)`：分页、过滤列出 functions。
-- [ ] 实现 `list_globals(queries)`：分页、过滤列出 global variables。
-- [ ] 实现 `imports(offset, count)`：分页列出 imported symbols 和 module names。
-- [ ] 实现 `decompile(addr)`：反编译指定地址所在 function。
-- [ ] 实现 `disasm(addr)`：反汇编指定地址所在 function，并输出 arguments、stack frame 等细节。
-- [ ] 实现 `xrefs_to(addrs)`：查询一个或多个地址的 cross-references。
-- [ ] 实现 `xrefs_to_field(queries)`：查询 struct field 的 cross-references。
-- [ ] 实现 `callees(addrs)`：查询一个或多个 function 调用的 callees。
-- [ ] 为 Core Functions 增加端到端 service / MCP 测试，覆盖成功、空结果、分页、非法输入和 adapter error。
+- [x] 实现 `lookup_funcs(queries)`：按地址或名称查询 function，自动识别输入类型，支持 list 或 comma-separated string。
+- [x] 实现 `int_convert(inputs)`：转换 decimal、hex、bytes、ASCII、binary 等数值表示。
+- [x] 实现 `list_funcs(queries)`：分页、过滤列出 functions。
+- [x] 实现 `list_globals(queries)`：分页、过滤列出 global variables。
+- [x] 实现 `imports(offset, count)`：分页列出 imported symbols 和 module names。
+- [x] 实现 `decompile(addr)`：通过 Hex-Rays 反编译指定地址所在 function，不返回反汇编 fallback。
+- [x] 实现 `disasm(addr)`：反汇编指定地址所在 function，并输出 arguments、stack frame 等细节。
+- [x] 实现 `xrefs_to(addrs)`：查询一个或多个地址的 cross-references。
+- [x] 实现 `xrefs_to_field(queries)`：查询 struct field 的 cross-references。
+- [x] 实现 `callees(addrs)`：查询一个或多个 function 调用的 callees。
+- [x] 为 Core Functions 增加端到端 service / MCP 测试，覆盖成功、空结果、分页、非法输入和 adapter error。
 
 Non-goals:
 
@@ -166,10 +166,10 @@ MVP 4 foundation acceptance:
 
 Full MVP 4 acceptance:
 
-- [ ] `lookup_funcs`、`int_convert`、`list_funcs`、`list_globals`、`imports`、`decompile`、`disasm`、`xrefs_to`、`xrefs_to_field`、`callees` 均可通过 service RPC 和 MCP tools 调用。
-- [ ] 所有 Core Functions 的输入支持文档化，返回 JSON 结构稳定，并能被 Markdown reverse notes 引用。
-- [ ] IDA Core Functions 的低层输出写入 `artifacts/reverse_sessions/<session_id>/`，并登记 operation record 和 artifact metadata。
-- [ ] 端到端测试覆盖 Core Functions 的主要成功路径、分页/过滤、批量输入和错误路径。
+- [x] `lookup_funcs`、`int_convert`、`list_funcs`、`list_globals`、`imports`、`decompile`、`disasm`、`xrefs_to`、`xrefs_to_field`、`callees` 均可通过 service RPC 和 MCP tools 调用。
+- [x] 所有 Core Functions 的输入支持文档化，返回 JSON 结构稳定，并能被 Markdown reverse notes 引用。
+- [x] IDA Core Functions 的低层输出写入 `artifacts/reverse_sessions/<session_id>/`，并登记 operation record 和 artifact metadata。
+- [x] 端到端测试覆盖 Core Functions 的主要成功路径、分页/过滤、批量输入和错误路径。
 
 ## MVP 5: Report And AI Workflow
 

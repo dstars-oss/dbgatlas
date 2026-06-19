@@ -53,7 +53,7 @@
 
 - 已有基础链路：IDA database target、native IDA adapter dynamic loading、active interactive user worker 中的 reverse session、explicit runtime address / module base / IDA image base -> IDA function mapping。
 - 对标 `ida-pro-mcp` Core Functions：`lookup_funcs`、`int_convert`、`list_funcs`、`list_globals`、`imports`、`decompile`、`disasm`、`xrefs_to`、`xrefs_to_field`、`callees`。
-- Core Functions 通过 service RPC 和 MCP tools 暴露，保持稳定 JSON 返回结构。
+- Core Functions 通过 service RPC 和 MCP tools 暴露，保持稳定 JSON 返回结构；输入和 artifact 约定见 `docs/reverse-core-functions.md`。
 - reverse workflow 低层输出、operation records 和 artifact metadata 可被 `analysis/` 中的 reverse notes 引用。
 
 ## MVP 5: Report And AI Workflow

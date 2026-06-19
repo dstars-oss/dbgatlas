@@ -1,12 +1,13 @@
 use dbgatlas_debug::{DebugCommandResult, DebugMemoryResult, DebugTarget};
 use dbgatlas_model::{OperationRef, SessionRef, Timestamp};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 use thiserror::Error;
 
 pub const WORKER_PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerEnvelope<T> {
     pub version: u32,
     pub request_id: String,
@@ -23,7 +24,7 @@ impl<T> WorkerEnvelope<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum WorkerRequest {
     StartDebugSession {
@@ -67,6 +68,14 @@ pub enum WorkerRequest {
         ida_image_base: u64,
         artifact_dir: PathBuf,
     },
+    ReverseCoreFunction {
+        session_id: SessionRef,
+        reverse_session_id: SessionRef,
+        operation_id: OperationRef,
+        function: String,
+        arguments: Value,
+        artifact_dir: PathBuf,
+    },
     CloseReverseSession {
         session_id: SessionRef,
         reverse_session_id: SessionRef,
@@ -83,7 +92,7 @@ pub enum WorkerRequest {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum WorkerResponse {
     Ok {
@@ -106,11 +115,22 @@ pub enum WorkerResponse {
         result: ReverseFunctionLookupResult,
         writes: Vec<WorkerArtifactWrite>,
     },
+    ReverseCoreFunction {
+        result: ReverseCoreFunctionResult,
+        writes: Vec<WorkerArtifactWrite>,
+    },
     Failed {
         code: String,
         message: String,
         writes: Vec<WorkerArtifactWrite>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReverseCoreFunctionResult {
+    pub function: String,
+    pub result: Value,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +283,27 @@ mod tests {
     }
 
     #[test]
+    fn reverse_core_request_round_trips_as_jsonl() {
+        let request = WorkerEnvelope::new(
+            "req-rev-core",
+            WorkerRequest::ReverseCoreFunction {
+                session_id: SessionRef::new(Id::new("session-001").unwrap()),
+                reverse_session_id: SessionRef::new(Id::new("reverse-001").unwrap()),
+                operation_id: OperationRef::new(Id::new("op-001").unwrap()),
+                function: "list_funcs".to_string(),
+                arguments: serde_json::json!({ "offset": 0, "count": 10 }),
+                artifact_dir: PathBuf::from(
+                    r"C:\case\dbgatlas\artifacts\reverse_sessions\session-001",
+                ),
+            },
+        );
+
+        let encoded = encode_jsonl(&request).unwrap();
+        let decoded: WorkerEnvelope<WorkerRequest> = decode_jsonl(&encoded).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn reverse_lookup_response_round_trips_as_jsonl() {
         let response = WorkerEnvelope::new(
             "req-rev-lookup",
@@ -277,6 +318,33 @@ mod tests {
                     function_end: 0x140001300,
                     function_name: "sub_140001200".to_string(),
                     found: true,
+                },
+                writes: Vec::new(),
+            },
+        );
+
+        let encoded = encode_jsonl(&response).unwrap();
+        let decoded: WorkerEnvelope<WorkerResponse> = decode_jsonl(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn reverse_core_response_round_trips_as_jsonl() {
+        let response = WorkerEnvelope::new(
+            "req-rev-core",
+            WorkerResponse::ReverseCoreFunction {
+                result: ReverseCoreFunctionResult {
+                    function: "imports".to_string(),
+                    result: serde_json::json!({
+                        "offset": 0,
+                        "count": 1,
+                        "items": [{
+                            "module": "KERNEL32.dll",
+                            "name": "CreateFileW",
+                            "ordinal": null
+                        }]
+                    }),
+                    warnings: Vec::new(),
                 },
                 writes: Vec::new(),
             },

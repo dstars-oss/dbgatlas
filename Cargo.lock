@@ -198,8 +198,10 @@ version = "0.1.0"
 dependencies = [
  "dbgatlas-ida-sys",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

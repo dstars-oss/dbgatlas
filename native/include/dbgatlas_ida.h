@@ -62,6 +62,12 @@ typedef struct DA_IdaFunctionLookup {
     DA_IdaTextView function_name;
 } DA_IdaFunctionLookup;
 
+typedef struct DA_IdaCoreResult {
+    uint32_t struct_size;
+    uint32_t flags;
+    DA_IdaTextView result_json;
+} DA_IdaCoreResult;
+
 typedef struct DA_IdaSessionHandle DA_IdaSessionHandle;
 
 DA_IDA_EXPORT int32_t da_ida_abi_version(DA_IdaVersion* out);
@@ -80,4 +86,9 @@ DA_IDA_EXPORT int32_t da_ida_lookup_function(
     uint64_t runtime_module_base,
     uint64_t ida_image_base,
     DA_IdaFunctionLookup* out);
+DA_IDA_EXPORT int32_t da_ida_core_function(
+    DA_IdaSessionHandle* handle,
+    const char* function_utf8,
+    const char* arguments_json_utf8,
+    DA_IdaCoreResult* out);
 DA_IDA_EXPORT int32_t da_ida_session_close(DA_IdaSessionHandle* handle);
