@@ -564,11 +564,9 @@ mod tests {
         let mut state = WorkerState::new("session-001".to_string());
         let response = state.handle_request(WorkerRequest::LookupReverseFunction {
             session_id: session_ref("session-001"),
-            operation_id: OperationRef::new(Id::new("op-001").unwrap()),
             runtime_address: 0x180001000,
             runtime_module_base: 0x180000000,
             ida_image_base: 0x140000000,
-            artifact_dir: PathBuf::from("unused"),
         });
 
         match response {
@@ -590,7 +588,6 @@ mod tests {
             session_id: session_ref("session-001"),
             ida_install_dir: temp.path().join("missing-ida"),
             database_path: database,
-            artifact_dir: temp.path().join("artifacts"),
         });
 
         match response {

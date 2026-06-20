@@ -1120,7 +1120,6 @@ impl ServiceHost {
                 session_id: session_id.clone(),
                 ida_install_dir: ida_install_dir.clone(),
                 database_path: params.database_path.clone(),
-                artifact_dir: artifact_dir.clone(),
             },
         );
         match open {
@@ -1327,11 +1326,9 @@ impl ServiceHost {
                 &session.worker,
                 WorkerRequest::LookupReverseFunction {
                     session_id: params.session_id.clone(),
-                    operation_id: operation_id.clone(),
                     runtime_address,
                     runtime_module_base,
                     ida_image_base,
-                    artifact_dir: session.artifact_dir.clone(),
                 },
             )
         };
@@ -1519,10 +1516,8 @@ impl ServiceHost {
                 &session.worker,
                 WorkerRequest::ReverseCoreFunction {
                     session_id: params.session_id.clone(),
-                    operation_id: operation_id.clone(),
                     function: function.to_string(),
                     arguments: arguments.clone(),
-                    artifact_dir: session.artifact_dir.clone(),
                 },
             )
         };

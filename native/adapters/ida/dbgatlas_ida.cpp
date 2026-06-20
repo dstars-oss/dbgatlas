@@ -1,5 +1,8 @@
 #define NOMINMAX
 #include "dbgatlas_ida.h"
+
+#include <nlohmann/json.hpp>
+
 #include "dbgatlas_ida_runtime.h"
 
 #include <cstring>
@@ -22,6 +25,8 @@
 #include <vector>
 
 namespace {
+
+using Json = nlohmann::json;
 
 thread_local std::string g_last_error;
 std::mutex g_session_mutex;
@@ -84,6 +89,25 @@ bool is_existing_file(const std::wstring& path) {
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+bool is_legacy_ida32_database(const std::wstring& path) {
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    char header[4] = {};
+    DWORD bytes_read = 0;
+    BOOL ok = ReadFile(file, header, sizeof(header), &bytes_read, nullptr);
+    CloseHandle(file);
+    return ok != 0 && bytes_read == sizeof(header) && memcmp(header, "IDA1", sizeof(header)) == 0;
+}
+
 std::wstring join_path(const std::wstring& base, const wchar_t* child) {
     std::wstring result = base;
     if (!result.empty() && result.back() != L'\\' && result.back() != L'/') {
@@ -122,165 +146,11 @@ std::string qstring_to_string(const qstring& value) {
     return text == nullptr ? std::string() : std::string(text, value.length());
 }
 
-std::string json_escape(const std::string& text) {
-    std::ostringstream out;
-    for (unsigned char ch : text) {
-        switch (ch) {
-        case '\\': out << "\\\\"; break;
-        case '"': out << "\\\""; break;
-        case '\n': out << "\\n"; break;
-        case '\r': out << "\\r"; break;
-        case '\t': out << "\\t"; break;
-        default:
-            if (ch < 0x20) {
-                out << "\\u";
-                const char* hex = "0123456789abcdef";
-                out << '0' << '0' << hex[(ch >> 4) & 0xf] << hex[ch & 0xf];
-            } else {
-                out << static_cast<char>(ch);
-            }
-            break;
-        }
-    }
-    return out.str();
-}
-
-std::string json_string(const std::string& text) {
-    return "\"" + json_escape(text) + "\"";
-}
-
-std::string json_u64(uint64_t value) {
-    return std::to_string(value);
-}
-
-std::string json_nullable_u64(ea_t value) {
-    return value == BADADDR ? "null" : json_u64(static_cast<uint64_t>(value));
-}
-
 std::string trim_copy(std::string value) {
     auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
     value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](unsigned char ch) { return !is_space(ch); }));
     value.erase(std::find_if(value.rbegin(), value.rend(), [&](unsigned char ch) { return !is_space(ch); }).base(), value.end());
     return value;
-}
-
-std::string find_json_value(const std::string& json, const std::string& key) {
-    const std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) {
-        return "";
-    }
-    pos = json.find(':', pos + needle.size());
-    if (pos == std::string::npos) {
-        return "";
-    }
-    ++pos;
-    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) {
-        ++pos;
-    }
-    if (pos >= json.size()) {
-        return "";
-    }
-    if (json[pos] == '"') {
-        size_t end = pos + 1;
-        bool escape = false;
-        for (; end < json.size(); ++end) {
-            if (escape) {
-                escape = false;
-            } else if (json[end] == '\\') {
-                escape = true;
-            } else if (json[end] == '"') {
-                break;
-            }
-        }
-        return end < json.size() ? json.substr(pos, end - pos + 1) : "";
-    }
-    if (json[pos] == '[') {
-        size_t end = pos + 1;
-        int depth = 1;
-        bool in_string = false;
-        bool escape = false;
-        for (; end < json.size(); ++end) {
-            char ch = json[end];
-            if (in_string) {
-                if (escape) {
-                    escape = false;
-                } else if (ch == '\\') {
-                    escape = true;
-                } else if (ch == '"') {
-                    in_string = false;
-                }
-            } else if (ch == '"') {
-                in_string = true;
-            } else if (ch == '[') {
-                ++depth;
-            } else if (ch == ']') {
-                --depth;
-                if (depth == 0) {
-                    break;
-                }
-            }
-        }
-        return end < json.size() ? json.substr(pos, end - pos + 1) : "";
-    }
-    if (json[pos] == '{') {
-        size_t end = pos + 1;
-        int depth = 1;
-        bool in_string = false;
-        bool escape = false;
-        for (; end < json.size(); ++end) {
-            char ch = json[end];
-            if (in_string) {
-                if (escape) {
-                    escape = false;
-                } else if (ch == '\\') {
-                    escape = true;
-                } else if (ch == '"') {
-                    in_string = false;
-                }
-            } else if (ch == '"') {
-                in_string = true;
-            } else if (ch == '{') {
-                ++depth;
-            } else if (ch == '}') {
-                --depth;
-                if (depth == 0) {
-                    break;
-                }
-            }
-        }
-        return end < json.size() ? json.substr(pos, end - pos + 1) : "";
-    }
-    size_t end = pos;
-    while (end < json.size() && json[end] != ',' && json[end] != '}') {
-        ++end;
-    }
-    return trim_copy(json.substr(pos, end - pos));
-}
-
-std::string unquote_json_string(std::string value) {
-    value = trim_copy(std::move(value));
-    if (value.size() < 2 || value.front() != '"' || value.back() != '"') {
-        return value;
-    }
-    std::string out;
-    for (size_t i = 1; i + 1 < value.size(); ++i) {
-        char ch = value[i];
-        if (ch == '\\' && i + 1 < value.size()) {
-            char next = value[++i];
-            switch (next) {
-            case 'n': out.push_back('\n'); break;
-            case 'r': out.push_back('\r'); break;
-            case 't': out.push_back('\t'); break;
-            case '\\': out.push_back('\\'); break;
-            case '"': out.push_back('"'); break;
-            default: out.push_back(next); break;
-            }
-        } else {
-            out.push_back(ch);
-        }
-    }
-    return out;
 }
 
 bool parse_u64_text(const std::string& text, uint64_t* out) {
@@ -314,84 +184,111 @@ bool parse_u64_text(const std::string& text, uint64_t* out) {
     return true;
 }
 
-uint64_t json_u64_arg(const std::string& args, const std::string& key, uint64_t fallback) {
-    std::string value = find_json_value(args, key);
-    if (value.empty()) {
-        return fallback;
+Json parse_json_args(const std::string& args) {
+    std::string trimmed = trim_copy(args);
+    if (trimmed.empty()) {
+        return Json::object();
     }
-    value = unquote_json_string(value);
-    uint64_t parsed = 0;
-    return parse_u64_text(value, &parsed) ? parsed : fallback;
+    try {
+        return Json::parse(trimmed);
+    } catch (const Json::parse_error& error) {
+        throw std::invalid_argument(std::string("arguments_json is not valid JSON: ") + error.what());
+    }
 }
 
-uint64_t required_json_u64_arg(const std::string& args, const std::string& key) {
-    std::string value = find_json_value(args, key);
-    if (value.empty()) {
-        throw std::invalid_argument(key + " is required");
+const Json* json_arg(const Json& args, const char* key) {
+    if (key == nullptr || key[0] == '\0') {
+        return &args;
     }
-    value = unquote_json_string(value);
+    if (!args.is_object()) {
+        return nullptr;
+    }
+    auto it = args.find(key);
+    return it == args.end() || it->is_null() ? nullptr : &*it;
+}
+
+bool json_has_arg(const Json& args, const char* key) {
+    return json_arg(args, key) != nullptr;
+}
+
+std::string json_scalar_text(const Json& value) {
+    if (value.is_null()) {
+        return "";
+    }
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    if (value.is_number_unsigned()) {
+        return std::to_string(value.get<uint64_t>());
+    }
+    if (value.is_number_integer()) {
+        int64_t number = value.get<int64_t>();
+        return number < 0 ? std::to_string(number) : std::to_string(static_cast<uint64_t>(number));
+    }
+    if (value.is_boolean()) {
+        return value.get<bool>() ? "true" : "false";
+    }
+    return value.dump();
+}
+
+uint64_t json_u64_value(const Json& value, const std::string& key) {
+    if (value.is_number_unsigned()) {
+        return value.get<uint64_t>();
+    }
+    if (value.is_number_integer()) {
+        int64_t number = value.get<int64_t>();
+        if (number >= 0) {
+            return static_cast<uint64_t>(number);
+        }
+    }
     uint64_t parsed = 0;
-    if (!parse_u64_text(value, &parsed)) {
+    if (!parse_u64_text(json_scalar_text(value), &parsed)) {
         throw std::invalid_argument(key + " must be an unsigned integer or address string");
     }
     return parsed;
 }
 
-bool optional_json_u64_arg(const std::string& args, const std::string& key, uint64_t* out) {
-    std::string value = find_json_value(args, key);
-    if (value.empty()) {
+uint64_t json_u64_arg(const Json& args, const char* key, uint64_t fallback) {
+    const Json* value = json_arg(args, key);
+    return value == nullptr ? fallback : json_u64_value(*value, key);
+}
+
+uint64_t required_json_u64_arg(const Json& args, const char* key) {
+    const Json* value = json_arg(args, key);
+    if (value == nullptr) {
+        throw std::invalid_argument(std::string(key) + " is required");
+    }
+    return json_u64_value(*value, key);
+}
+
+bool optional_json_u64_arg(const Json& args, const char* key, uint64_t* out) {
+    const Json* value = json_arg(args, key);
+    if (value == nullptr) {
         return false;
     }
-    value = unquote_json_string(value);
-    uint64_t parsed = 0;
-    if (!parse_u64_text(value, &parsed)) {
-        throw std::invalid_argument(key + " must be an unsigned integer or address string");
-    }
-    *out = parsed;
+    *out = json_u64_value(*value, key);
     return true;
 }
 
-std::string json_string_arg(const std::string& args, const std::string& key) {
-    return unquote_json_string(find_json_value(args, key));
+std::string json_string_arg(const Json& args, const char* key) {
+    const Json* value = json_arg(args, key);
+    return value == nullptr ? std::string() : json_scalar_text(*value);
 }
 
-std::vector<std::string> json_list_arg(const std::string& args, const std::string& key) {
-    std::string value = trim_copy(find_json_value(args, key));
+std::vector<std::string> json_list_value(const Json& value) {
     std::vector<std::string> result;
-    if (value.empty() || value == "null") {
+    if (value.is_null()) {
         return result;
     }
-    if (value.front() == '[') {
-        size_t pos = 1;
-        while (pos < value.size() && value[pos] != ']') {
-            while (pos < value.size() && (std::isspace(static_cast<unsigned char>(value[pos])) != 0 || value[pos] == ',')) {
-                ++pos;
-            }
-            if (pos >= value.size() || value[pos] == ']') {
-                break;
-            }
-            if (value[pos] == '"') {
-                size_t end = pos + 1;
-                bool escape = false;
-                for (; end < value.size(); ++end) {
-                    if (escape) escape = false;
-                    else if (value[end] == '\\') escape = true;
-                    else if (value[end] == '"') break;
-                }
-                result.push_back(unquote_json_string(value.substr(pos, end - pos + 1)));
-                pos = end + 1;
-            } else {
-                size_t end = pos;
-                while (end < value.size() && value[end] != ',' && value[end] != ']') {
-                    ++end;
-                }
-                result.push_back(trim_copy(value.substr(pos, end - pos)));
-                pos = end;
+    if (value.is_array()) {
+        for (const Json& item : value) {
+            if (!item.is_null()) {
+                result.push_back(json_scalar_text(item));
             }
         }
         return result;
     }
-    std::string scalar = unquote_json_string(value);
+    std::string scalar = json_scalar_text(value);
     size_t start = 0;
     while (start <= scalar.size()) {
         size_t comma = scalar.find(',', start);
@@ -407,114 +304,78 @@ std::vector<std::string> json_list_arg(const std::string& args, const std::strin
     return result;
 }
 
-std::vector<std::string> json_value_items_arg(const std::string& args, const std::string& key) {
-    std::string value = trim_copy(find_json_value(args, key));
-    std::vector<std::string> result;
-    if (value.empty() || value == "null") {
+std::vector<std::string> json_list_arg(const Json& args, const char* key) {
+    const Json* value = json_arg(args, key);
+    return value == nullptr ? std::vector<std::string>() : json_list_value(*value);
+}
+
+std::vector<Json> json_items_arg(const Json& args, const char* key) {
+    const Json* value = json_arg(args, key);
+    std::vector<Json> result;
+    if (value == nullptr) {
         return result;
     }
-    if (value.front() != '[') {
-        result.push_back(value);
-        return result;
-    }
-
-    size_t pos = 1;
-    while (pos < value.size() && value[pos] != ']') {
-        while (pos < value.size() && (std::isspace(static_cast<unsigned char>(value[pos])) != 0 || value[pos] == ',')) {
-            ++pos;
-        }
-        if (pos >= value.size() || value[pos] == ']') {
-            break;
-        }
-
-        size_t start = pos;
-        if (value[pos] == '"' || value[pos] == '{' || value[pos] == '[') {
-            char open = value[pos];
-            char close = open == '{' ? '}' : (open == '[' ? ']' : '"');
-            int depth = open == '"' ? 0 : 1;
-            bool in_string = open == '"';
-            bool escape = false;
-            ++pos;
-            for (; pos < value.size(); ++pos) {
-                char ch = value[pos];
-                if (in_string) {
-                    if (escape) {
-                        escape = false;
-                    } else if (ch == '\\') {
-                        escape = true;
-                    } else if (ch == '"') {
-                        if (open == '"') {
-                            ++pos;
-                            break;
-                        }
-                        in_string = false;
-                    }
-                } else if (ch == '"') {
-                    in_string = true;
-                } else if ((open == '{' && ch == '{') || (open == '[' && ch == '[')) {
-                    ++depth;
-                } else if (ch == close) {
-                    --depth;
-                    if (depth == 0) {
-                        ++pos;
-                        break;
-                    }
-                }
-            }
-        } else {
-            while (pos < value.size() && value[pos] != ',' && value[pos] != ']') {
-                ++pos;
-            }
-        }
-        std::string item = trim_copy(value.substr(start, pos - start));
-        if (!item.empty()) {
+    if (value->is_array()) {
+        for (const Json& item : *value) {
             result.push_back(item);
         }
+    } else {
+        result.push_back(*value);
     }
     return result;
 }
 
-bool json_bool_arg(const std::string& args, const std::string& key, bool fallback) {
-    std::string value = unquote_json_string(find_json_value(args, key));
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (value == "true" || value == "1") {
+bool json_bool_arg(const Json& args, const char* key, bool fallback) {
+    const Json* value = json_arg(args, key);
+    if (value == nullptr) {
+        return fallback;
+    }
+    if (value->is_boolean()) {
+        return value->get<bool>();
+    }
+    if (value->is_number_integer()) {
+        return value->get<int64_t>() != 0;
+    }
+    std::string text = json_scalar_text(*value);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (text == "true" || text == "1") {
         return true;
     }
-    if (value == "false" || value == "0") {
+    if (text == "false" || text == "0") {
         return false;
     }
     return fallback;
 }
 
-std::string json_object_string_arg(const std::string& object, const std::string& key) {
-    return unquote_json_string(find_json_value(object, key));
+Json nullable_ea(ea_t value) {
+    return value == BADADDR ? Json(nullptr) : Json(static_cast<uint64_t>(value));
 }
 
-bool optional_json_object_u64_arg(const std::string& object, const std::string& key, uint64_t* out) {
-    std::string value = find_json_value(object, key);
-    if (value.empty()) {
-        return false;
-    }
-    value = unquote_json_string(value);
-    if (!parse_u64_text(value, out)) {
-        throw std::invalid_argument(key + " must be an unsigned integer or address string");
-    }
-    return true;
+std::string json_string(const std::string& text) {
+    return Json(text).dump();
+}
+
+std::string json_u64(uint64_t value) {
+    return Json(value).dump();
+}
+
+std::string json_nullable_u64(ea_t value) {
+    return nullable_ea(value).dump();
 }
 
 std::string function_json(func_t* function) {
     if (function == nullptr) {
-        return "null";
+        return Json(nullptr).dump();
     }
     qstring name;
     get_func_name(&name, function->start_ea);
-    std::ostringstream out;
-    out << "{\"address\":" << json_u64(static_cast<uint64_t>(function->start_ea))
-        << ",\"start_ea\":" << json_u64(static_cast<uint64_t>(function->start_ea))
-        << ",\"end_ea\":" << json_u64(static_cast<uint64_t>(function->end_ea))
-        << ",\"size\":" << json_u64(static_cast<uint64_t>(function->end_ea - function->start_ea))
-        << ",\"name\":" << json_string(qstring_to_string(name)) << "}";
-    return out.str();
+    return Json{
+        {"address", static_cast<uint64_t>(function->start_ea)},
+        {"start_ea", static_cast<uint64_t>(function->start_ea)},
+        {"end_ea", static_cast<uint64_t>(function->end_ea)},
+        {"size", static_cast<uint64_t>(function->end_ea - function->start_ea)},
+        {"name", qstring_to_string(name)},
+    }.dump();
 }
 
 std::string bytes_hex(const std::vector<uint8_t>& bytes) {
@@ -553,12 +414,12 @@ bool get_string_list_item_at(ea_t ea, string_info_t* out) {
 }
 
 std::string string_info_json(const string_info_t& item, const std::string& text) {
-    std::ostringstream out;
-    out << "{\"address\":" << json_u64(static_cast<uint64_t>(item.ea))
-        << ",\"length\":" << json_u64(item.length > 0 ? static_cast<uint64_t>(item.length) : 0)
-        << ",\"type\":" << item.type
-        << ",\"text\":" << json_string(text) << "}";
-    return out.str();
+    return Json{
+        {"address", static_cast<uint64_t>(item.ea)},
+        {"length", item.length > 0 ? static_cast<uint64_t>(item.length) : 0},
+        {"type", item.type},
+        {"text", text},
+    }.dump();
 }
 
 bool read_string_text(ea_t ea, size_t length, int32 type, std::string* out) {
@@ -588,9 +449,9 @@ std::vector<uint8_t> read_idb_bytes(ea_t ea, uint64_t length) {
     return bytes;
 }
 
-std::string core_int_convert(const std::string& args) {
+std::string core_int_convert(const Json& args) {
     std::vector<std::string> inputs = json_list_arg(args, "inputs");
-    if (inputs.empty()) {
+    if (inputs.empty() && !args.is_object()) {
         inputs = json_list_arg(args, "");
     }
     std::ostringstream out;
@@ -667,7 +528,7 @@ std::string core_int_convert(const std::string& args) {
     return out.str();
 }
 
-std::string core_lookup_funcs(const std::string& args) {
+std::string core_lookup_funcs(const Json& args) {
     std::vector<std::string> queries = json_list_arg(args, "queries");
     uint64_t runtime_module_base = json_u64_arg(args, "runtime_module_base", 0);
     uint64_t ida_image_base = json_u64_arg(args, "ida_image_base", 0);
@@ -698,7 +559,7 @@ std::string core_lookup_funcs(const std::string& args) {
     return out.str();
 }
 
-std::string core_list_funcs(const std::string& args) {
+std::string core_list_funcs(const Json& args) {
     uint64_t offset = json_u64_arg(args, "offset", 0);
     uint64_t count = std::min<uint64_t>(json_u64_arg(args, "count", 50), 1000);
     std::string filter = json_string_arg(args, "filter");
@@ -729,7 +590,7 @@ std::string core_list_funcs(const std::string& args) {
     return out.str();
 }
 
-std::string core_list_globals(const std::string& args) {
+std::string core_list_globals(const Json& args) {
     uint64_t offset = json_u64_arg(args, "offset", 0);
     uint64_t count = std::min<uint64_t>(json_u64_arg(args, "count", 50), 1000);
     std::string filter = json_string_arg(args, "filter");
@@ -803,7 +664,7 @@ int idaapi collect_import_cb(ea_t ea, const char* name, uval_t ordinal, void* pa
     return 1;
 }
 
-std::string core_imports(const std::string& args) {
+std::string core_imports(const Json& args) {
     uint64_t offset = json_u64_arg(args, "offset", 0);
     uint64_t count = std::min<uint64_t>(json_u64_arg(args, "count", 50), 1000);
     std::string filter = json_string_arg(args, "filter");
@@ -824,7 +685,7 @@ std::string core_imports(const std::string& args) {
     return out.str();
 }
 
-std::string core_list_strings(IdaSessionHandleImpl* handle, const std::string& args) {
+std::string core_list_strings(IdaSessionHandleImpl* handle, const Json& args) {
     ensure_string_list(handle);
     uint64_t offset = json_u64_arg(args, "offset", 0);
     uint64_t count = std::min<uint64_t>(json_u64_arg(args, "count", 50), 1000);
@@ -866,7 +727,7 @@ std::string core_list_strings(IdaSessionHandleImpl* handle, const std::string& a
     return out.str();
 }
 
-std::string core_get_string(IdaSessionHandleImpl* handle, const std::string& args) {
+std::string core_get_string(IdaSessionHandleImpl* handle, const Json& args) {
     ensure_string_list(handle);
     uint64_t addr = required_json_u64_arg(args, "addr");
     ea_t ea = static_cast<ea_t>(addr);
@@ -916,7 +777,7 @@ std::string core_get_string(IdaSessionHandleImpl* handle, const std::string& arg
     return out.str();
 }
 
-std::string core_get_bytes(const std::string& args) {
+std::string core_get_bytes(const Json& args) {
     uint64_t addr = required_json_u64_arg(args, "addr");
     uint64_t length = required_json_u64_arg(args, "length");
     std::vector<uint8_t> bytes = read_idb_bytes(static_cast<ea_t>(addr), length);
@@ -929,7 +790,7 @@ std::string core_get_bytes(const std::string& args) {
     return out.str();
 }
 
-std::string core_get_int(const std::string& args) {
+std::string core_get_int(const Json& args) {
     uint64_t addr = required_json_u64_arg(args, "addr");
     uint64_t size = 8;
     optional_json_u64_arg(args, "size", &size);
@@ -974,7 +835,7 @@ std::string core_get_int(const std::string& args) {
     return out.str();
 }
 
-std::string core_decompile(const std::string& args) {
+std::string core_decompile(const Json& args) {
     uint64_t addr = required_json_u64_arg(args, "addr");
     func_t* function = get_func(static_cast<ea_t>(addr));
     if (function == nullptr) {
@@ -1017,7 +878,7 @@ std::string core_decompile(const std::string& args) {
     return "{\"found\":true,\"function\":" + function_json(function) + ",\"language\":\"c\",\"pseudocode\":" + json_string(text.str()) + "}";
 }
 
-std::string core_disasm(const std::string& args) {
+std::string core_disasm(const Json& args) {
     uint64_t addr = required_json_u64_arg(args, "addr");
     func_t* function = get_func(static_cast<ea_t>(addr));
     if (function == nullptr) {
@@ -1045,7 +906,7 @@ std::string core_disasm(const std::string& args) {
     return out.str();
 }
 
-std::string core_xrefs_to(const std::string& args) {
+std::string core_xrefs_to(const Json& args) {
     std::vector<std::string> addrs = json_list_arg(args, "addrs");
     std::ostringstream out;
     out << "{\"items\":[";
@@ -1073,7 +934,7 @@ std::string core_xrefs_to(const std::string& args) {
     return out.str();
 }
 
-std::string core_xrefs_to_field(const std::string& args) {
+std::string core_xrefs_to_field(const Json& args) {
     std::vector<std::string> queries = json_list_arg(args, "queries");
     std::ostringstream out;
     out << "{\"items\":[";
@@ -1125,7 +986,7 @@ std::string core_xrefs_to_field(const std::string& args) {
     return out.str();
 }
 
-std::string core_callees(const std::string& args) {
+std::string core_callees(const Json& args) {
     std::vector<std::string> addrs = json_list_arg(args, "addrs");
     std::ostringstream out;
     out << "{\"items\":[";
@@ -1160,12 +1021,12 @@ std::string core_callees(const std::string& args) {
     return out.str();
 }
 
-ea_t resolve_addr_or_name(const std::string& object, bool required = true) {
+ea_t resolve_addr_or_name(const Json& object, bool required = true) {
     uint64_t addr = 0;
-    if (optional_json_object_u64_arg(object, "addr", &addr)) {
+    if (optional_json_u64_arg(object, "addr", &addr)) {
         return static_cast<ea_t>(addr);
     }
-    std::string name = json_object_string_arg(object, "name");
+    std::string name = json_string_arg(object, "name");
     if (!name.empty()) {
         return get_name_ea(BADADDR, name.c_str());
     }
@@ -1234,15 +1095,15 @@ std::string paged_result_json(const std::vector<std::string>& rows, uint64_t off
     return out.str();
 }
 
-std::string core_rename(const std::string& args) {
-    std::vector<std::string> items = json_value_items_arg(args, "items");
+std::string core_rename(const Json& args) {
+    std::vector<Json> items = json_items_arg(args, "items");
     std::ostringstream out;
     out << "{\"items\":[";
     bool first = true;
     size_t changed = 0;
     for (const auto& item : items) {
-        std::string kind = json_object_string_arg(item, "kind");
-        std::string new_name = json_object_string_arg(item, "new_name");
+        std::string kind = json_string_arg(item, "kind");
+        std::string new_name = json_string_arg(item, "new_name");
         ea_t ea = BADADDR;
         std::string error;
         bool ok = false;
@@ -1284,15 +1145,15 @@ std::string core_rename(const std::string& args) {
     return out.str();
 }
 
-std::string core_set_comments(const std::string& args) {
-    std::vector<std::string> items = json_value_items_arg(args, "items");
+std::string core_set_comments(const Json& args) {
+    std::vector<Json> items = json_items_arg(args, "items");
     std::ostringstream out;
     out << "{\"items\":[";
     bool first = true;
     size_t changed = 0;
     for (const auto& item : items) {
         ea_t ea = BADADDR;
-        std::string text = json_object_string_arg(item, "text");
+        std::string text = json_string_arg(item, "text");
         bool repeatable = json_bool_arg(item, "repeatable", false);
         bool ok = false;
         std::string error;
@@ -1319,15 +1180,15 @@ std::string core_set_comments(const std::string& args) {
     return out.str();
 }
 
-std::string core_set_type(const std::string& args) {
-    std::vector<std::string> items = json_value_items_arg(args, "items");
+std::string core_set_type(const Json& args) {
+    std::vector<Json> items = json_items_arg(args, "items");
     std::ostringstream out;
     out << "{\"items\":[";
     bool first = true;
     size_t changed = 0;
     for (const auto& item : items) {
-        std::string kind = json_object_string_arg(item, "kind");
-        std::string type_text = json_object_string_arg(item, "type");
+        std::string kind = json_string_arg(item, "kind");
+        std::string type_text = json_string_arg(item, "type");
         ea_t ea = BADADDR;
         bool ok = false;
         std::string error;
@@ -1372,16 +1233,11 @@ std::string core_set_type(const std::string& args) {
     return out.str();
 }
 
-std::string core_declare_type(const std::string& args) {
+std::string core_declare_type(const Json& args) {
     std::vector<std::string> decls;
-    std::string raw_decls = trim_copy(find_json_value(args, "decls"));
-    if (!raw_decls.empty() && raw_decls.front() == '[') {
-        decls = json_list_arg(args, "decls");
-    } else {
-        std::string scalar = unquote_json_string(raw_decls);
-        if (!scalar.empty()) {
-            decls.push_back(scalar);
-        }
+    const Json* raw_decls = json_arg(args, "decls");
+    if (raw_decls != nullptr) {
+        decls = json_list_value(*raw_decls);
     }
     std::ostringstream input;
     for (const auto& decl : decls) {
@@ -1399,7 +1255,7 @@ std::string core_declare_type(const std::string& args) {
         + ",\"errors\":" + std::to_string(errors) + "}";
 }
 
-std::string core_force_recompile(const std::string& args) {
+std::string core_force_recompile(const Json& args) {
     if (!dbgatlas_init_hexrays_plugin()) {
         throw std::runtime_error("Hex-Rays decompiler is not available");
     }
@@ -1436,7 +1292,7 @@ std::string core_force_recompile(const std::string& args) {
     return out.str();
 }
 
-std::string core_idb_save(const std::string& args) {
+std::string core_idb_save(const Json& args) {
     std::string path = json_string_arg(args, "path");
     bool ok = save_database(path.empty() ? nullptr : path.c_str(), 0);
     std::ostringstream out;
@@ -1448,7 +1304,7 @@ std::string core_idb_save(const std::string& args) {
     return out.str();
 }
 
-std::string core_py_eval(const std::string& args) {
+std::string core_py_eval(const Json& args) {
     std::string code = json_string_arg(args, "code");
     if (code.empty()) {
         throw std::invalid_argument("code is required");
@@ -1549,7 +1405,7 @@ bool byte_pattern_matches(ea_t ea, const BytePattern& pattern) {
     return true;
 }
 
-std::string core_find_bytes(const std::string& args) {
+std::string core_find_bytes(const Json& args) {
     std::vector<std::string> patterns = json_list_arg(args, "patterns");
     uint64_t offset = json_u64_arg(args, "offset", 0);
     uint64_t limit = std::min<uint64_t>(json_u64_arg(args, "limit", 100), 10000);
@@ -1619,7 +1475,7 @@ void maybe_add_search_row(std::vector<std::string>* rows, const std::string& sco
     rows->push_back(row.str());
 }
 
-std::string core_search_text(IdaSessionHandleImpl* handle, const std::string& args) {
+std::string core_search_text(IdaSessionHandleImpl* handle, const Json& args) {
     std::string query = json_string_arg(args, "query");
     std::string scope = json_string_arg(args, "scope");
     if (scope.empty()) scope = "all";
@@ -1676,7 +1532,7 @@ std::string core_search_text(IdaSessionHandleImpl* handle, const std::string& ar
     return paged_result_json(rows, offset, count);
 }
 
-std::string core_xref_query(const std::string& args) {
+std::string core_xref_query(const Json& args) {
     std::string target = json_string_arg(args, "target");
     std::string direction = json_string_arg(args, "direction");
     std::string xref_type = json_string_arg(args, "xref_type");
@@ -1719,7 +1575,7 @@ std::string core_xref_query(const std::string& args) {
     return paged_result_json(rows, offset, count);
 }
 
-std::string core_func_query(const std::string& args) {
+std::string core_func_query(const Json& args) {
     std::string filter = to_lower_copy(json_string_arg(args, "filter"));
     std::string name_regex = json_string_arg(args, "name_regex");
     std::string sort_by = json_string_arg(args, "sort_by");
@@ -1729,7 +1585,7 @@ std::string core_func_query(const std::string& args) {
     uint64_t min_size = json_u64_arg(args, "min_size", 0);
     uint64_t max_size = json_u64_arg(args, "max_size", std::numeric_limits<uint64_t>::max());
     bool require_has_type = false;
-    bool has_type_filter = !find_json_value(args, "has_type").empty();
+    bool has_type_filter = json_has_arg(args, "has_type");
     if (has_type_filter) require_has_type = json_bool_arg(args, "has_type", false);
     std::regex regex_filter;
     bool use_regex = false;
@@ -1772,7 +1628,7 @@ std::string core_func_query(const std::string& args) {
     return paged_result_json(json_rows, offset, count);
 }
 
-std::string core_entity_query(IdaSessionHandleImpl* handle, const std::string& args) {
+std::string core_entity_query(IdaSessionHandleImpl* handle, const Json& args) {
     std::string kind = json_string_arg(args, "kind");
     if (kind.empty()) kind = "functions";
     std::string filter = to_lower_copy(json_string_arg(args, "filter"));
@@ -1818,32 +1674,33 @@ std::string core_entity_query(IdaSessionHandleImpl* handle, const std::string& a
 }
 
 std::string execute_core_function(IdaSessionHandleImpl* handle, const std::string& function, const std::string& args) {
-    if (function == "lookup_funcs") return core_lookup_funcs(args);
-    if (function == "int_convert") return core_int_convert(args);
-    if (function == "list_funcs") return core_list_funcs(args);
-    if (function == "list_globals") return core_list_globals(args);
-    if (function == "imports") return core_imports(args);
-    if (function == "list_strings") return core_list_strings(handle, args);
-    if (function == "get_string") return core_get_string(handle, args);
-    if (function == "get_bytes") return core_get_bytes(args);
-    if (function == "get_int") return core_get_int(args);
-    if (function == "decompile") return core_decompile(args);
-    if (function == "disasm") return core_disasm(args);
-    if (function == "xrefs_to") return core_xrefs_to(args);
-    if (function == "xrefs_to_field") return core_xrefs_to_field(args);
-    if (function == "callees") return core_callees(args);
-    if (function == "rename") return core_rename(args);
-    if (function == "set_comments") return core_set_comments(args);
-    if (function == "set_type") return core_set_type(args);
-    if (function == "declare_type") return core_declare_type(args);
-    if (function == "force_recompile") return core_force_recompile(args);
-    if (function == "idb_save") return core_idb_save(args);
-    if (function == "py_eval") return core_py_eval(args);
-    if (function == "find_bytes") return core_find_bytes(args);
-    if (function == "search_text") return core_search_text(handle, args);
-    if (function == "xref_query") return core_xref_query(args);
-    if (function == "func_query") return core_func_query(args);
-    if (function == "entity_query") return core_entity_query(handle, args);
+    Json parsed_args = parse_json_args(args);
+    if (function == "lookup_funcs") return core_lookup_funcs(parsed_args);
+    if (function == "int_convert") return core_int_convert(parsed_args);
+    if (function == "list_funcs") return core_list_funcs(parsed_args);
+    if (function == "list_globals") return core_list_globals(parsed_args);
+    if (function == "imports") return core_imports(parsed_args);
+    if (function == "list_strings") return core_list_strings(handle, parsed_args);
+    if (function == "get_string") return core_get_string(handle, parsed_args);
+    if (function == "get_bytes") return core_get_bytes(parsed_args);
+    if (function == "get_int") return core_get_int(parsed_args);
+    if (function == "decompile") return core_decompile(parsed_args);
+    if (function == "disasm") return core_disasm(parsed_args);
+    if (function == "xrefs_to") return core_xrefs_to(parsed_args);
+    if (function == "xrefs_to_field") return core_xrefs_to_field(parsed_args);
+    if (function == "callees") return core_callees(parsed_args);
+    if (function == "rename") return core_rename(parsed_args);
+    if (function == "set_comments") return core_set_comments(parsed_args);
+    if (function == "set_type") return core_set_type(parsed_args);
+    if (function == "declare_type") return core_declare_type(parsed_args);
+    if (function == "force_recompile") return core_force_recompile(parsed_args);
+    if (function == "idb_save") return core_idb_save(parsed_args);
+    if (function == "py_eval") return core_py_eval(parsed_args);
+    if (function == "find_bytes") return core_find_bytes(parsed_args);
+    if (function == "search_text") return core_search_text(handle, parsed_args);
+    if (function == "xref_query") return core_xref_query(parsed_args);
+    if (function == "func_query") return core_func_query(parsed_args);
+    if (function == "entity_query") return core_entity_query(handle, parsed_args);
     throw std::invalid_argument("unsupported IDA Core Function `" + function + "`");
 }
 
@@ -1927,6 +1784,11 @@ DA_IDA_EXPORT int32_t da_ida_session_open(
         std::string database_path_utf8_copy = utf8_string(database_path_utf8, "database_path");
         if (!is_existing_file(database_path)) {
             return fail(DA_IDA_ERR_INVALID_ARGUMENT, "database_path does not exist or is not a file");
+        }
+        if (is_legacy_ida32_database(database_path)) {
+            return fail(
+                DA_IDA_ERR_INVALID_ARGUMENT,
+                "database_path is a legacy 32-bit IDA database (IDA1); convert it to .i64 with IDA before opening it through DbgAtlas, or pass the original input file");
         }
 
         auto handle = std::make_unique<IdaSessionHandleImpl>();

@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerEnvelope<T> {
@@ -56,22 +56,17 @@ pub enum WorkerRequest {
         session_id: SessionRef,
         ida_install_dir: PathBuf,
         database_path: PathBuf,
-        artifact_dir: PathBuf,
     },
     LookupReverseFunction {
         session_id: SessionRef,
-        operation_id: OperationRef,
         runtime_address: u64,
         runtime_module_base: u64,
         ida_image_base: u64,
-        artifact_dir: PathBuf,
     },
     ReverseCoreFunction {
         session_id: SessionRef,
-        operation_id: OperationRef,
         function: String,
         arguments: Value,
-        artifact_dir: PathBuf,
     },
     CloseReverseSession {
         session_id: SessionRef,
@@ -295,22 +290,15 @@ mod tests {
                 session_id: session_id.clone(),
                 ida_install_dir: PathBuf::from(r"C:\Program Files\IDA Professional 9.3"),
                 database_path: PathBuf::from(r"C:\case\sample.i64"),
-                artifact_dir: PathBuf::from(
-                    r"C:\case\dbgatlas\artifacts\reverse_sessions\session-001",
-                ),
             },
         );
         let lookup = WorkerEnvelope::new(
             "req-rev-lookup",
             WorkerRequest::LookupReverseFunction {
                 session_id: session_id.clone(),
-                operation_id: OperationRef::new(Id::new("op-001").unwrap()),
                 runtime_address: 0x180001234,
                 runtime_module_base: 0x180000000,
                 ida_image_base: 0x140000000,
-                artifact_dir: PathBuf::from(
-                    r"C:\case\dbgatlas\artifacts\reverse_sessions\session-001",
-                ),
             },
         );
         let close = WorkerEnvelope::new(
@@ -331,7 +319,6 @@ mod tests {
             "req-rev-core",
             WorkerRequest::ReverseCoreFunction {
                 session_id: SessionRef::new(Id::new("session-001").unwrap()),
-                operation_id: OperationRef::new(Id::new("op-001").unwrap()),
                 function: "rename".to_string(),
                 arguments: serde_json::json!({
                     "items": [{
@@ -340,9 +327,6 @@ mod tests {
                         "new_name": "dbgatlas_main"
                     }]
                 }),
-                artifact_dir: PathBuf::from(
-                    r"C:\case\dbgatlas\artifacts\reverse_sessions\session-001",
-                ),
             },
         );
 
@@ -454,22 +438,17 @@ mod tests {
                 session_id: session_id.clone(),
                 ida_install_dir: PathBuf::from("ida"),
                 database_path: PathBuf::from("sample.i64"),
-                artifact_dir: PathBuf::from("artifacts"),
             },
             WorkerRequest::LookupReverseFunction {
                 session_id: session_id.clone(),
-                operation_id: operation_id.clone(),
                 runtime_address: 0x180001000,
                 runtime_module_base: 0x180000000,
                 ida_image_base: 0x140000000,
-                artifact_dir: PathBuf::from("artifacts"),
             },
             WorkerRequest::ReverseCoreFunction {
                 session_id: session_id.clone(),
-                operation_id,
                 function: "list_funcs".to_string(),
                 arguments: serde_json::json!({}),
-                artifact_dir: PathBuf::from("artifacts"),
             },
             WorkerRequest::CloseReverseSession {
                 session_id: session_id.clone(),

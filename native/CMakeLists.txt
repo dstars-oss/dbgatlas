@@ -18,10 +18,20 @@ set(DBGATLAS_IDA_SDK_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../3rdpart/cpp/ida-sdk/include"
     CACHE PATH "Vendored IDA SDK include directory"
 )
+set(DBGATLAS_NLOHMANN_JSON_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../3rdpart/cpp/nlohmann-json/include"
+    CACHE PATH "Vendored nlohmann/json include directory"
+)
 if(NOT EXISTS "${DBGATLAS_IDA_SDK_INCLUDE_DIR}/pro.h")
     message(FATAL_ERROR
         "IDA SDK headers are required at ${DBGATLAS_IDA_SDK_INCLUDE_DIR}; "
         "expected pro.h from dstars-oss/ida-sdk v9.3.1-release"
+    )
+endif()
+if(NOT EXISTS "${DBGATLAS_NLOHMANN_JSON_INCLUDE_DIR}/nlohmann/json.hpp")
+    message(FATAL_ERROR
+        "nlohmann/json single header is required at "
+        "${DBGATLAS_NLOHMANN_JSON_INCLUDE_DIR}/nlohmann/json.hpp"
     )
 endif()
 
@@ -69,6 +79,7 @@ target_include_directories(dbgatlas_ida
 target_include_directories(dbgatlas_ida
     SYSTEM PRIVATE
         "${DBGATLAS_IDA_SDK_INCLUDE_DIR}"
+        "${DBGATLAS_NLOHMANN_JSON_INCLUDE_DIR}"
 )
 
 if(WIN32)
