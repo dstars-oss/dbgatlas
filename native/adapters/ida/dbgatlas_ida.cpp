@@ -664,7 +664,7 @@ int idaapi collect_import_cb(ea_t ea, const char* name, uval_t ordinal, void* pa
     return 1;
 }
 
-std::string core_imports(const Json& args) {
+std::string core_list_imports(const Json& args) {
     uint64_t offset = json_u64_arg(args, "offset", 0);
     uint64_t count = std::min<uint64_t>(json_u64_arg(args, "count", 50), 1000);
     std::string filter = json_string_arg(args, "filter");
@@ -1532,7 +1532,7 @@ std::string core_search_text(IdaSessionHandleImpl* handle, const Json& args) {
     return paged_result_json(rows, offset, count);
 }
 
-std::string core_xref_query(const Json& args) {
+std::string core_query_xrefs(const Json& args) {
     std::string target = json_string_arg(args, "target");
     std::string direction = json_string_arg(args, "direction");
     std::string xref_type = json_string_arg(args, "xref_type");
@@ -1575,7 +1575,7 @@ std::string core_xref_query(const Json& args) {
     return paged_result_json(rows, offset, count);
 }
 
-std::string core_func_query(const Json& args) {
+std::string core_query_funcs(const Json& args) {
     std::string filter = to_lower_copy(json_string_arg(args, "filter"));
     std::string name_regex = json_string_arg(args, "name_regex");
     std::string sort_by = json_string_arg(args, "sort_by");
@@ -1628,7 +1628,7 @@ std::string core_func_query(const Json& args) {
     return paged_result_json(json_rows, offset, count);
 }
 
-std::string core_entity_query(IdaSessionHandleImpl* handle, const Json& args) {
+std::string core_query_entities(IdaSessionHandleImpl* handle, const Json& args) {
     std::string kind = json_string_arg(args, "kind");
     if (kind.empty()) kind = "functions";
     std::string filter = to_lower_copy(json_string_arg(args, "filter"));
@@ -1655,7 +1655,7 @@ std::string core_entity_query(IdaSessionHandleImpl* handle, const Json& args) {
             add_if_match(row.str());
         }
     } else if (kind == "imports") {
-        return core_imports(args);
+        return core_list_imports(args);
     } else if (kind == "strings") {
         ensure_string_list(handle);
         size_t qty = get_strlist_qty();
@@ -1679,7 +1679,7 @@ std::string execute_core_function(IdaSessionHandleImpl* handle, const std::strin
     if (function == "int_convert") return core_int_convert(parsed_args);
     if (function == "list_funcs") return core_list_funcs(parsed_args);
     if (function == "list_globals") return core_list_globals(parsed_args);
-    if (function == "imports") return core_imports(parsed_args);
+    if (function == "list_imports") return core_list_imports(parsed_args);
     if (function == "list_strings") return core_list_strings(handle, parsed_args);
     if (function == "get_string") return core_get_string(handle, parsed_args);
     if (function == "get_bytes") return core_get_bytes(parsed_args);
@@ -1698,9 +1698,9 @@ std::string execute_core_function(IdaSessionHandleImpl* handle, const std::strin
     if (function == "py_eval") return core_py_eval(parsed_args);
     if (function == "find_bytes") return core_find_bytes(parsed_args);
     if (function == "search_text") return core_search_text(handle, parsed_args);
-    if (function == "xref_query") return core_xref_query(parsed_args);
-    if (function == "func_query") return core_func_query(parsed_args);
-    if (function == "entity_query") return core_entity_query(handle, parsed_args);
+    if (function == "query_xrefs") return core_query_xrefs(parsed_args);
+    if (function == "query_funcs") return core_query_funcs(parsed_args);
+    if (function == "query_entities") return core_query_entities(handle, parsed_args);
     throw std::invalid_argument("unsupported IDA Core Function `" + function + "`");
 }
 

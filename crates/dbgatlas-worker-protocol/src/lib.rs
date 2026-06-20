@@ -366,7 +366,7 @@ mod tests {
             "req-rev-core",
             WorkerResponse::ReverseCoreFunction {
                 result: ReverseCoreFunctionResult {
-                    function: "imports".to_string(),
+                    function: "list_imports".to_string(),
                     result: serde_json::json!({
                         "offset": 0,
                         "count": 1,

@@ -6,13 +6,17 @@ Function call requires that reverse `session_id`.
 
 ## RPC methods
 
+Canonical reverse method names use verb-first names: `list_*` for paginated
+enumeration, `query_*` for structured filtering/search, and `lookup_*` for
+resolving user-provided addresses or names to concrete IDA entities.
+
 - `reverse.session.open`: `{ project_root, database_path, ida_install_dir? }`
 - `reverse.session.close`: `{ session_id }`
 - `reverse.lookup_funcs`: `{ session_id, queries, runtime_module_base?, ida_image_base? }`
 - `reverse.int_convert`: `{ session_id, inputs }`
 - `reverse.list_funcs`: `{ session_id, offset?, count?, filter? }`
 - `reverse.list_globals`: `{ session_id, offset?, count?, filter? }`
-- `reverse.imports`: `{ session_id, offset?, count?, filter? }`
+- `reverse.list_imports`: `{ session_id, offset?, count?, filter? }`
 - `reverse.list_strings`: `{ session_id, offset?, count?, filter? }`
 - `reverse.get_string`: `{ session_id, addr, length?, type? }`
 - `reverse.get_bytes`: `{ session_id, addr, length }`
@@ -31,9 +35,9 @@ Function call requires that reverse `session_id`.
 - `reverse.py_eval`: `{ session_id, code }`
 - `reverse.find_bytes`: `{ session_id, patterns, offset?, limit? }`
 - `reverse.search_text`: `{ session_id, query, scope?, offset?, limit? }`
-- `reverse.xref_query`: `{ session_id, target, direction?, xref_type?, offset?, limit? }`
-- `reverse.func_query`: `{ session_id, filter?, name_regex?, min_size?, max_size?, has_type?, sort_by?, descending?, offset?, count? }`
-- `reverse.entity_query`: `{ session_id, kind, filter?, fields?, offset?, count? }`
+- `reverse.query_xrefs`: `{ session_id, target, direction?, xref_type?, offset?, limit? }`
+- `reverse.query_funcs`: `{ session_id, filter?, name_regex?, min_size?, max_size?, has_type?, sort_by?, descending?, offset?, count? }`
+- `reverse.query_entities`: `{ session_id, kind, filter?, fields?, offset?, count? }`
 
 List inputs accept either a JSON array or a comma-separated string. Integer inputs accept
 JSON numbers, decimal strings, `0x` hex strings, and `0b` binary strings. `int_convert`

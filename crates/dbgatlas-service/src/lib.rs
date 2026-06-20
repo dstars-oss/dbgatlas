@@ -231,7 +231,7 @@ impl ServiceHost {
             "reverse.int_convert" => self.reverse_core_function("int_convert", request.params),
             "reverse.list_funcs" => self.reverse_core_function("list_funcs", request.params),
             "reverse.list_globals" => self.reverse_core_function("list_globals", request.params),
-            "reverse.imports" => self.reverse_core_function("imports", request.params),
+            "reverse.list_imports" => self.reverse_core_function("list_imports", request.params),
             "reverse.list_strings" => self.reverse_core_function("list_strings", request.params),
             "reverse.get_string" => self.reverse_core_function("get_string", request.params),
             "reverse.get_bytes" => self.reverse_core_function("get_bytes", request.params),
@@ -254,9 +254,11 @@ impl ServiceHost {
             "reverse.py_eval" => self.reverse_py_eval(request.params),
             "reverse.find_bytes" => self.reverse_core_function("find_bytes", request.params),
             "reverse.search_text" => self.reverse_core_function("search_text", request.params),
-            "reverse.xref_query" => self.reverse_core_function("xref_query", request.params),
-            "reverse.func_query" => self.reverse_core_function("func_query", request.params),
-            "reverse.entity_query" => self.reverse_core_function("entity_query", request.params),
+            "reverse.query_xrefs" => self.reverse_core_function("query_xrefs", request.params),
+            "reverse.query_funcs" => self.reverse_core_function("query_funcs", request.params),
+            "reverse.query_entities" => {
+                self.reverse_core_function("query_entities", request.params)
+            }
             "reverse.session.close" => self.reverse_session_close(request.params),
             "recording.start" => self.recording_start(request.params),
             "recording.status" => self.recording_status(request.params),
@@ -345,7 +347,7 @@ impl ServiceHost {
             | "reverse.int_convert"
             | "reverse.list_funcs"
             | "reverse.list_globals"
-            | "reverse.imports"
+            | "reverse.list_imports"
             | "reverse.list_strings"
             | "reverse.get_string"
             | "reverse.get_bytes"
@@ -363,9 +365,9 @@ impl ServiceHost {
             | "reverse.idb_save"
             | "reverse.find_bytes"
             | "reverse.search_text"
-            | "reverse.xref_query"
-            | "reverse.func_query"
-            | "reverse.entity_query"
+            | "reverse.query_xrefs"
+            | "reverse.query_funcs"
+            | "reverse.query_entities"
             | "reverse.session.close" => self.call_mcp_service_tool(name, arguments),
             "reverse.py_eval" => {
                 self.ensure_ida_py_eval_enabled()?;
@@ -3676,7 +3678,7 @@ fn mock_reverse_core_response(
         "int_convert" => mock_int_convert(&arguments),
         "list_funcs" => mock_list_funcs(&arguments)?,
         "list_globals" => mock_list_globals(&arguments)?,
-        "imports" => mock_imports(&arguments)?,
+        "list_imports" => mock_list_imports(&arguments)?,
         "list_strings" => mock_list_strings(&arguments)?,
         "get_string" => mock_get_string(&arguments)?,
         "get_bytes" => mock_get_bytes(&arguments)?,
@@ -3695,9 +3697,9 @@ fn mock_reverse_core_response(
         "py_eval" => mock_py_eval(&arguments),
         "find_bytes" => mock_find_bytes(&arguments)?,
         "search_text" => mock_search_text(&arguments)?,
-        "xref_query" => mock_xref_query(&arguments)?,
-        "func_query" => mock_func_query(&arguments)?,
-        "entity_query" => mock_entity_query(&arguments)?,
+        "query_xrefs" => mock_query_xrefs(&arguments)?,
+        "query_funcs" => mock_query_funcs(&arguments)?,
+        "query_entities" => mock_query_entities(&arguments)?,
         other => {
             return Ok(WorkerResponse::Failed {
                 code: "reverse_core_failed".to_string(),
@@ -3803,7 +3805,7 @@ fn mock_list_globals(arguments: &Value) -> Result<Value, ServiceError> {
     paginate_filtered(rows, arguments)
 }
 
-fn mock_imports(arguments: &Value) -> Result<Value, ServiceError> {
+fn mock_list_imports(arguments: &Value) -> Result<Value, ServiceError> {
     let rows = vec![
         json!({ "module": "KERNEL32.dll", "name": "CreateFileW", "ordinal": Value::Null, "iat_ea": 0x140030000u64 }),
         json!({ "module": "KERNEL32.dll", "name": "ReadFile", "ordinal": Value::Null, "iat_ea": 0x140030008u64 }),
@@ -4086,7 +4088,7 @@ fn mock_search_text(arguments: &Value) -> Result<Value, ServiceError> {
     paginate_filtered(rows, arguments)
 }
 
-fn mock_xref_query(arguments: &Value) -> Result<Value, ServiceError> {
+fn mock_query_xrefs(arguments: &Value) -> Result<Value, ServiceError> {
     let target = arguments.get("target").cloned().unwrap_or(Value::Null);
     let rows = vec![
         json!({
@@ -4107,11 +4109,11 @@ fn mock_xref_query(arguments: &Value) -> Result<Value, ServiceError> {
     paginate_filtered(rows, arguments)
 }
 
-fn mock_func_query(arguments: &Value) -> Result<Value, ServiceError> {
+fn mock_query_funcs(arguments: &Value) -> Result<Value, ServiceError> {
     mock_list_funcs(arguments)
 }
 
-fn mock_entity_query(arguments: &Value) -> Result<Value, ServiceError> {
+fn mock_query_entities(arguments: &Value) -> Result<Value, ServiceError> {
     match arguments
         .get("kind")
         .and_then(Value::as_str)
@@ -4119,10 +4121,10 @@ fn mock_entity_query(arguments: &Value) -> Result<Value, ServiceError> {
     {
         "functions" => mock_list_funcs(arguments),
         "globals" | "names" => mock_list_globals(arguments),
-        "imports" => mock_imports(arguments),
+        "imports" => mock_list_imports(arguments),
         "strings" => mock_list_strings(arguments),
         other => Err(ServiceError::Rpc(format!(
-            "unsupported entity_query kind `{other}`"
+            "unsupported query_entities kind `{other}`"
         ))),
     }
 }
@@ -6308,7 +6310,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             })),
         ),
         mcp_tool(
-            "reverse.imports",
+            "reverse.list_imports",
             "List imported symbols and module names with pagination.",
             mcp_reverse_core_schema(json!({
                 "offset": { "type": "integer" },
@@ -6448,7 +6450,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             ),
         ),
         mcp_tool(
-            "reverse.xref_query",
+            "reverse.query_xrefs",
             "Query cross-references to or from an address or name.",
             mcp_reverse_core_schema_required(
                 json!({
@@ -6462,7 +6464,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             ),
         ),
         mcp_tool(
-            "reverse.func_query",
+            "reverse.query_funcs",
             "Query IDA functions with richer filtering and sorting.",
             mcp_reverse_core_schema(json!({
                 "filter": { "type": "string" },
@@ -6477,7 +6479,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             })),
         ),
         mcp_tool(
-            "reverse.entity_query",
+            "reverse.query_entities",
             "Query IDB entities with filtering and pagination.",
             mcp_reverse_core_schema_required(
                 json!({
@@ -8521,7 +8523,7 @@ allow_py_eval = true
                 json!({ "offset": 0, "count": 2, "filter": "parse" }),
             ),
             ("reverse.list_globals", json!({ "offset": 0, "count": 10 })),
-            ("reverse.imports", json!({ "offset": 1, "count": 1 })),
+            ("reverse.list_imports", json!({ "offset": 1, "count": 1 })),
             (
                 "reverse.list_strings",
                 json!({ "offset": 0, "count": 2, "filter": "config" }),
@@ -8580,15 +8582,15 @@ allow_py_eval = true
                 json!({ "code": "print('hello from dbgatlas')" }),
             ),
             (
-                "reverse.xref_query",
+                "reverse.query_xrefs",
                 json!({ "target": "0x140001000", "direction": "to", "xref_type": "all" }),
             ),
             (
-                "reverse.func_query",
+                "reverse.query_funcs",
                 json!({ "filter": "parse", "sort_by": "name" }),
             ),
             (
-                "reverse.entity_query",
+                "reverse.query_entities",
                 json!({ "kind": "functions", "filter": "main" }),
             ),
         ];
@@ -8606,6 +8608,12 @@ allow_py_eval = true
             assert_eq!(result["operation_status"], "success");
             assert!(result["artifact_refs"].as_array().unwrap().len() == 1);
             assert!(result.get("result").is_some());
+            assert_eq!(
+                result["function"],
+                method
+                    .strip_prefix("reverse.")
+                    .expect("reverse method prefix is present")
+            );
         }
 
         let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
@@ -8623,7 +8631,7 @@ allow_py_eval = true
             "reverse.int_convert",
             "reverse.list_funcs",
             "reverse.list_globals",
-            "reverse.imports",
+            "reverse.list_imports",
             "reverse.list_strings",
             "reverse.get_string",
             "reverse.get_bytes",
@@ -8642,15 +8650,37 @@ allow_py_eval = true
             "reverse.find_bytes",
             "reverse.search_text",
             "reverse.py_eval",
-            "reverse.xref_query",
-            "reverse.func_query",
-            "reverse.entity_query",
+            "reverse.query_xrefs",
+            "reverse.query_funcs",
+            "reverse.query_entities",
         ] {
             assert!(
                 operations
                     .iter()
                     .any(|operation| operation.capability == capability),
                 "{capability} was not recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_core_legacy_names_are_not_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id = open_reverse_session(&host, temp.path());
+
+        for (method, args) in [
+            ("reverse.imports", json!({ "offset": 0, "count": 1 })),
+            ("reverse.xref_query", json!({ "target": "0x140001000" })),
+            ("reverse.func_query", json!({ "filter": "parse" })),
+            ("reverse.entity_query", json!({ "kind": "functions" })),
+        ] {
+            let response = reverse_core_rpc(&host, method, session_id.clone(), args);
+            let error = response.error.expect("legacy method is rejected");
+            assert!(
+                error.message.contains("unknown method"),
+                "{method}: {:?}",
+                error
             );
         }
     }
@@ -9475,7 +9505,7 @@ allow_py_eval = true
             "reverse.int_convert",
             "reverse.list_funcs",
             "reverse.list_globals",
-            "reverse.imports",
+            "reverse.list_imports",
             "reverse.list_strings",
             "reverse.get_string",
             "reverse.get_bytes",
@@ -9493,13 +9523,24 @@ allow_py_eval = true
             "reverse.idb_save",
             "reverse.find_bytes",
             "reverse.search_text",
+            "reverse.query_xrefs",
+            "reverse.query_funcs",
+            "reverse.query_entities",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == tool_name),
+                "{tool_name} tool is listed"
+            );
+        }
+        for legacy_tool_name in [
+            "reverse.imports",
             "reverse.xref_query",
             "reverse.func_query",
             "reverse.entity_query",
         ] {
             assert!(
-                tools.iter().any(|tool| tool["name"] == tool_name),
-                "{tool_name} tool is listed"
+                !tools.iter().any(|tool| tool["name"] == legacy_tool_name),
+                "{legacy_tool_name} legacy tool name is not listed"
             );
         }
         assert!(tools.iter().any(|tool| tool["name"] == "workspace.facts"));
