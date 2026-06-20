@@ -71,6 +71,10 @@ impl RuntimeConfig {
         self.proxy.validate()?;
         Ok(())
     }
+
+    pub fn resolve_tool_paths(&self) -> ResolvedToolPaths {
+        resolve_tool_paths(&self.tools)
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -102,25 +106,15 @@ impl Default for ServerRuntimeConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dbgeng_dir: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttd_dir: Option<PathBuf>,
     #[serde(default)]
     pub ida: IdaRuntimeConfig,
 }
 
 impl ToolRuntimeConfig {
     fn validate(&self) -> Result<(), RuntimeConfigError> {
-        if let Some(path) = &self.dbgeng_dir {
-            validate_path_value(path, "tools.dbgeng_dir")?;
-        }
         if let Some(symbol_path) = &self.symbol_path {
             validate_text_value(symbol_path, "tools.symbol_path")?;
-        }
-        if let Some(path) = &self.ttd_dir {
-            validate_path_value(path, "tools.ttd_dir")?;
         }
         self.ida.validate()
     }
@@ -261,6 +255,232 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedToolPaths {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbgeng: Option<ToolLocation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dbgeng_candidates: Vec<ToolLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttd: Option<ToolLocation>,
+}
+
+impl ResolvedToolPaths {
+    pub fn dbgeng_dir(&self) -> Option<&Path> {
+        self.dbgeng.as_ref().map(|location| location.dir.as_path())
+    }
+
+    pub fn dbgeng_dirs(&self) -> impl Iterator<Item = &Path> {
+        self.dbgeng_candidates
+            .iter()
+            .map(|location| location.dir.as_path())
+    }
+
+    pub fn ttd_dir(&self) -> Option<&Path> {
+        self.ttd.as_ref().map(|location| location.dir.as_path())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolLocation {
+    pub dir: PathBuf,
+    pub source: ToolPathSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPathSource {
+    AppStore,
+    WindowsSdk,
+    System32,
+    DbgEngSibling,
+}
+
+pub fn resolve_tool_paths(_tools: &ToolRuntimeConfig) -> ResolvedToolPaths {
+    let roots = ToolSearchRoots::default();
+    resolve_tool_paths_from_roots(&roots)
+}
+
+fn resolve_tool_paths_from_roots(roots: &ToolSearchRoots) -> ResolvedToolPaths {
+    let dbgeng_candidates = resolve_dbgeng_dirs_from_roots(roots);
+    let dbgeng = dbgeng_candidates.first().cloned();
+    let ttd = resolve_ttd_dir_from_roots(&dbgeng_candidates, roots);
+    ResolvedToolPaths {
+        dbgeng,
+        dbgeng_candidates,
+        ttd,
+    }
+}
+
+#[cfg(test)]
+fn resolve_dbgeng_dir_from_roots(roots: &ToolSearchRoots) -> Option<ToolLocation> {
+    resolve_dbgeng_dirs_from_roots(roots).into_iter().next()
+}
+
+fn resolve_dbgeng_dirs_from_roots(roots: &ToolSearchRoots) -> Vec<ToolLocation> {
+    let mut locations = Vec::new();
+    if let Some(dir) = find_store_dbgeng_dir(&roots.program_files_windows_apps) {
+        push_tool_location(&mut locations, dir, ToolPathSource::AppStore);
+    }
+    if let Some(dir) = find_sdk_dbgeng_dir(&roots.windows_kits_roots) {
+        push_tool_location(&mut locations, dir, ToolPathSource::WindowsSdk);
+    }
+    let system32 = roots.system_root.join("System32");
+    if find_dbgeng_in_dir(&system32).is_some() {
+        push_tool_location(&mut locations, system32, ToolPathSource::System32);
+    }
+    locations
+}
+
+fn push_tool_location(locations: &mut Vec<ToolLocation>, dir: PathBuf, source: ToolPathSource) {
+    if locations.iter().any(|location| location.dir == dir) {
+        return;
+    }
+    locations.push(ToolLocation { dir, source });
+}
+
+fn resolve_ttd_dir_from_roots(
+    dbgeng_candidates: &[ToolLocation],
+    roots: &ToolSearchRoots,
+) -> Option<ToolLocation> {
+    for dbgeng in dbgeng_candidates {
+        if let Some(dir) = find_ttd_in_dir(&dbgeng.dir.join("ttd")) {
+            return Some(ToolLocation {
+                dir,
+                source: ToolPathSource::DbgEngSibling,
+            });
+        }
+    }
+    if let Some(dir) = find_store_ttd_dir(&roots.program_files_windows_apps) {
+        return Some(ToolLocation {
+            dir,
+            source: ToolPathSource::AppStore,
+        });
+    }
+    None
+}
+
+fn find_dbgeng_in_dir(dir: &Path) -> Option<PathBuf> {
+    dir.join("dbgeng.dll").is_file().then(|| dir.to_path_buf())
+}
+
+fn find_ttd_in_dir(dir: &Path) -> Option<PathBuf> {
+    dir.join("TTD.exe").is_file().then(|| dir.to_path_buf())
+}
+
+fn find_store_dbgeng_dir(root: &Path) -> Option<PathBuf> {
+    let mut packages = store_packages(root, "Microsoft.WinDbg");
+    packages.sort();
+    packages.reverse();
+    packages
+        .into_iter()
+        .find_map(|package| find_file_limited(&package, "dbgeng.dll", 4))
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+fn find_store_ttd_dir(root: &Path) -> Option<PathBuf> {
+    let mut packages = store_packages(root, "Microsoft.TimeTravelDebugging");
+    packages.sort();
+    packages.reverse();
+    packages
+        .into_iter()
+        .find_map(|package| find_ttd_in_dir(&package))
+}
+
+fn store_packages(root: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect()
+}
+
+fn find_sdk_dbgeng_dir(roots: &[PathBuf]) -> Option<PathBuf> {
+    let arch = debugger_arch();
+    roots.iter().find_map(|root| {
+        find_dbgeng_in_dir(&root.join("Debuggers").join(arch)).or_else(|| find_dbgeng_in_dir(root))
+    })
+}
+
+fn find_file_limited(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
+    if max_depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
+        {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_limited(&path, file_name, max_depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn debugger_arch() -> &'static str {
+    if cfg!(target_arch = "x86") {
+        "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    }
+}
+
+#[derive(Debug)]
+struct ToolSearchRoots {
+    program_files_windows_apps: PathBuf,
+    windows_kits_roots: Vec<PathBuf>,
+    system_root: PathBuf,
+}
+
+impl Default for ToolSearchRoots {
+    fn default() -> Self {
+        let program_files = std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+        let program_files_x86 = std::env::var_os("ProgramFiles(x86)")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"));
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let mut windows_kits_roots = Vec::new();
+        for key in [
+            "WindowsSdkDir",
+            "WDKContentRoot",
+            "WindowsSDK_ExecutablePath_x64",
+        ] {
+            if let Some(path) = std::env::var_os(key).map(PathBuf::from) {
+                windows_kits_roots.push(path);
+            }
+        }
+        windows_kits_roots.push(program_files_x86.join("Windows Kits").join("10"));
+        windows_kits_roots.push(program_files.join("Windows Kits").join("10"));
+        Self {
+            program_files_windows_apps: program_files.join("WindowsApps"),
+            windows_kits_roots,
+            system_root,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +512,29 @@ mode = "none"
         let encoded = toml::to_string(&config).unwrap();
         assert!(!encoded.contains("workspace_id"));
         assert!(!encoded.contains("dbgatlas-workspace"));
+    }
+
+    #[test]
+    fn ignores_legacy_local_debug_tool_paths() {
+        let config = RuntimeConfig::from_toml_str(
+            r#"
+version = 1
+
+[tools]
+dbgeng_dir = "C:\\stale\\windbg"
+ttd_dir = "C:\\stale\\ttd"
+symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.tools.symbol_path.as_deref(),
+            Some("srv*C:\\symbols*https://msdl.microsoft.com/download/symbols")
+        );
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(!encoded.contains("dbgeng_dir"));
+        assert!(!encoded.contains("ttd_dir"));
     }
 
     #[test]
@@ -362,5 +605,104 @@ BAD_PROXY = "http://127.0.0.1:7897"
         .unwrap_err();
 
         assert!(matches!(error, RuntimeConfigError::UnsupportedProxyKey(_)));
+    }
+
+    #[test]
+    fn resolves_dbgeng_precedence_from_store_sdk_system32() {
+        let root = unique_test_dir("runtime-dbgeng-resolver");
+        let apps = root.join("WindowsApps");
+        let sdk = root.join("Windows Kits").join("10");
+        let system_root = root.join("Windows");
+
+        touch(
+            apps.join("Microsoft.WinDbg_2.0.0.0_x64__8wekyb3d8bbwe")
+                .join("amd64")
+                .join("dbgeng.dll"),
+        );
+        touch(
+            sdk.join("Debuggers")
+                .join(debugger_arch())
+                .join("dbgeng.dll"),
+        );
+        touch(system_root.join("System32").join("dbgeng.dll"));
+
+        let roots = ToolSearchRoots {
+            program_files_windows_apps: apps.clone(),
+            windows_kits_roots: vec![sdk.clone()],
+            system_root: system_root.clone(),
+        };
+        let store_location = resolve_dbgeng_dir_from_roots(&roots).unwrap();
+        assert_eq!(store_location.source, ToolPathSource::AppStore);
+
+        let candidates = resolve_dbgeng_dirs_from_roots(&roots);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|location| location.source)
+                .collect::<Vec<_>>(),
+            vec![
+                ToolPathSource::AppStore,
+                ToolPathSource::WindowsSdk,
+                ToolPathSource::System32,
+            ]
+        );
+
+        let roots_without_store = ToolSearchRoots {
+            program_files_windows_apps: root.join("missing-apps"),
+            windows_kits_roots: vec![sdk.clone()],
+            system_root: system_root.clone(),
+        };
+        let sdk_location = resolve_dbgeng_dir_from_roots(&roots_without_store).unwrap();
+        assert_eq!(sdk_location.source, ToolPathSource::WindowsSdk);
+
+        let system32_location = resolve_dbgeng_dir_from_roots(&ToolSearchRoots {
+            program_files_windows_apps: root.join("missing-apps"),
+            windows_kits_roots: vec![root.join("missing-sdk")],
+            system_root,
+        })
+        .unwrap();
+        assert_eq!(system32_location.source, ToolPathSource::System32);
+    }
+
+    #[test]
+    fn resolves_ttd_precedence_from_dbgeng_sibling_then_store() {
+        let root = unique_test_dir("runtime-ttd-resolver");
+        let dbgeng = root.join("dbgeng");
+        let apps = root.join("WindowsApps");
+
+        touch(dbgeng.join("ttd").join("TTD.exe"));
+        touch(
+            apps.join("Microsoft.TimeTravelDebugging_2.0.0.0_x64__8wekyb3d8bbwe")
+                .join("TTD.exe"),
+        );
+        let dbgeng_candidates = vec![ToolLocation {
+            dir: dbgeng.clone(),
+            source: ToolPathSource::AppStore,
+        }];
+
+        let roots = ToolSearchRoots {
+            program_files_windows_apps: apps.clone(),
+            windows_kits_roots: Vec::new(),
+            system_root: root.join("Windows"),
+        };
+
+        let sibling_location = resolve_ttd_dir_from_roots(&dbgeng_candidates, &roots).unwrap();
+        assert_eq!(sibling_location.source, ToolPathSource::DbgEngSibling);
+        assert_eq!(sibling_location.dir, dbgeng.join("ttd"));
+
+        let store_location = resolve_ttd_dir_from_roots(&[], &roots).unwrap();
+        assert_eq!(store_location.source, ToolPathSource::AppStore);
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test root");
+        root
+    }
+
+    fn touch(path: PathBuf) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, b"").expect("touch file");
     }
 }

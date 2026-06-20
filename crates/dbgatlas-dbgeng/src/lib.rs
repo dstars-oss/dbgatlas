@@ -19,12 +19,16 @@ pub enum DbgEngError {
     NullSessionHandle,
     #[error("native returned a null text pointer")]
     NullText,
-    #[error("dump path must not be empty")]
+    #[error("debug file path must not be empty")]
     EmptyPath,
     #[error("attach pid must be greater than zero")]
     InvalidPid,
-    #[error("dump path must be valid UTF-8")]
+    #[error("debug file path must be valid UTF-8")]
     NonUtf8Path,
+    #[error("DbgEng runtime directory must be valid UTF-8")]
+    NonUtf8RuntimePath,
+    #[error("DbgEng runtime candidates failed: {0}")]
+    RuntimeCandidatesFailed(String),
     #[error("debug command must not be empty")]
     EmptyCommand,
     #[error("symbol path must not be empty")]
@@ -49,33 +53,140 @@ pub struct DbgEngSession {
 
 impl DbgEngSession {
     #[cfg(windows)]
-    pub fn open_dump(path: impl AsRef<Path>) -> Result<Self, DbgEngError> {
+    pub fn open_file(
+        path: impl AsRef<Path>,
+        dbgeng_dir: Option<&Path>,
+    ) -> Result<Self, DbgEngError> {
+        load_runtime(dbgeng_dir)?;
         let path = path_to_cstring(path.as_ref())?;
         let mut handle = std::ptr::null_mut();
         let status =
-            unsafe { dbgatlas_dbgeng_sys::da_dbgeng_session_open_dump(path.as_ptr(), &mut handle) };
+            unsafe { dbgatlas_dbgeng_sys::da_dbgeng_session_open_file(path.as_ptr(), &mut handle) };
         session_from_status(handle, status)
     }
 
+    #[cfg(windows)]
+    pub fn open_file_with_runtimes(
+        path: impl AsRef<Path>,
+        dbgeng_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, DbgEngError> {
+        let path = path_to_cstring(path.as_ref())?;
+        if dbgeng_dirs.is_empty() {
+            load_runtime(None)?;
+            let mut handle = std::ptr::null_mut();
+            let status = unsafe {
+                dbgatlas_dbgeng_sys::da_dbgeng_session_open_file(path.as_ptr(), &mut handle)
+            };
+            return session_from_status(handle, status);
+        }
+
+        let mut errors = Vec::new();
+        for dbgeng_dir in dbgeng_dirs {
+            match load_runtime(Some(dbgeng_dir.as_path())) {
+                Ok(()) => {
+                    let mut handle = std::ptr::null_mut();
+                    let status = unsafe {
+                        dbgatlas_dbgeng_sys::da_dbgeng_session_open_file(path.as_ptr(), &mut handle)
+                    };
+                    return session_from_status(handle, status).map_err(|error| {
+                        DbgEngError::RuntimeCandidatesFailed(format!(
+                            "{}: {error}",
+                            dbgeng_dir.display()
+                        ))
+                    });
+                }
+                Err(error) => errors.push(format!("{}: {error}", dbgeng_dir.display())),
+            }
+        }
+        Err(DbgEngError::RuntimeCandidatesFailed(errors.join("; ")))
+    }
+
     #[cfg(not(windows))]
-    pub fn open_dump(path: impl AsRef<Path>) -> Result<Self, DbgEngError> {
+    pub fn open_file(
+        path: impl AsRef<Path>,
+        _dbgeng_dir: Option<&Path>,
+    ) -> Result<Self, DbgEngError> {
+        path_to_cstring(path.as_ref())?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(windows))]
+    pub fn open_file_with_runtimes(
+        path: impl AsRef<Path>,
+        _dbgeng_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, DbgEngError> {
         path_to_cstring(path.as_ref())?;
         Err(DbgEngError::UnsupportedPlatform)
     }
 
     #[cfg(windows)]
     pub fn attach(pid: u32) -> Result<Self, DbgEngError> {
+        Self::attach_with_runtime(pid, None)
+    }
+
+    #[cfg(not(windows))]
+    pub fn attach(pid: u32) -> Result<Self, DbgEngError> {
+        Self::attach_with_runtime(pid, None)
+    }
+
+    #[cfg(windows)]
+    pub fn attach_with_runtime(pid: u32, dbgeng_dir: Option<&Path>) -> Result<Self, DbgEngError> {
         if pid == 0 {
             return Err(DbgEngError::InvalidPid);
         }
+        load_runtime(dbgeng_dir)?;
         let mut handle = std::ptr::null_mut();
         let status =
             unsafe { dbgatlas_dbgeng_sys::da_dbgeng_session_attach_process(pid, &mut handle) };
         session_from_status(handle, status)
     }
 
+    #[cfg(windows)]
+    pub fn attach_with_runtimes(
+        pid: u32,
+        dbgeng_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, DbgEngError> {
+        if pid == 0 {
+            return Err(DbgEngError::InvalidPid);
+        }
+        if dbgeng_dirs.is_empty() {
+            return Self::attach_with_runtime(pid, None);
+        }
+
+        let mut errors = Vec::new();
+        for dbgeng_dir in dbgeng_dirs {
+            match load_runtime(Some(dbgeng_dir.as_path())) {
+                Ok(()) => {
+                    let mut handle = std::ptr::null_mut();
+                    let status = unsafe {
+                        dbgatlas_dbgeng_sys::da_dbgeng_session_attach_process(pid, &mut handle)
+                    };
+                    return session_from_status(handle, status).map_err(|error| {
+                        DbgEngError::RuntimeCandidatesFailed(format!(
+                            "{}: {error}",
+                            dbgeng_dir.display()
+                        ))
+                    });
+                }
+                Err(error) => errors.push(format!("{}: {error}", dbgeng_dir.display())),
+            }
+        }
+        Err(DbgEngError::RuntimeCandidatesFailed(errors.join("; ")))
+    }
+
     #[cfg(not(windows))]
-    pub fn attach(pid: u32) -> Result<Self, DbgEngError> {
+    pub fn attach_with_runtime(pid: u32, _dbgeng_dir: Option<&Path>) -> Result<Self, DbgEngError> {
+        if pid == 0 {
+            return Err(DbgEngError::InvalidPid);
+        }
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(windows))]
+    pub fn attach_with_runtimes(
+        pid: u32,
+        _dbgeng_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, DbgEngError> {
         if pid == 0 {
             return Err(DbgEngError::InvalidPid);
         }
@@ -239,6 +350,20 @@ fn release_view(owner: *mut std::ffi::c_void) {
 }
 
 #[cfg(windows)]
+fn load_runtime(dbgeng_dir: Option<&Path>) -> Result<(), DbgEngError> {
+    let runtime = match dbgeng_dir {
+        Some(path) => Some(runtime_path_to_cstring(path)?),
+        None => None,
+    };
+    let ptr = runtime
+        .as_ref()
+        .map(|path| path.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let status = unsafe { dbgatlas_dbgeng_sys::da_dbgeng_load_runtime(ptr) };
+    status_to_result(status)
+}
+
+#[cfg(windows)]
 fn last_error() -> String {
     let mut required = 0usize;
     let _ = unsafe {
@@ -269,6 +394,17 @@ fn path_to_cstring(path: &Path) -> Result<std::ffi::CString, DbgEngError> {
         return Err(DbgEngError::EmptyPath);
     }
     let path = path.as_os_str().to_str().ok_or(DbgEngError::NonUtf8Path)?;
+    std::ffi::CString::new(path).map_err(Into::into)
+}
+
+fn runtime_path_to_cstring(path: &Path) -> Result<std::ffi::CString, DbgEngError> {
+    if path.as_os_str().is_empty() {
+        return Err(DbgEngError::EmptyPath);
+    }
+    let path = path
+        .as_os_str()
+        .to_str()
+        .ok_or(DbgEngError::NonUtf8RuntimePath)?;
     std::ffi::CString::new(path).map_err(Into::into)
 }
 
@@ -315,30 +451,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_dump_path() {
+    fn rejects_empty_file_path() {
         assert!(matches!(
-            DbgEngSession::open_dump(std::path::PathBuf::new()),
+            DbgEngSession::open_file(std::path::PathBuf::new(), None),
             Err(DbgEngError::EmptyPath)
         ));
     }
 
     #[test]
-    fn rejects_dump_path_with_nul() {
+    fn rejects_file_path_with_nul() {
         assert!(matches!(
-            DbgEngSession::open_dump(std::path::PathBuf::from("bad\0path")),
+            DbgEngSession::open_file(std::path::PathBuf::from("bad\0path"), None),
             Err(DbgEngError::InteriorNul(_))
         ));
     }
 
     #[cfg(windows)]
     #[test]
-    fn rejects_non_utf8_dump_path() {
+    fn rejects_non_utf8_file_path() {
         use std::ffi::OsString;
         use std::os::windows::ffi::OsStringExt;
 
         let path = std::path::PathBuf::from(OsString::from_wide(&[0xD800]));
         assert!(matches!(
-            DbgEngSession::open_dump(path),
+            DbgEngSession::open_file(path, None),
             Err(DbgEngError::NonUtf8Path)
         ));
     }
@@ -393,9 +529,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn opening_missing_dump_reports_native_failure() {
+    fn opening_missing_file_reports_native_failure() {
         let _guard = dbgeng_session_test_guard();
-        let error = DbgEngSession::open_dump("dbgatlas-missing-sample.dmp").unwrap_err();
+        let error = DbgEngSession::open_file("dbgatlas-missing-sample.dmp", None).unwrap_err();
         assert!(matches!(error, DbgEngError::Native { .. }));
     }
 
@@ -409,7 +545,7 @@ mod tests {
         let dump_path = temp.path().join("self.dmp");
         write_current_process_minidump(&dump_path);
 
-        let session = DbgEngSession::open_dump(&dump_path).unwrap();
+        let session = DbgEngSession::open_file(&dump_path, None).unwrap();
         let output = session.execute(".echo dbgatlas-probe").unwrap();
         assert!(output.contains("dbgatlas-probe"));
 

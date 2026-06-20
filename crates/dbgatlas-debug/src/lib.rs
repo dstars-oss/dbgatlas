@@ -30,7 +30,7 @@ pub enum DebugError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DebugTarget {
-    Dump {
+    File {
         path: PathBuf,
     },
     Attach {
@@ -45,7 +45,7 @@ pub enum DebugTarget {
 impl DebugTarget {
     pub fn validate(self) -> Result<Self, DebugError> {
         match self {
-            Self::Dump { path } => validate_path(&path).map(|path| Self::Dump { path }),
+            Self::File { path } => validate_path(&path).map(|path| Self::File { path }),
             Self::Attach { pid } => validate_attach_pid(pid),
             Self::Launch { executable, args } => validate_launch_target(&executable, args),
         }
@@ -250,6 +250,21 @@ mod tests {
     }
 
     #[test]
+    fn file_target_round_trips_and_dump_kind_is_rejected() {
+        let target = DebugTarget::File {
+            path: PathBuf::from(r"C:\traces\sample.run"),
+        };
+        let json = serde_json::to_value(&target).unwrap();
+        assert_eq!(json["kind"], "file");
+        let restored: DebugTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, target);
+
+        assert!(
+            serde_json::from_str::<DebugTarget>(r#"{"kind":"dump","path":"sample.dmp"}"#).is_err()
+        );
+    }
+
+    #[test]
     fn rejects_empty_debug_command() {
         let request = EvalDebugCommand {
             session_id: SessionRef::new(Id::new("session-001").unwrap()),
@@ -292,7 +307,7 @@ mod tests {
             Err(DebugError::InvalidPid)
         ));
         assert!(matches!(
-            DebugTarget::Dump {
+            DebugTarget::File {
                 path: PathBuf::new()
             }
             .validate(),

@@ -409,7 +409,7 @@ mod tests {
         let requests = vec![
             WorkerRequest::StartDebugSession {
                 session_id: session_id.clone(),
-                target: DebugTarget::Dump {
+                target: DebugTarget::File {
                     path: PathBuf::from("sample.dmp"),
                 },
                 artifact_dir: PathBuf::from("artifacts"),

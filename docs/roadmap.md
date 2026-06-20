@@ -24,7 +24,7 @@
 
 - per-session worker skeleton。
 - debug session create/close/cancel/kill。
-- open dump。
+- open DbgEng-supported debug files such as `.dmp` and `.run`。
 - attach process。
 - execute raw WinDbg command。
 - capture command output。

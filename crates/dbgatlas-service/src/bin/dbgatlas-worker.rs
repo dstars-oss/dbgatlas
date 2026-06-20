@@ -1,6 +1,9 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use dbgatlas_dbgeng::DbgEngSession;
 use dbgatlas_debug::{DebugCommandResult, DebugMemoryResult, DebugSessionState, DebugTarget};
 use dbgatlas_model::{OperationRef, SessionRef, Timestamp};
+use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
     ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
     WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
@@ -21,7 +24,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = WorkerArgs::parse()?;
     let mut pipe = open_pipe(&args.pipe)?;
-    let mut state = WorkerState::new(args.session_id.clone());
+    let mut state = WorkerState::new(args.session_id.clone(), args.dbgeng_dirs);
     loop {
         let line = read_jsonl_line(&mut pipe)?;
         let request: WorkerEnvelope<WorkerRequest> = decode_jsonl(&line)?;
@@ -47,6 +50,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct WorkerArgs {
     pipe: String,
     session_id: String,
+    dbgeng_dirs: Vec<PathBuf>,
 }
 
 impl WorkerArgs {
@@ -54,30 +58,49 @@ impl WorkerArgs {
         let mut args = std::env::args().skip(1);
         let mut pipe = None;
         let mut session_id = None;
+        let mut dbgeng_dirs = Vec::new();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--pipe" => pipe = args.next(),
                 "--session-id" => session_id = args.next(),
+                "--dbgeng-dir" => {
+                    dbgeng_dirs.push(
+                        args.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "missing --dbgeng-dir value".to_string())?,
+                    );
+                }
                 other => return Err(format!("unsupported argument `{other}`")),
             }
         }
         Ok(Self {
             pipe: pipe.ok_or_else(|| "missing --pipe".to_string())?,
             session_id: session_id.ok_or_else(|| "missing --session-id".to_string())?,
+            dbgeng_dirs,
         })
     }
 }
 
 struct WorkerState {
     expected_session_id: String,
+    dbgeng_dirs: Vec<PathBuf>,
     session: Option<DbgEngSession>,
     reverse_session: Option<dbgatlas_ida::IdaSession>,
 }
 
 impl WorkerState {
-    fn new(expected_session_id: String) -> Self {
+    fn new(expected_session_id: String, mut dbgeng_dirs: Vec<PathBuf>) -> Self {
+        if dbgeng_dirs.is_empty() {
+            dbgeng_dirs = RuntimeConfig::default()
+                .resolve_tool_paths()
+                .dbgeng_candidates
+                .into_iter()
+                .map(|location| location.dir)
+                .collect();
+        }
         Self {
             expected_session_id,
+            dbgeng_dirs,
             session: None,
             reverse_session: None,
         }
@@ -203,8 +226,12 @@ impl WorkerState {
 
     fn start_session(&mut self, target: DebugTarget, artifact_dir: &Path) -> WorkerResponse {
         let opened = match target {
-            DebugTarget::Dump { path } => DbgEngSession::open_dump(path),
-            DebugTarget::Attach { pid } => DbgEngSession::attach(pid),
+            DebugTarget::File { path } => {
+                DbgEngSession::open_file_with_runtimes(path, &self.dbgeng_dirs)
+            }
+            DebugTarget::Attach { pid } => {
+                DbgEngSession::attach_with_runtimes(pid, &self.dbgeng_dirs)
+            }
             DebugTarget::Launch { .. } => {
                 return WorkerResponse::failed(
                     "unsupported_target",
@@ -545,7 +572,7 @@ mod tests {
 
     #[test]
     fn worker_rejects_session_mismatch() {
-        let mut state = WorkerState::new("session-expected".to_string());
+        let mut state = WorkerState::new("session-expected".to_string(), Vec::new());
         let response = state.handle_request(WorkerRequest::CloseSession {
             session_id: session_ref("session-other"),
         });
@@ -561,7 +588,7 @@ mod tests {
 
     #[test]
     fn worker_reports_unknown_reverse_session() {
-        let mut state = WorkerState::new("session-001".to_string());
+        let mut state = WorkerState::new("session-001".to_string(), Vec::new());
         let response = state.handle_request(WorkerRequest::LookupReverseFunction {
             session_id: session_ref("session-001"),
             runtime_address: 0x180001000,
@@ -583,7 +610,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("sample.i64");
         fs::write(&database, b"sample").unwrap();
-        let mut state = WorkerState::new("session-001".to_string());
+        let mut state = WorkerState::new("session-001".to_string(), Vec::new());
         let response = state.handle_request(WorkerRequest::OpenReverseSession {
             session_id: session_ref("session-001"),
             ida_install_dir: temp.path().join("missing-ida"),

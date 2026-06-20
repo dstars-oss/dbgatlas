@@ -83,7 +83,6 @@ target_include_directories(dbgatlas_ida
 )
 
 if(WIN32)
-    target_link_libraries(dbgatlas_dbgeng PRIVATE DbgEng)
     target_link_libraries(dbgatlas_etw PRIVATE Advapi32 Tdh Ole32 OleAut32 uuid)
 endif()
 

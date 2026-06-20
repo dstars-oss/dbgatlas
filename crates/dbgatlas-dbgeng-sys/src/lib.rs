@@ -46,13 +46,14 @@ pub struct DA_DbgEngSessionHandle {
 #[link(name = "dbgatlas_dbgeng")]
 unsafe extern "C" {
     pub fn da_dbgeng_abi_version(out: *mut DA_DbgEngVersion) -> i32;
+    pub fn da_dbgeng_load_runtime(dbgeng_dir_utf8: *const c_char) -> i32;
     pub fn da_dbgeng_release_view(owner: *mut c_void);
     pub fn da_dbgeng_last_error(
         buffer: *mut c_char,
         buffer_len: usize,
         required_len: *mut usize,
     ) -> i32;
-    pub fn da_dbgeng_session_open_dump(
+    pub fn da_dbgeng_session_open_file(
         path_utf8: *const c_char,
         out_handle: *mut *mut DA_DbgEngSessionHandle,
     ) -> i32;

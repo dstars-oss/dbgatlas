@@ -22,11 +22,9 @@ analysis-workspace/
 
 `dbgatlas-runtime` 第一版只定义类型、解析入口和校验。配置项包括：
 
-- `tools.dbgeng_dir`
 - `tools.symbol_path`
 - `tools.etw.adapter_dir` 或等价 native ETW adapter 位置（MVP 3 规划）
 - `tools.etw.default_presets`（MVP 3 规划）
-- `tools.ttd_dir`
 - `tools.ida.install_dir`
 - `tools.ida.python_executable`
 - `tools.ida.vendor_src_dir`（历史兼容配置；IDA native adapter 现在使用仓库内固定的 IDA SDK header 快照构建，运行时打开 reverse session 不依赖该配置路径）
@@ -57,11 +55,20 @@ analysis-workspace/
 
 SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe`，不指向开发目录下的 `target\debug` 或 `target\release`。`dbgatlas service install` 从当前 executable 所在目录复制 runtime payload；若发现旧布局中的 `%ProgramData%\DbgAtlas\runtime.toml` 或 `%ProgramData%\DbgAtlas\token`，会迁移到 `etc\`。`dbgatlas service uninstall` 默认只删除 `bin\` 和 SCM entry，保留 `etc\` 与 `var\log\`，`--purge` 才删除整个 install root。
 
-安装态 service 还暴露 `service.update` JSON-RPC/MCP 方法，接收一个已经构建好的 payload 目录。该方法只完成校验并启动独立 updater 进程，然后异步返回 accepted；updater 会先复制到 `bin.next-*`，停止服务，使用 rename 将旧 `bin` 移到 `bin.old-*` 并把新 payload 放到 `bin`，最后按请求重启服务并 best-effort 清理旧目录。更新结果写入 service 日志。
+安装态 service 还暴露 `service.update` JSON-RPC/MCP 方法，接收一个已经构建好的 payload 目录。该方法只完成校验并启动独立 updater 进程，然后异步返回 accepted；updater 会先复制到 `bin.next-*`，停止服务，使用 rename 将旧 `bin` 移到 `bin.old-*` 并把新 payload 放到 `bin`，最后按请求重启服务并 best-effort 清理旧目录。payload 根目录的 `runtime.toml` 或 `etc/runtime.toml` 会在校验通过后覆盖安装态 `etc/runtime.toml`；payload 中的 `token` 不会复制，安装态 token 始终保留。payload `runtime.toml` 本身也不得包含 `token` / `token_file` / `bearer_token` 等 token 字段。更新结果写入 service 日志。
 
 安装态 service 日志写入 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 
 开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。开发态如需暴露高权限 IDAPython 执行能力，必须显式传入 `--allow-ida-py-eval`。
+
+DbgEng / TTD 路径解析不读取 runtime config 或环境变量中的本地安装路径。安装态 debug worker 默认使用 LocalSystem，由运行时按当前机器状态自动发现候选，避免把 Store WinDbg 的版本化 WindowsApps 路径写死到 `runtime.toml`。
+
+- DbgEng：Store WinDbg -> Windows Kits / WDK Debuggers -> System32。
+- TTD：按 DbgEng 候选顺序查找 `<dbgeng_dir>\ttd` -> Store TimeTravelDebugging。
+
+debug worker 会按解析顺序接收 DbgEng 候选目录，并在 `LoadLibrary` 失败时尝试下一个候选。打开 `.run` 时，每个候选会进入独立 worker 尝试，因此 Store 版不支持或不可加载时可以降级到 SDK，再降级到 System32；`dbgeng.dll` 一旦在某个进程内成功加载，就不在同一进程内切换版本。
+
+`dbgatlas service install` 创建新的 `runtime.toml` 时不写入自动发现的 DbgEng / TTD 路径。`service.update` 可用 payload 中的 `runtime.toml` 覆盖已有 config，但不会覆盖安装态 token；payload `runtime.toml` 不得包含已移除的 `tools.dbgeng_dir` / `tools.ttd_dir` 字段。升级前已有 config 中的这些旧字段会被运行时忽略。
 
 ## Recording Runtime
 
@@ -75,7 +82,7 @@ recording policy 的文档目标：
 - attach 不回填历史，只记录 `recording.start` 之后的事件。
 - WPR/WPAExport 不作为主采集链路，只作为未来诊断、比对或 fallback 方向。
 
-安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。IDA reverse worker 使用 active interactive session 用户，不使用 LocalSystem fallback。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
+安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。安装态 debug worker 默认使用 LocalSystem；IDA reverse worker 使用 active interactive session 用户，不使用 LocalSystem fallback。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
 
 ## 校验原则
 

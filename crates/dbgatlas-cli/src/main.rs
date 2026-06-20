@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dbgatlas_debug::DebugTarget;
-use dbgatlas_recording::RecordingTarget;
+use dbgatlas_recording::{
+    RecordingTarget, TtdRecordMode, TtdRecordingOptions, TtdReplayCpuSupport, TtdTarget,
+};
 use dbgatlas_service::{
     DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     ServiceConfig, ServiceHost, WindowsServiceApplyUpdateOptions, WindowsServiceInstallOptions,
@@ -197,7 +199,7 @@ enum DebugSessionCommand {
         #[arg(long)]
         project_root: PathBuf,
         #[arg(long)]
-        dump: Option<PathBuf>,
+        file: Option<PathBuf>,
         #[arg(long)]
         attach: Option<u32>,
         #[arg(long)]
@@ -230,6 +232,42 @@ enum RecordingCommand {
         launch: Option<PathBuf>,
         #[arg(long)]
         attach: Option<u32>,
+        #[arg(last = true)]
+        args: Vec<String>,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Ttd {
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        launch: Option<PathBuf>,
+        #[arg(long)]
+        attach: Option<u32>,
+        #[arg(long)]
+        monitor: Option<PathBuf>,
+        #[arg(long)]
+        cmd_line_filter: Option<String>,
+        #[arg(long)]
+        timeout_ms: u64,
+        #[arg(long)]
+        accept_eula: bool,
+        #[arg(long)]
+        children: bool,
+        #[arg(long)]
+        ring: bool,
+        #[arg(long, default_value_t = 2048)]
+        max_file_mb: u32,
+        #[arg(long = "module")]
+        modules: Vec<String>,
+        #[arg(long, default_value = "automatic")]
+        record_mode: String,
+        #[arg(long, default_value = "default")]
+        replay_cpu_support: String,
+        #[arg(long)]
+        show_ui: bool,
         #[arg(last = true)]
         args: Vec<String>,
         #[arg(long)]
@@ -559,18 +597,18 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
     match command {
         DebugSessionCommand::Create {
             project_root,
-            dump,
+            file,
             attach,
             endpoint,
             token,
         } => {
             let project_root = absolute_path(project_root)?;
-            let target = match (dump, attach) {
-                (Some(path), None) => serde_json::to_value(DebugTarget::Dump {
+            let target = match (file, attach) {
+                (Some(path), None) => serde_json::to_value(DebugTarget::File {
                     path: std::fs::canonicalize(path)?,
                 })?,
                 (None, Some(pid)) => serde_json::to_value(DebugTarget::Attach { pid })?,
-                _ => anyhow::bail!("provide exactly one of --dump or --attach"),
+                _ => anyhow::bail!("provide exactly one of --file or --attach"),
             };
             let response = call_service(
                 endpoint,
@@ -627,6 +665,71 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
                 json!({
                     "project_root": project_root,
                     "target": target,
+                }),
+            )?;
+            print_rpc_response(response, as_json)
+        }
+        RecordingCommand::Ttd {
+            project_root,
+            launch,
+            attach,
+            monitor,
+            cmd_line_filter,
+            timeout_ms,
+            accept_eula,
+            children,
+            ring,
+            max_file_mb,
+            modules,
+            record_mode,
+            replay_cpu_support,
+            show_ui,
+            args,
+            endpoint,
+            token,
+        } => {
+            let project_root = absolute_path(project_root)?;
+            let target = match (launch, attach, monitor) {
+                (Some(executable), None, None) => serde_json::to_value(TtdTarget::Launch {
+                    executable: absolute_path(executable)?,
+                    args,
+                })?,
+                (None, Some(pid), None) => {
+                    if !args.is_empty() {
+                        anyhow::bail!("--attach does not accept launch args");
+                    }
+                    serde_json::to_value(TtdTarget::Attach { pid })?
+                }
+                (None, None, Some(program)) => {
+                    if !args.is_empty() {
+                        anyhow::bail!("--monitor does not accept launch args");
+                    }
+                    serde_json::to_value(TtdTarget::Monitor {
+                        program,
+                        cmd_line_filter,
+                    })?
+                }
+                _ => anyhow::bail!("provide exactly one of --launch, --attach, or --monitor"),
+            };
+            let options = TtdRecordingOptions {
+                children,
+                no_ui: !show_ui,
+                accept_eula,
+                ring,
+                max_file_mb,
+                modules,
+                record_mode: parse_ttd_record_mode(&record_mode)?,
+                replay_cpu_support: parse_ttd_replay_cpu_support(&replay_cpu_support)?,
+            };
+            let response = call_service(
+                endpoint,
+                token,
+                "recording.ttd",
+                json!({
+                    "project_root": project_root,
+                    "target": target,
+                    "timeout_ms": timeout_ms,
+                    "options": options,
                 }),
             )?;
             print_rpc_response(response, as_json)
@@ -747,6 +850,25 @@ fn resolve_client_connection(
             .or_else(|| installed.map(|config| config.bearer_token))
             .unwrap_or(dev.bearer_token),
     })
+}
+
+fn parse_ttd_record_mode(value: &str) -> Result<TtdRecordMode> {
+    match value {
+        "automatic" => Ok(TtdRecordMode::Automatic),
+        "manual" => Ok(TtdRecordMode::Manual),
+        other => anyhow::bail!("unsupported --record-mode `{other}`"),
+    }
+}
+
+fn parse_ttd_replay_cpu_support(value: &str) -> Result<TtdReplayCpuSupport> {
+    match value {
+        "default" => Ok(TtdReplayCpuSupport::Default),
+        "most_conservative" => Ok(TtdReplayCpuSupport::MostConservative),
+        "most_aggressive" => Ok(TtdReplayCpuSupport::MostAggressive),
+        "intel_avx_required" => Ok(TtdReplayCpuSupport::IntelAvxRequired),
+        "intel_avx2_required" => Ok(TtdReplayCpuSupport::IntelAvx2Required),
+        other => anyhow::bail!("unsupported --replay-cpu-support `{other}`"),
+    }
 }
 
 fn print_service_command_result(

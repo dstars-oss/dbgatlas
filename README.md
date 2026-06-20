@@ -11,7 +11,7 @@ MVP 0 through MVP 1 contain:
 - Runtime configuration types in `dbgatlas-runtime`, kept separate from workspace manifests.
 - A visible analysis workspace layout with `artifacts/`, `analysis/`, and optional `inputs/`.
 - Controlled artifact helpers for debug sessions and reserved recording/reverse artifact layouts.
-- A C++20 DbgEng native DLL with adapter-specific C ABI for open dump, attach process, raw command execution, session symbol path append, and virtual memory reads.
+- A C++20 DbgEng native DLL with adapter-specific C ABI for opening DbgEng files (`.dmp`, `.run`), attach process, raw command execution, session symbol path append, and virtual memory reads.
 - CLI commands for workspace initialization, workspace inspection, service dev mode, and debug session workflows.
 - Windows Service lifecycle commands that install an isolated runtime payload under `%ProgramData%\DbgAtlas\bin\`, machine config under `etc\`, and service logs under `var\log\`.
 
@@ -32,7 +32,8 @@ dbgatlas service health
 dbgatlas service status --json
 dbgatlas service stop
 dbgatlas service uninstall
-cargo run -p dbgatlas-cli -- debug session create --project-root .\scratch-project --dump .\sample.dmp
+cargo run -p dbgatlas-cli -- debug session create --project-root .\scratch-project --file .\sample.dmp
+cargo run -p dbgatlas-cli -- debug session create --project-root .\scratch-project --file .\trace.run
 cargo run -p dbgatlas-cli -- debug eval <session-id> ".echo hello"
 cargo run -p dbgatlas-cli -- debug modules <session-id>
 cargo run -p dbgatlas-cli -- debug threads <session-id>
@@ -40,6 +41,7 @@ cargo run -p dbgatlas-cli -- debug stack <session-id>
 cargo run -p dbgatlas-cli -- debug add-symbols <session-id> "srv*C:\symbols*https://msdl.microsoft.com/download/symbols" --reload
 cargo run -p dbgatlas-cli -- debug read-memory <session-id> --address 0x1000 --length 64
 cargo run -p dbgatlas-cli -- debug session close <session-id>
+cargo run -p dbgatlas-cli -- recording ttd --project-root .\scratch-project --launch C:\Windows\System32\cmd.exe --timeout-ms 30000 --accept-eula -- /C exit 0
 ```
 
 The installed service can update its own runtime payload through JSON-RPC or

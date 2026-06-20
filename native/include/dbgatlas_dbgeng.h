@@ -45,12 +45,13 @@ typedef struct DA_DbgEngTextView {
 typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out);
+DA_DBGENG_EXPORT int32_t da_dbgeng_load_runtime(const char* dbgeng_dir_utf8);
 DA_DBGENG_EXPORT void da_dbgeng_release_view(void* owner);
 DA_DBGENG_EXPORT int32_t da_dbgeng_last_error(
     char* buffer,
     size_t buffer_len,
     size_t* required_len);
-DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_dump(
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_file(
     const char* path_utf8,
     DA_DbgEngSessionHandle** out_handle);
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(

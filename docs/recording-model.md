@@ -27,6 +27,7 @@ recording 是独立产品能力，不依赖 debug session。debug、reverse 和 
 - `recording.status`：查询 recording 状态、target、开始时间、已登记 artifact 和最近 operation。
 - `recording.cancel`：协作式取消正在进行的 recording operation。
 - `recording.kill`：当 worker 卡死或无法协作停止时终止 recording worker，并把 operation 记录为 failed 或 canceled。
+- `recording.ttd`：用 `TTD.exe` 执行一次 launch / attach / monitor 录制，返回 `recording_id`、`operation_id`、状态和 artifact refs；该入口是一次性同步操作，不复用 ETW lifecycle 的 `recording.start/status/stop`。
 
 CLI 方向与 service capability 对齐：
 
@@ -37,6 +38,9 @@ dbgatlas recording status <recording-id>
 dbgatlas recording stop <recording-id>
 dbgatlas recording cancel <recording-id>
 dbgatlas recording kill <recording-id>
+dbgatlas recording ttd --project-root <path> --launch <exe> --timeout-ms <ms> [-- <args>]
+dbgatlas recording ttd --project-root <path> --attach <pid> --timeout-ms <ms>
+dbgatlas recording ttd --project-root <path> --monitor <program> --timeout-ms <ms>
 ```
 
 `launch` 和 `attach` 都以 process tree 为过滤核心。`attach` 不回填历史状态，只记录 `recording.start` 之后观察到的事件，并在 `recording.json` 中标明 attach mode、root pid 和 start timestamp。
@@ -77,6 +81,13 @@ artifacts/
         file.jsonl
         registry.jsonl
         network.jsonl
+      traces/
+        sample.run
+        sample.idx
+      recorder.stdout.txt
+      recorder.stderr.txt
+      recorder-stop.stdout.txt
+      recorder-stop.stderr.txt
 ```
 
 `recording.json` 记录低层可审计 metadata，包括：
@@ -94,6 +105,10 @@ artifacts/
 `trace.etl` 是过滤后的 ETL artifact。它不是完整 system-wide 原始 ETL，而是由 recording worker 根据 process tree 和 preset 过滤后的可复现材料。
 
 `events/*.jsonl` 是按 category 拆分的低层事件流。每一行是一条规范化事件，同时保留 ETW provenance 和 raw payload，方便后续审计和重新解释。
+
+TTD recording 使用同一 `artifacts/recordings/<recording_id>/` namespace。`recording.json` 的 `adapter.kind` 为 `ttd`，`traces/*.run` / `traces/*.idx` 登记为 `recording.ttd.trace` / `recording.ttd.index`，recorder stdout/stderr 登记为 `recording.recorder_output`，事件审计写入 `events.jsonl`。
+
+`timeout_ms` 到达时，DbgAtlas 会先执行 `TTD.exe -stop <target> -wait 10`，再等待 recorder 进程退出和落盘；只有 recorder 在 stop 后仍不退出时才兜底终止 recorder 进程，并在 metadata warnings 中记录。
 
 若 native ETW session 启动或停止失败，`trace.etl` 可以退化为文本 fallback artifact，用于保留失败原因和审计线索。此时 `recording.json` 必须显式记录 `trace.valid_etl=false` 和 `trace.fallback_reason`，读取方不能把该文件当作可由 ETW/WPA/DbgEng 打开的有效 ETL。真实 ETL artifact 应记录 `trace.valid_etl=true`。
 

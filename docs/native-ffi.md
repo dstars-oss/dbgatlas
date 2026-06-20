@@ -41,14 +41,15 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 最小 session ABI 包括：
 
-- `da_dbgeng_session_open_dump(path_utf8, out_handle)`
+- `da_dbgeng_load_runtime(dbgeng_dir_utf8)`
+- `da_dbgeng_session_open_file(path_utf8, out_handle)`
 - `da_dbgeng_session_attach_process(pid, out_handle)`
 - `da_dbgeng_session_execute(handle, command_utf8, out_text)`
 - `da_dbgeng_session_add_symbols(handle, symbol_path_utf8, reload, out_text)`
 - `da_dbgeng_session_read_virtual(handle, address, length, out_bytes)`
 - `da_dbgeng_session_close(handle)`
 
-当前实现使用 DbgEng `DebugCreate` 建立 session。dump 通过 `OpenDumpFile` 打开，attach 使用非侵入 attach，不在 close 时终止目标进程。raw command 通过 `IDebugControl::Execute` 执行，并用 output callbacks 捕获输出。`add_symbols` 追加当前 session 的 symbol path，可选执行 `.reload`。`read_virtual` 用 `IDebugDataSpaces::ReadVirtual` 返回二进制 view。
+当前实现按自动 resolver 给出的 Store WinDbg / SDK / System32 候选目录动态加载 `dbgeng.dll`，通过 `DebugCreate` 建立 session。Rust worker 会在 `LoadLibrary` 失败时尝试下一个候选；一旦某个 `dbgeng.dll` 成功加载，native adapter 不在同一进程内切换版本。`.dmp`、`.run` 等 DbgEng 支持的文件统一通过 `da_dbgeng_session_open_file` 进入，内部使用 `OpenDumpFile` 打开；attach 使用非侵入 attach，不在 close 时终止目标进程。raw command 通过 `IDebugControl::Execute` 执行，并用 output callbacks 捕获输出。`add_symbols` 追加当前 session 的 symbol path，可选执行 `.reload`。`read_virtual` 用 `IDebugDataSpaces::ReadVirtual` 返回二进制 view。
 
 ## IDA native adapter ABI
 

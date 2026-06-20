@@ -3,7 +3,10 @@ use dbgatlas_debug::{
     DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
 };
 use dbgatlas_model::{ArtifactRef, Id, OperationRef, RecordingRef, SessionRef, Timestamp};
-use dbgatlas_recording::{RecordingPreset, RecordingState, RecordingTarget, StartRecording};
+use dbgatlas_recording::{
+    RecordTtd, RecordingPreset, RecordingState, RecordingTarget, StartRecording,
+    TtdRecordingOptions, TtdTarget, build_ttd_args, ttd_stop_target,
+};
 use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
     ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
@@ -16,11 +19,12 @@ use dbgatlas_workspace::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -161,11 +165,14 @@ pub struct ServiceHost {
     state: Arc<Mutex<ServiceState>>,
     supervisor: Arc<dyn WorkerSupervisor>,
     capabilities: ServiceCapabilities,
+    ttd_runner: Arc<dyn TtdRecorderRunner>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ServiceCapabilities {
     pub ida_py_eval: bool,
+    pub dbgeng_dirs: Vec<PathBuf>,
+    pub ttd_dir: Option<PathBuf>,
 }
 
 impl ServiceHost {
@@ -173,7 +180,8 @@ impl ServiceHost {
         Self {
             state: Arc::new(Mutex::new(ServiceState::default())),
             supervisor,
-            capabilities: ServiceCapabilities::default(),
+            capabilities: ServiceCapabilities::from_runtime_config(&RuntimeConfig::default()),
+            ttd_runner: Arc::new(ProcessTtdRecorderRunner),
         }
     }
 
@@ -204,6 +212,12 @@ impl ServiceHost {
 
     pub fn with_capabilities(mut self, capabilities: ServiceCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ttd_runner(mut self, runner: Arc<dyn TtdRecorderRunner>) -> Self {
+        self.ttd_runner = runner;
         self
     }
 
@@ -261,6 +275,7 @@ impl ServiceHost {
             }
             "reverse.session.close" => self.reverse_session_close(request.params),
             "recording.start" => self.recording_start(request.params),
+            "recording.ttd" => self.recording_ttd(request.params),
             "recording.status" => self.recording_status(request.params),
             "recording.stop" => self.recording_stop(request.params),
             "recording.cancel" => self.recording_cancel(request.params),
@@ -300,7 +315,7 @@ impl ServiceHost {
             })),
             "ping" => Ok(json!({})),
             "notifications/initialized" => Ok(json!(null)),
-            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors(self.capabilities) })),
+            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors(self.capabilities.clone()) })),
             "tools/call" => {
                 let params: ToolCallParams =
                     serde_json::from_value(request.params.unwrap_or_else(|| json!({})))?;
@@ -368,7 +383,8 @@ impl ServiceHost {
             | "reverse.query_xrefs"
             | "reverse.query_funcs"
             | "reverse.query_entities"
-            | "reverse.session.close" => self.call_mcp_service_tool(name, arguments),
+            | "reverse.session.close"
+            | "recording.ttd" => self.call_mcp_service_tool(name, arguments),
             "reverse.py_eval" => {
                 self.ensure_ida_py_eval_enabled()?;
                 self.call_mcp_service_tool(name, arguments)
@@ -660,6 +676,302 @@ impl ServiceHost {
         )?)
     }
 
+    fn recording_ttd(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: RecordingTtdParams = parse_params(params)?;
+        let request = RecordTtd {
+            target: params.target,
+            timeout_ms: params.timeout_ms,
+            options: params.options,
+        }
+        .validate()?;
+        let recording_id = next_recording_ref();
+        let operation_id = next_operation_ref();
+        let _active_guard = self.start_ttd_recording(recording_id.clone())?;
+        let workspace = ensure_project_workspace(&params.project_root)?;
+        let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
+        let traces_dir = artifact_dir.join("traces");
+        fs::create_dir_all(&traces_dir)?;
+
+        let ttd_exe = self.resolve_ttd_exe()?;
+        let started = Instant::now();
+        let started_at = Timestamp::now();
+        let stdout_path = artifact_dir.join("recorder.stdout.txt");
+        let stderr_path = artifact_dir.join("recorder.stderr.txt");
+        let stop_stdout_path = artifact_dir.join("recorder-stop.stdout.txt");
+        let stop_stderr_path = artifact_dir.join("recorder-stop.stderr.txt");
+        let events_path = artifact_dir.join("events.jsonl");
+        append_ttd_recording_event(
+            &events_path,
+            &recording_id,
+            &operation_id,
+            "ttd_recording_started",
+            started_at,
+            json!({
+                "target": request.target,
+                "timeout_ms": request.timeout_ms,
+                "ttd_exe": ttd_exe,
+            }),
+            None,
+        )?;
+
+        let args = build_ttd_args(&request.target, &request.options, &traces_dir);
+        append_ttd_recording_event(
+            &events_path,
+            &recording_id,
+            &operation_id,
+            "recorder_starting",
+            Timestamp::now(),
+            json!({
+                "args": args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>()
+            }),
+            None,
+        )?;
+
+        let timeout_stop_target = ttd_stop_target(&request.target, None);
+        let recorder_exit = self.ttd_runner.run(TtdRecorderInvocation {
+            ttd_exe: ttd_exe.clone(),
+            args,
+            timeout: Duration::from_millis(request.timeout_ms),
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+            timeout_stop: timeout_stop_target
+                .clone()
+                .map(|stop_target| TtdTimeoutStop {
+                    stop_target,
+                    prefer_recorded_pid: matches!(&request.target, TtdTarget::Launch { .. }),
+                    stdout_path: stop_stdout_path.clone(),
+                    stderr_path: stop_stderr_path.clone(),
+                    timeout: Duration::from_secs(15),
+                    recorder_exit_timeout: Duration::from_secs(15),
+                }),
+        });
+        ensure_file_exists(&stdout_path)?;
+        ensure_file_exists(&stderr_path)?;
+
+        let mut warnings = Vec::new();
+        let mut error = None;
+        let mut recorder_exit_code = None;
+        let mut timed_out = false;
+        let mut recorder_stop = None;
+        let mut recorder_killed_after_timeout = false;
+        match recorder_exit {
+            Ok(exit) => {
+                recorder_exit_code = exit.exit_code;
+                timed_out = exit.timed_out;
+                recorder_stop = exit.stop;
+                recorder_killed_after_timeout = exit.killed_after_timeout;
+                append_ttd_recording_event(
+                    &events_path,
+                    &recording_id,
+                    &operation_id,
+                    "recorder_finished",
+                    Timestamp::now(),
+                    json!({
+                        "exit_code": exit.exit_code,
+                        "timed_out": exit.timed_out,
+                    }),
+                    None,
+                )?;
+            }
+            Err(run_error) => {
+                error = Some(format!("start TTD recorder failed: {run_error}"));
+                append_ttd_recording_event(
+                    &events_path,
+                    &recording_id,
+                    &operation_id,
+                    "recorder_failed",
+                    Timestamp::now(),
+                    json!({}),
+                    error.clone(),
+                )?;
+            }
+        }
+
+        let target_pid = parse_first_recorded_pid(
+            &(read_text_lossy(&stdout_path) + "\n" + read_text_lossy(&stderr_path).as_str()),
+        );
+        let mut stop_stdout_registered = false;
+        let mut stop_stderr_registered = false;
+        if timed_out {
+            if recorder_killed_after_timeout {
+                warnings
+                    .push("TTD recorder did not exit after stop and was terminated".to_string());
+            }
+            append_ttd_recording_event(
+                &events_path,
+                &recording_id,
+                &operation_id,
+                "timeout_reached",
+                Timestamp::now(),
+                json!({}),
+                None,
+            )?;
+            if let Some(stop) = recorder_stop {
+                ensure_file_exists(&stop_stdout_path)?;
+                ensure_file_exists(&stop_stderr_path)?;
+                stop_stdout_registered = true;
+                stop_stderr_registered = true;
+                if let Some(stop_error) = stop.error {
+                    let warning = format!("TTD stop failed after timeout: {stop_error}");
+                    warnings.push(warning.clone());
+                    append_ttd_recording_event(
+                        &events_path,
+                        &recording_id,
+                        &operation_id,
+                        "recorder_stop_failed",
+                        Timestamp::now(),
+                        json!({ "stop_target": stop.stop_target.to_string_lossy() }),
+                        Some(warning),
+                    )?;
+                } else {
+                    if stop.timed_out {
+                        warnings.push("TTD stop command timed out".to_string());
+                    }
+                    append_ttd_recording_event(
+                        &events_path,
+                        &recording_id,
+                        &operation_id,
+                        "recorder_stop_finished",
+                        Timestamp::now(),
+                        json!({
+                            "stop_target": stop.stop_target.to_string_lossy(),
+                            "exit_code": stop.exit_code,
+                            "timed_out": stop.timed_out,
+                        }),
+                        None,
+                    )?;
+                }
+            } else {
+                let message = match timeout_stop_target {
+                    Some(stop_target) => format!(
+                        "TTD recorder timed out, but stop was not attempted for {}",
+                        stop_target.to_string_lossy()
+                    ),
+                    None => {
+                        "TTD recorder timed out, but DbgAtlas could not determine a stop target"
+                            .to_string()
+                    }
+                };
+                warnings.push(message);
+            }
+        }
+
+        let discovered = discover_ttd_artifacts(&traces_dir)?;
+        let status = if error.is_some() {
+            "failed"
+        } else if recorder_exit_code.is_some_and(|code| code != 0) {
+            error = Some(recorder_error_summary(
+                &stdout_path,
+                &stderr_path,
+                recorder_exit_code,
+            ));
+            "failed"
+        } else if discovered.traces.is_empty() {
+            error = Some("TTD recorder completed but no .run trace was created".to_string());
+            "failed"
+        } else if timed_out {
+            "timed_out"
+        } else {
+            "completed"
+        };
+        let operation_status = if status == "failed" {
+            OperationStatus::Failed
+        } else {
+            OperationStatus::Success
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let stopped_at = Timestamp::now();
+        let metadata = ttd_recording_metadata_json(TtdRecordingMetadata {
+            recording_id: &recording_id,
+            operation_id: &operation_id,
+            request: &request,
+            status,
+            operation_status: &operation_status,
+            target_pid,
+            recorder_exit_code,
+            timed_out,
+            started_at,
+            stopped_at,
+            duration_ms,
+            ttd_exe: &ttd_exe,
+            discovered: &discovered,
+            warnings: &warnings,
+            error: error.as_deref(),
+        });
+        let metadata_len = write_json_file(&artifact_dir.join("recording.json"), &metadata)?;
+        append_ttd_recording_event(
+            &events_path,
+            &recording_id,
+            &operation_id,
+            "recording_completed",
+            stopped_at,
+            json!({
+                "status": status,
+                "operation_status": operation_status,
+                "trace_count": discovered.traces.len(),
+                "duration_ms": duration_ms,
+            }),
+            error.clone(),
+        )?;
+
+        let writes = ttd_recording_writes(
+            &recording_id,
+            &artifact_dir,
+            metadata_len,
+            stop_stdout_registered,
+            stop_stderr_registered,
+            &discovered,
+        )?;
+        let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
+        workspace.append_operation(&OperationRecord {
+            operation_id: operation_id.clone(),
+            adapter_id: "service".to_string(),
+            capability: "recording.ttd".to_string(),
+            status: operation_status.clone(),
+            created_at: started_at,
+            summary: format!("TTD recording {status}"),
+            artifacts: registered.artifacts.clone(),
+            raw_output: registered.raw_output.clone(),
+        })?;
+
+        let mut operation = ServiceOperation::success(
+            operation_id.clone(),
+            "recording.ttd",
+            None,
+            format!("TTD recording {status}"),
+        );
+        if operation_status == OperationStatus::Failed {
+            operation.status = ServiceOperationStatus::Failed;
+        }
+        operation.artifacts = registered.artifacts.clone();
+        operation.raw_output = registered.raw_output.clone();
+        let mut state = self.lock_state()?;
+        state
+            .operations
+            .insert(operation_id.id.as_str().to_string(), operation);
+
+        Ok(json!({
+            "recording_id": recording_id,
+            "state": status,
+            "target": request.target,
+            "mode": request.target.mode(),
+            "operation_id": operation_id,
+            "operation_status": operation_status,
+            "target_pid": target_pid,
+            "recorder_exit_code": recorder_exit_code,
+            "duration_ms": duration_ms,
+            "artifact_refs": registered.artifacts,
+            "raw_output_ref": registered.raw_output,
+            "warnings": warnings,
+            "error": error,
+            "operation": {
+                "status": operation_status,
+                "artifact_refs": registered.artifacts,
+                "raw_output_ref": registered.raw_output,
+            }
+        }))
+    }
+
     fn recording_status(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         let params: RecordingParams = parse_params(params)?;
         let state = self.lock_state()?;
@@ -808,55 +1120,57 @@ impl ServiceHost {
         let operation_id = next_operation_ref();
         let workspace = ensure_project_workspace(&params.project_root)?;
         let session_dir = workspace.ensure_session_artifact_dir(&session_id.id)?;
-        let worker = self.supervisor.create_worker(WorkerCreateRequest {
-            session_id: session_id.clone(),
-            project_root: params.project_root.clone(),
-            internal_workspace_root: workspace.root().to_path_buf(),
-            artifact_dir: session_dir.clone(),
-            startup_timeout_ms: request.startup_timeout_ms.unwrap_or(5_000),
-        })?;
-        let start = self.supervisor.request_worker(
-            &worker,
-            WorkerRequest::StartDebugSession {
+        let mut started_worker = None;
+        let mut start_writes = None;
+        let mut start_failures = Vec::new();
+        for dbgeng_dirs in
+            debug_worker_dbgeng_attempts(&request.target, &self.capabilities.dbgeng_dirs)
+        {
+            let worker = self.supervisor.create_worker(WorkerCreateRequest {
                 session_id: session_id.clone(),
-                target: request.target.clone(),
+                project_root: params.project_root.clone(),
+                internal_workspace_root: workspace.root().to_path_buf(),
                 artifact_dir: session_dir.clone(),
-            },
-        );
-        let start_writes = match start {
-            Ok(WorkerResponse::Ok { writes, .. }) => writes,
-            Ok(WorkerResponse::Failed { code, message, .. }) => {
-                let _ = self.supervisor.kill_worker(&worker);
-                self.record_failed_session_create(
-                    &workspace,
-                    &operation_id,
-                    &session_id,
-                    format!("{code}: {message}"),
-                )?;
-                return Err(ServiceError::Worker(format!("{code}: {message}")));
+                startup_timeout_ms: request.startup_timeout_ms.unwrap_or(5_000),
+                dbgeng_dirs,
+                identity: None,
+            })?;
+            let start = self.supervisor.request_worker(
+                &worker,
+                WorkerRequest::StartDebugSession {
+                    session_id: session_id.clone(),
+                    target: request.target.clone(),
+                    artifact_dir: session_dir.clone(),
+                },
+            );
+            match start {
+                Ok(WorkerResponse::Ok { writes, .. }) => {
+                    started_worker = Some(worker);
+                    start_writes = Some(writes);
+                    break;
+                }
+                Ok(WorkerResponse::Failed { code, message, .. }) => {
+                    let _ = self.supervisor.kill_worker(&worker);
+                    start_failures.push(format!("{code}: {message}"));
+                }
+                Ok(other) => {
+                    let _ = self.supervisor.kill_worker(&worker);
+                    start_failures.push(format!("unexpected start response: {other:?}"));
+                    break;
+                }
+                Err(error) => {
+                    let _ = self.supervisor.kill_worker(&worker);
+                    start_failures.push(error.to_string());
+                    break;
+                }
             }
-            Ok(other) => {
-                let _ = self.supervisor.kill_worker(&worker);
-                let message = format!("unexpected start response: {other:?}");
-                self.record_failed_session_create(
-                    &workspace,
-                    &operation_id,
-                    &session_id,
-                    &message,
-                )?;
-                return Err(ServiceError::Worker(message));
-            }
-            Err(error) => {
-                let _ = self.supervisor.kill_worker(&worker);
-                self.record_failed_session_create(
-                    &workspace,
-                    &operation_id,
-                    &session_id,
-                    error.to_string(),
-                )?;
-                return Err(error);
-            }
+        }
+        let Some(worker) = started_worker else {
+            let message = start_failures.join(" | ");
+            self.record_failed_session_create(&workspace, &operation_id, &session_id, &message)?;
+            return Err(ServiceError::Worker(message));
         };
+        let start_writes = start_writes.expect("worker start writes are set with started worker");
         let now = Timestamp::now();
         let registered_start_writes =
             register_worker_writes(&workspace, &operation_id, &start_writes)?;
@@ -1114,6 +1428,8 @@ impl ServiceHost {
             internal_workspace_root: workspace.root().to_path_buf(),
             artifact_dir: artifact_dir.clone(),
             startup_timeout_ms: 5_000,
+            dbgeng_dirs: self.capabilities.dbgeng_dirs.clone(),
+            identity: Some(WorkerIdentity::ActiveInteractiveUser),
         })?;
 
         let open = self.supervisor.request_worker(
@@ -2313,6 +2629,49 @@ impl ServiceHost {
             .map(|operation| operation.status.clone()))
     }
 
+    fn start_ttd_recording(
+        &self,
+        recording_id: RecordingRef,
+    ) -> Result<TtdActiveGuard, ServiceError> {
+        let mut state = self.lock_state()?;
+        if let Some(active) = &state.active_ttd_recording {
+            return Err(ServiceError::Rpc(format!(
+                "another TTD recording is already active: {active}"
+            )));
+        }
+        state.active_ttd_recording = Some(recording_id.clone());
+        Ok(TtdActiveGuard {
+            state: self.state.clone(),
+            recording_id,
+        })
+    }
+
+    fn resolve_ttd_exe(&self) -> Result<PathBuf, ServiceError> {
+        let ttd_dir = self
+            .capabilities
+            .ttd_dir
+            .clone()
+            .or_else(|| {
+                RuntimeConfig::default()
+                    .resolve_tool_paths()
+                    .ttd
+                    .map(|location| location.dir)
+            })
+            .ok_or_else(|| {
+                ServiceError::Rpc(
+                    "TTD.exe was not found in the automatic tool search path".to_string(),
+                )
+            })?;
+        let ttd_exe = ttd_dir.join("TTD.exe");
+        if !ttd_exe.is_file() {
+            return Err(ServiceError::Rpc(format!(
+                "TTD.exe was not found under {}",
+                ttd_dir.display()
+            )));
+        }
+        Ok(ttd_exe)
+    }
+
     fn finish_operation_in_memory(
         &self,
         operation_id: &OperationRef,
@@ -2405,8 +2764,15 @@ impl ServiceHost {
 
 impl ServiceCapabilities {
     pub fn from_runtime_config(runtime: &RuntimeConfig) -> Self {
+        let tools = runtime.resolve_tool_paths();
         Self {
             ida_py_eval: runtime.tools.ida.allow_py_eval,
+            dbgeng_dirs: tools
+                .dbgeng_candidates
+                .iter()
+                .map(|location| location.dir.clone())
+                .collect(),
+            ttd_dir: tools.ttd.map(|location| location.dir),
         }
     }
 }
@@ -2416,6 +2782,23 @@ struct ServiceState {
     sessions: HashMap<String, ManagedSession>,
     recordings: HashMap<String, ManagedRecording>,
     operations: HashMap<String, ServiceOperation>,
+    active_ttd_recording: Option<RecordingRef>,
+}
+
+struct TtdActiveGuard {
+    state: Arc<Mutex<ServiceState>>,
+    recording_id: RecordingRef,
+}
+
+impl Drop for TtdActiveGuard {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.active_ttd_recording.as_ref() == Some(&self.recording_id) {
+            state.active_ttd_recording = None;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2483,6 +2866,8 @@ pub struct WorkerCreateRequest {
     pub internal_workspace_root: PathBuf,
     pub artifact_dir: PathBuf,
     pub startup_timeout_ms: u64,
+    pub dbgeng_dirs: Vec<PathBuf>,
+    pub identity: Option<WorkerIdentity>,
 }
 
 pub trait WorkerSupervisor: Send + Sync {
@@ -2506,6 +2891,55 @@ pub trait WorkerSupervisor: Send + Sync {
 pub enum WorkerCancelOutcome {
     Notified,
     WorkerKilled,
+}
+
+#[derive(Clone, Debug)]
+struct TtdRecorderInvocation {
+    ttd_exe: PathBuf,
+    args: Vec<OsString>,
+    timeout: Duration,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    timeout_stop: Option<TtdTimeoutStop>,
+}
+
+#[derive(Clone, Debug)]
+struct TtdTimeoutStop {
+    stop_target: OsString,
+    prefer_recorded_pid: bool,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    timeout: Duration,
+    recorder_exit_timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TtdProcessExit {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stop: Option<TtdStopExit>,
+    killed_after_timeout: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TtdStopExit {
+    stop_target: OsString,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    error: Option<String>,
+}
+
+trait TtdRecorderRunner: Send + Sync {
+    fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, ServiceError>;
+}
+
+#[derive(Debug)]
+struct ProcessTtdRecorderRunner;
+
+impl TtdRecorderRunner for ProcessTtdRecorderRunner {
+    fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, ServiceError> {
+        run_ttd_process(invocation)
+    }
 }
 
 pub struct MockWorkerSupervisor {
@@ -2536,7 +2970,7 @@ impl WorkerSupervisor for MockWorkerSupervisor {
             worker_id,
             pipe_name: format!(r"\\.\pipe\dbgatlas-{}", request.session_id.id.as_str()),
             session_id: request.session_id,
-            identity: self.identity.clone(),
+            identity: request.identity.unwrap_or_else(|| self.identity.clone()),
         })
     }
 
@@ -2630,7 +3064,7 @@ impl ProcessWorkerSupervisor {
 
     pub fn new_installed_service() -> Result<Self, ServiceError> {
         Ok(Self {
-            identity: WorkerIdentity::ActiveInteractiveUser,
+            identity: WorkerIdentity::LocalSystem,
             worker_exe: None,
             workers: Mutex::new(HashMap::new()),
             job: job::ManagedJob::create_result("DbgAtlasInstalledWorkers")?,
@@ -2660,11 +3094,13 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             .clone()
             .map(Ok)
             .unwrap_or_else(worker_executable_path)?;
+        let identity = request.identity.unwrap_or_else(|| self.identity.clone());
         let mut child = spawn_worker_process(
             &worker_exe,
             &pipe_name,
             request.session_id.id.as_str(),
-            &self.identity,
+            &identity,
+            &request.dbgeng_dirs,
         )?;
         self.job.assign_process(&child)?;
         let connected = match transport.connect(request.startup_timeout_ms) {
@@ -2687,7 +3123,7 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             worker_id,
             pipe_name,
             session_id: request.session_id,
-            identity: self.identity.clone(),
+            identity,
         })
     }
 
@@ -3362,6 +3798,443 @@ fn prepare_recording_target(
         )),
         RecordingTarget::Attach { pid } => Ok(PreparedRecordingTarget::Attach { pid: *pid }),
     }
+}
+
+fn run_ttd_process(invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, ServiceError> {
+    if let Some(parent) = invocation.stdout_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = invocation.stderr_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stdout = fs::File::create(&invocation.stdout_path)?;
+    let stderr = fs::File::create(&invocation.stderr_path)?;
+    let mut child = Command::new(&invocation.ttd_exe)
+        .args(&invocation.args)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    let deadline = Instant::now() + invocation.timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(TtdProcessExit {
+                exit_code: status.code(),
+                timed_out: false,
+                stop: None,
+                killed_after_timeout: false,
+            });
+        }
+        if Instant::now() >= deadline {
+            let mut stop = None;
+            if let Some(timeout_stop) = invocation.timeout_stop.as_ref() {
+                let recorder_exit_deadline = Instant::now() + timeout_stop.recorder_exit_timeout;
+                let mut timeout_stop = timeout_stop.clone();
+                if timeout_stop.prefer_recorded_pid {
+                    let recorder_output = read_text_lossy(&invocation.stdout_path)
+                        + "\n"
+                        + read_text_lossy(&invocation.stderr_path).as_str();
+                    if let Some(pid) = parse_first_recorded_pid(&recorder_output) {
+                        timeout_stop.stop_target = OsString::from(pid.to_string());
+                    }
+                }
+                stop = Some(run_ttd_stop_process(&invocation.ttd_exe, &timeout_stop));
+                while Instant::now() < recorder_exit_deadline {
+                    if let Some(status) = child.try_wait()? {
+                        return Ok(TtdProcessExit {
+                            exit_code: status.code(),
+                            timed_out: true,
+                            stop,
+                            killed_after_timeout: false,
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+            let killed_after_timeout = child.try_wait()?.is_none();
+            if killed_after_timeout {
+                let _ = child.kill();
+            }
+            let status = child.wait().ok();
+            return Ok(TtdProcessExit {
+                exit_code: status.as_ref().and_then(ExitStatus::code),
+                timed_out: true,
+                stop,
+                killed_after_timeout,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_ttd_stop_process(ttd_exe: &Path, timeout_stop: &TtdTimeoutStop) -> TtdStopExit {
+    let args = [
+        OsString::from("-stop"),
+        timeout_stop.stop_target.clone(),
+        OsString::from("-wait"),
+        OsString::from("10"),
+    ];
+    match run_ttd_command(
+        ttd_exe,
+        &args,
+        timeout_stop.timeout,
+        &timeout_stop.stdout_path,
+        &timeout_stop.stderr_path,
+    ) {
+        Ok(exit) => TtdStopExit {
+            stop_target: timeout_stop.stop_target.clone(),
+            exit_code: exit.exit_code,
+            timed_out: exit.timed_out,
+            error: None,
+        },
+        Err(error) => {
+            let _ = ensure_file_exists(&timeout_stop.stdout_path);
+            let _ = ensure_file_exists(&timeout_stop.stderr_path);
+            TtdStopExit {
+                stop_target: timeout_stop.stop_target.clone(),
+                exit_code: None,
+                timed_out: false,
+                error: Some(error.to_string()),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TtdCommandExit {
+    exit_code: Option<i32>,
+    timed_out: bool,
+}
+
+fn run_ttd_command(
+    ttd_exe: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<TtdCommandExit, ServiceError> {
+    if let Some(parent) = stdout_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = stderr_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stdout = fs::File::create(stdout_path)?;
+    let stderr = fs::File::create(stderr_path)?;
+    let mut child = Command::new(ttd_exe)
+        .args(args)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(TtdCommandExit {
+                exit_code: status.code(),
+                timed_out: false,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child.wait().ok();
+            return Ok(TtdCommandExit {
+                exit_code: status.as_ref().and_then(ExitStatus::code),
+                timed_out: true,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiscoveredTtdArtifacts {
+    traces: Vec<PathBuf>,
+    trace_indexes: Vec<PathBuf>,
+    recorder_logs: Vec<PathBuf>,
+}
+
+struct TtdRecordingMetadata<'a> {
+    recording_id: &'a RecordingRef,
+    operation_id: &'a OperationRef,
+    request: &'a RecordTtd,
+    status: &'a str,
+    operation_status: &'a OperationStatus,
+    target_pid: Option<u32>,
+    recorder_exit_code: Option<i32>,
+    timed_out: bool,
+    started_at: Timestamp,
+    stopped_at: Timestamp,
+    duration_ms: u64,
+    ttd_exe: &'a Path,
+    discovered: &'a DiscoveredTtdArtifacts,
+    warnings: &'a [String],
+    error: Option<&'a str>,
+}
+
+fn append_ttd_recording_event(
+    events_path: &Path,
+    recording_id: &RecordingRef,
+    operation_id: &OperationRef,
+    event: &str,
+    timestamp: Timestamp,
+    fields: Value,
+    error: Option<String>,
+) -> Result<u64, ServiceError> {
+    write_jsonl_file(
+        events_path,
+        &json!({
+            "event": event,
+            "recording_id": recording_id,
+            "operation_id": operation_id,
+            "timestamp": timestamp,
+            "fields": fields,
+            "error": error,
+        }),
+    )
+}
+
+fn discover_ttd_artifacts(traces_dir: &Path) -> Result<DiscoveredTtdArtifacts, ServiceError> {
+    let mut discovered = DiscoveredTtdArtifacts::default();
+    if !traces_dir.exists() {
+        return Ok(discovered);
+    }
+    for entry in fs::read_dir(traces_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "run" => discovered.traces.push(path),
+            "idx" => discovered.trace_indexes.push(path),
+            "out" | "err" | "log" => discovered.recorder_logs.push(path),
+            _ => {}
+        }
+    }
+    discovered.traces.sort();
+    discovered.trace_indexes.sort();
+    discovered.recorder_logs.sort();
+    Ok(discovered)
+}
+
+fn ttd_recording_metadata_json(input: TtdRecordingMetadata<'_>) -> Value {
+    json!({
+        "recording_id": input.recording_id,
+        "operation_id": input.operation_id,
+        "target": input.request.target,
+        "mode": input.request.target.mode(),
+        "timeout_ms": input.request.timeout_ms,
+        "options": input.request.options,
+        "target_pid": input.target_pid,
+        "started_at": input.started_at,
+        "stopped_at": input.stopped_at,
+        "duration_ms": input.duration_ms,
+        "status": input.status,
+        "operation_status": input.operation_status,
+        "recorder_exit_code": input.recorder_exit_code,
+        "timed_out": input.timed_out,
+        "adapter": {
+            "kind": "ttd",
+            "tool": "TTD.exe",
+            "ttd_exe": input.ttd_exe,
+        },
+        "traces": input.discovered.traces,
+        "trace_indexes": input.discovered.trace_indexes,
+        "recorder_logs": input.discovered.recorder_logs,
+        "warnings": input.warnings,
+        "error": input.error,
+    })
+}
+
+fn ttd_recording_writes(
+    recording_id: &RecordingRef,
+    artifact_dir: &Path,
+    metadata_len: u64,
+    include_stop_stdout: bool,
+    include_stop_stderr: bool,
+    discovered: &DiscoveredTtdArtifacts,
+) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
+    let mut writes = vec![
+        WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, "recording.json"),
+            kind: "recording.metadata".to_string(),
+            byte_len: metadata_len,
+            description: Some("TTD recording metadata".to_string()),
+        },
+        WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, "events.jsonl"),
+            kind: "recording.events.ttd".to_string(),
+            byte_len: file_len_or_zero(&artifact_dir.join("events.jsonl"))?,
+            description: Some("TTD recording events".to_string()),
+        },
+        WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, "recorder.stdout.txt"),
+            kind: "recording.recorder_output".to_string(),
+            byte_len: file_len_or_zero(&artifact_dir.join("recorder.stdout.txt"))?,
+            description: Some("TTD recorder stdout".to_string()),
+        },
+        WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, "recorder.stderr.txt"),
+            kind: "recording.recorder_output".to_string(),
+            byte_len: file_len_or_zero(&artifact_dir.join("recorder.stderr.txt"))?,
+            description: Some("TTD recorder stderr".to_string()),
+        },
+    ];
+    if include_stop_stdout {
+        writes.push(WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, "recorder-stop.stdout.txt"),
+            kind: "recording.recorder_output".to_string(),
+            byte_len: file_len_or_zero(&artifact_dir.join("recorder-stop.stdout.txt"))?,
+            description: Some("TTD recorder stop stdout".to_string()),
+        });
+    }
+    if include_stop_stderr {
+        writes.push(WorkerArtifactWrite {
+            relative_path: recording_relative_path(recording_id, "recorder-stop.stderr.txt"),
+            kind: "recording.recorder_output".to_string(),
+            byte_len: file_len_or_zero(&artifact_dir.join("recorder-stop.stderr.txt"))?,
+            description: Some("TTD recorder stop stderr".to_string()),
+        });
+    }
+    for trace in &discovered.traces {
+        writes.push(discovered_ttd_write(
+            recording_id,
+            artifact_dir,
+            trace,
+            "recording.ttd.trace",
+            "TTD .run trace",
+        )?);
+    }
+    for index in &discovered.trace_indexes {
+        writes.push(discovered_ttd_write(
+            recording_id,
+            artifact_dir,
+            index,
+            "recording.ttd.index",
+            "TTD trace index",
+        )?);
+    }
+    for log in &discovered.recorder_logs {
+        writes.push(discovered_ttd_write(
+            recording_id,
+            artifact_dir,
+            log,
+            "recording.recorder_output",
+            "TTD recorder log",
+        )?);
+    }
+    Ok(writes)
+}
+
+fn discovered_ttd_write(
+    recording_id: &RecordingRef,
+    artifact_dir: &Path,
+    path: &Path,
+    kind: &str,
+    description: &str,
+) -> Result<WorkerArtifactWrite, ServiceError> {
+    let relative_to_recording = path.strip_prefix(artifact_dir).map_err(|_| {
+        ServiceError::Rpc(format!(
+            "TTD artifact escaped recording dir: {}",
+            path.display()
+        ))
+    })?;
+    Ok(WorkerArtifactWrite {
+        relative_path: recording_relative_path(
+            recording_id,
+            &relative_to_recording.to_string_lossy(),
+        ),
+        kind: kind.to_string(),
+        byte_len: fs::metadata(path)?.len(),
+        description: Some(description.to_string()),
+    })
+}
+
+fn file_len_or_zero(path: &Path) -> Result<u64, ServiceError> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(fs::metadata(path)?.len())
+}
+
+fn ensure_file_exists(path: &Path) -> Result<(), ServiceError> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, [])?;
+    Ok(())
+}
+
+fn parse_first_recorded_pid(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        if let Some(index) = line.find("PID:") {
+            let digits = line[index + 4..]
+                .chars()
+                .skip_while(|ch| ch.is_whitespace())
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(pid) = digits.parse::<u32>() {
+                return Some(pid);
+            }
+        }
+        if line.contains("Recording process ") {
+            if let Some(open) = line.rfind('(') {
+                if let Some(close) = line[open + 1..].find(')') {
+                    let value = &line[open + 1..open + 1 + close];
+                    if let Ok(pid) = value.parse::<u32>() {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn recorder_error_summary(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    exit_code: Option<i32>,
+) -> String {
+    let stderr = read_text_lossy(stderr_path);
+    if !stderr.trim().is_empty() {
+        return format!(
+            "TTD recorder exited with code {:?}: {}",
+            exit_code,
+            last_non_empty_line(&stderr)
+        );
+    }
+    let stdout = read_text_lossy(stdout_path);
+    if !stdout.trim().is_empty() {
+        return format!(
+            "TTD recorder exited with code {:?}: {}",
+            exit_code,
+            last_non_empty_line(&stdout)
+        );
+    }
+    format!("TTD recorder exited with code {:?}", exit_code)
+}
+
+fn read_text_lossy(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+fn last_non_empty_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 enum PreparedLaunch {
@@ -4532,40 +5405,63 @@ fn spawn_worker_process(
     pipe_name: &str,
     session_id: &str,
     identity: &WorkerIdentity,
+    dbgeng_dirs: &[PathBuf],
 ) -> Result<WorkerProcess, ServiceError> {
+    let args = worker_process_args(pipe_name, session_id, dbgeng_dirs);
     match identity {
         WorkerIdentity::ActiveInteractiveUser => {
-            spawn_active_interactive_worker_process(worker_exe, pipe_name, session_id)
+            spawn_active_interactive_worker_process(worker_exe, &args)
         }
         WorkerIdentity::CurrentUserDevMode | WorkerIdentity::LocalSystem => Ok(WorkerProcess::Std(
-            Command::new(worker_exe)
-                .arg("--pipe")
-                .arg(pipe_name)
-                .arg("--session-id")
-                .arg(session_id)
-                .spawn()?,
+            Command::new(worker_exe).args(&args).spawn()?,
         )),
     }
+}
+
+fn worker_process_args(pipe_name: &str, session_id: &str, dbgeng_dirs: &[PathBuf]) -> Vec<String> {
+    let mut args = vec![
+        "--pipe".to_string(),
+        pipe_name.to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+    ];
+    for dbgeng_dir in dbgeng_dirs {
+        args.push("--dbgeng-dir".to_string());
+        args.push(dbgeng_dir.display().to_string());
+    }
+    args
+}
+
+fn debug_worker_dbgeng_attempts(
+    target: &DebugTarget,
+    dbgeng_dirs: &[PathBuf],
+) -> Vec<Vec<PathBuf>> {
+    if matches!(target, DebugTarget::File { path } if is_ttd_run_file(path))
+        && dbgeng_dirs.len() > 1
+    {
+        return dbgeng_dirs.iter().cloned().map(|dir| vec![dir]).collect();
+    }
+    vec![dbgeng_dirs.to_vec()]
+}
+
+fn is_ttd_run_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("run"))
 }
 
 #[cfg(windows)]
 fn spawn_active_interactive_worker_process(
     worker_exe: &Path,
-    pipe_name: &str,
-    session_id: &str,
+    args: &[String],
 ) -> Result<WorkerProcess, ServiceError> {
-    windows_active_user_process::spawn(
-        worker_exe,
-        &["--pipe", pipe_name, "--session-id", session_id],
-    )
-    .map(WorkerProcess::RawWindows)
+    windows_active_user_process::spawn(worker_exe, args).map(WorkerProcess::RawWindows)
 }
 
 #[cfg(not(windows))]
 fn spawn_active_interactive_worker_process(
     _worker_exe: &Path,
-    _pipe_name: &str,
-    _session_id: &str,
+    _args: &[String],
 ) -> Result<WorkerProcess, ServiceError> {
     Err(ServiceError::WorkerTransportUnsupported)
 }
@@ -4686,7 +5582,8 @@ pub struct WindowsServiceUpdateAccepted {
 #[derive(Debug)]
 struct PreparedServiceUpdate {
     source_dir: PathBuf,
-    payload: Vec<ServicePayloadFile>,
+    bin_payload: Vec<ServicePayloadFile>,
+    config_payload: Option<ServicePayloadFile>,
     response: WindowsServiceUpdateAccepted,
 }
 
@@ -4811,10 +5708,35 @@ fn create_runtime_config_if_missing(
     if paths.config_path.exists() {
         return Ok(RuntimeConfig::load(&paths.config_path)?);
     }
-    let config = format!("version = 1\n\n[server]\nbind = \"{}\"\n", bind);
+    let mut runtime = RuntimeConfig::default();
+    runtime.server.bind = bind;
+    let config = runtime_config_toml(&runtime);
     let runtime = RuntimeConfig::from_toml_str(&config)?;
     fs::write(&paths.config_path, config)?;
     Ok(runtime)
+}
+
+fn runtime_config_toml(runtime: &RuntimeConfig) -> String {
+    let mut config = format!(
+        "version = 1\n\n[server]\nbind = \"{}\"\n",
+        runtime.server.bind
+    );
+    if runtime.tools.symbol_path.is_some() {
+        config.push_str("\n[tools]\n");
+        if let Some(symbol_path) = &runtime.tools.symbol_path {
+            config.push_str(&format!("symbol_path = \"{}\"\n", toml_escape(symbol_path)));
+        }
+    }
+    config
+}
+
+fn toml_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }
 
 fn prepare_install_layout(paths: &ServiceInstallPaths) -> Result<(), ServiceError> {
@@ -4881,21 +5803,131 @@ fn prepare_service_update(
             "cannot update service from the installed bin directory; pass a development or release payload directory".to_string(),
         ));
     }
-    let payload = discover_service_payload(&source_dir, &paths.bin_dir)?;
+    let bin_payload = discover_service_payload(&source_dir, &paths.bin_dir)?;
+    let config_payload = discover_service_config_payload(&source_dir, paths)?;
+    let mut response_payload = bin_payload.clone();
+    if let Some(config_payload) = &config_payload {
+        response_payload.push(config_payload.clone());
+    }
     let response = WindowsServiceUpdateAccepted {
         status: "accepted".to_string(),
         source_dir: source_dir.clone(),
         service_name: WINDOWS_SERVICE_NAME.to_string(),
         installed_binary: paths.installed_exe.clone(),
         log_dir: paths.log_dir.clone(),
-        payload: payload.clone(),
+        payload: response_payload,
         restart,
     };
     Ok(PreparedServiceUpdate {
         source_dir,
-        payload,
+        bin_payload,
+        config_payload,
         response,
     })
+}
+
+fn discover_service_config_payload(
+    source_dir: &Path,
+    paths: &ServiceInstallPaths,
+) -> Result<Option<ServicePayloadFile>, ServiceError> {
+    let candidates = [
+        source_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
+        source_dir
+            .join(WINDOWS_SERVICE_ETC_DIR)
+            .join(WINDOWS_SERVICE_CONFIG_FILE),
+    ];
+    let found = candidates
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    match found.as_slice() {
+        [] => Ok(None),
+        [source] => {
+            validate_update_runtime_config(source)?;
+            Ok(Some(ServicePayloadFile {
+                file_name: WINDOWS_SERVICE_CONFIG_FILE.to_string(),
+                source: source.clone(),
+                destination: paths.config_path.clone(),
+            }))
+        }
+        _ => Err(ServiceError::Rpc(format!(
+            "provide {WINDOWS_SERVICE_CONFIG_FILE} in either the payload root or {WINDOWS_SERVICE_ETC_DIR}\\{WINDOWS_SERVICE_CONFIG_FILE}, not both"
+        ))),
+    }
+}
+
+fn validate_update_runtime_config(path: &Path) -> Result<(), ServiceError> {
+    let input = fs::read_to_string(path)?;
+    reject_runtime_config_token_keys(&input)?;
+    reject_runtime_config_local_debug_tool_keys(&input)?;
+    let _runtime = RuntimeConfig::from_toml_str(&input)?;
+    Ok(())
+}
+
+fn reject_runtime_config_token_keys(input: &str) -> Result<(), ServiceError> {
+    let value = toml::from_str::<toml::Value>(input)
+        .map_err(|error| dbgatlas_runtime::RuntimeConfigError::ParseToml(error))?;
+    let mut path = Vec::new();
+    reject_runtime_config_token_keys_in_value(&value, &mut path)
+}
+
+fn reject_runtime_config_token_keys_in_value(
+    value: &toml::Value,
+    path: &mut Vec<String>,
+) -> Result<(), ServiceError> {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                path.push(key.clone());
+                if is_runtime_config_token_key(key) {
+                    return Err(ServiceError::Rpc(format!(
+                        "runtime config payload must not contain token fields: {}",
+                        path.join(".")
+                    )));
+                }
+                reject_runtime_config_token_keys_in_value(value, path)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        toml::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(index.to_string());
+                reject_runtime_config_token_keys_in_value(value, path)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn is_runtime_config_token_key(key: &str) -> bool {
+    key.chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .contains("token")
+}
+
+fn reject_runtime_config_local_debug_tool_keys(input: &str) -> Result<(), ServiceError> {
+    let value = toml::from_str::<toml::Value>(input)
+        .map_err(|error| dbgatlas_runtime::RuntimeConfigError::ParseToml(error))?;
+    let tools = value
+        .as_table()
+        .and_then(|table| table.get("tools"))
+        .and_then(toml::Value::as_table);
+    if let Some(tools) = tools {
+        for key in ["dbgeng_dir", "ttd_dir"] {
+            if tools.contains_key(key) {
+                return Err(ServiceError::Rpc(format!(
+                    "runtime config payload must not contain removed local debug tool field: tools.{key}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn copy_update_payload_to_staging(
@@ -4909,6 +5941,44 @@ fn copy_update_payload_to_staging(
     for file in payload {
         fs::copy(&file.source, staging_dir.join(&file.file_name))?;
     }
+    Ok(())
+}
+
+fn copy_update_config_to_staging(
+    config_payload: &ServicePayloadFile,
+    staging_dir: &Path,
+    paths: &ServiceInstallPaths,
+) -> Result<ServicePayloadFile, ServiceError> {
+    if config_payload.destination != paths.config_path {
+        return Err(ServiceError::ServiceControl(format!(
+            "refusing to stage service config for unexpected path: {}",
+            config_payload.destination.display()
+        )));
+    }
+    fs::create_dir_all(staging_dir)?;
+    let staged = staging_dir.join(WINDOWS_SERVICE_CONFIG_FILE);
+    fs::copy(&config_payload.source, &staged)?;
+    validate_update_runtime_config(&staged)?;
+    Ok(ServicePayloadFile {
+        file_name: WINDOWS_SERVICE_CONFIG_FILE.to_string(),
+        source: staged,
+        destination: paths.config_path.clone(),
+    })
+}
+
+fn apply_update_config_payload(
+    config_payload: &ServicePayloadFile,
+    paths: &ServiceInstallPaths,
+) -> Result<(), ServiceError> {
+    if config_payload.destination != paths.config_path {
+        return Err(ServiceError::ServiceControl(format!(
+            "refusing to copy service config to unexpected path: {}",
+            config_payload.destination.display()
+        )));
+    }
+    validate_update_runtime_config(&config_payload.source)?;
+    fs::create_dir_all(&paths.etc_dir)?;
+    fs::copy(&config_payload.source, &paths.config_path)?;
     Ok(())
 }
 
@@ -5224,7 +6294,22 @@ mod windows_service_control {
             prepared.source_dir.display(),
             staging_dir.display()
         ));
-        copy_update_payload_to_staging(&prepared.payload, &staging_dir)?;
+        copy_update_payload_to_staging(&prepared.bin_payload, &staging_dir)?;
+        let staged_config_payload = prepared
+            .config_payload
+            .as_ref()
+            .map(|config_payload| {
+                copy_update_config_to_staging(config_payload, &staging_dir, &paths)
+            })
+            .transpose()?;
+
+        if let Some(config_payload) = &staged_config_payload {
+            apply_update_config_payload(config_payload, &paths)?;
+            append_service_log(&format!(
+                "service runtime config replaced from {}",
+                config_payload.source.display()
+            ));
+        }
 
         std::thread::sleep(Duration::from_millis(SERVICE_UPDATE_DELAY_MS));
         let manager = manager(ServiceManagerAccess::CONNECT)?;
@@ -5265,7 +6350,7 @@ mod windows_service_control {
             },
             installed_endpoint(&paths).ok().flatten(),
             paths,
-            prepared.payload,
+            prepared.response.payload,
         ))
     }
 
@@ -6179,7 +7264,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "debug.session.create",
-            "Create a debug session from a dump or attach target.",
+            "Create a debug session from a file, attach, or launch target.",
             json!({
                 "type": "object",
                 "properties": {
@@ -6187,6 +7272,20 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
                     "target": { "type": "object" }
                 },
                 "required": ["project_root", "target"]
+            }),
+        ),
+        mcp_tool(
+            "recording.ttd",
+            "Record a Time Travel Debugging trace with TTD.exe.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_root": { "type": "string" },
+                    "target": { "type": "object" },
+                    "timeout_ms": { "type": "integer" },
+                    "options": { "type": "object" }
+                },
+                "required": ["project_root", "target", "timeout_ms"]
             }),
         ),
         mcp_tool(
@@ -6632,6 +7731,15 @@ struct RecordingStartParams {
     target: RecordingTarget,
     #[serde(default = "dbgatlas_recording::default_presets")]
     presets: Vec<RecordingPreset>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RecordingTtdParams {
+    project_root: PathBuf,
+    target: TtdTarget,
+    timeout_ms: u64,
+    #[serde(default)]
+    options: TtdRecordingOptions,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -7362,7 +8470,7 @@ mod windows_active_user_process {
         }
     }
 
-    pub fn spawn(worker_exe: &Path, args: &[&str]) -> Result<RawProcess, ServiceError> {
+    pub fn spawn(worker_exe: &Path, args: &[String]) -> Result<RawProcess, ServiceError> {
         let session_id = unsafe { WTSGetActiveConsoleSessionId() };
         if session_id == u32::MAX {
             return Err(ServiceError::Worker(
@@ -7440,7 +8548,7 @@ mod windows_active_user_process {
         })
     }
 
-    fn command_line(executable: &OsStr, args: &[&str]) -> Vec<u16> {
+    fn command_line(executable: &OsStr, args: &[String]) -> Vec<u16> {
         let mut parts = Vec::with_capacity(args.len() + 1);
         parts.push(quote_arg(&executable.to_string_lossy()));
         parts.extend(args.iter().map(|arg| quote_arg(arg)));
@@ -7772,6 +8880,111 @@ mod tests {
     }
 
     #[test]
+    fn service_update_can_replace_runtime_config_but_not_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("payload");
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(source.join(file_name), file_name).unwrap();
+        }
+        fs::write(
+            source.join(WINDOWS_SERVICE_CONFIG_FILE),
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
+        )
+        .unwrap();
+        fs::write(source.join(WINDOWS_SERVICE_TOKEN_FILE), "payload-token\n").unwrap();
+        fs::write(
+            &paths.config_path,
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7331\"\n",
+        )
+        .unwrap();
+        fs::write(&paths.token_file, "installed-token\n").unwrap();
+
+        let prepared = prepare_service_update(&source, &paths, false).unwrap();
+        let config_payload = prepared
+            .config_payload
+            .as_ref()
+            .expect("runtime config payload is discovered");
+
+        assert_eq!(config_payload.destination, paths.config_path);
+        assert!(
+            prepared
+                .response
+                .payload
+                .iter()
+                .any(|file| file.destination == paths.config_path)
+        );
+        assert!(
+            !prepared
+                .response
+                .payload
+                .iter()
+                .any(|file| file.destination == paths.token_file)
+        );
+
+        let staging = temp.path().join("config-staging");
+        let staged_payload =
+            copy_update_config_to_staging(config_payload, &staging, &paths).unwrap();
+        assert!(staged_payload.source.starts_with(&staging));
+
+        apply_update_config_payload(&staged_payload, &paths).unwrap();
+
+        assert!(
+            fs::read_to_string(&paths.config_path)
+                .unwrap()
+                .contains("127.0.0.1:7444")
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.token_file).unwrap(),
+            "installed-token\n"
+        );
+    }
+
+    #[test]
+    fn service_update_rejects_token_fields_in_runtime_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("payload");
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&source).unwrap();
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(source.join(file_name), file_name).unwrap();
+        }
+        fs::write(
+            source.join(WINDOWS_SERVICE_CONFIG_FILE),
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\ntoken = \"secret\"\n",
+        )
+        .unwrap();
+
+        let error = prepare_service_update(&source, &paths, false).unwrap_err();
+
+        assert!(error.to_string().contains("must not contain token fields"));
+        assert!(error.to_string().contains("server.token"));
+    }
+
+    #[test]
+    fn service_update_rejects_removed_local_debug_tool_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("payload");
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&source).unwrap();
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(source.join(file_name), file_name).unwrap();
+        }
+        fs::write(
+            source.join(WINDOWS_SERVICE_CONFIG_FILE),
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n\n[tools]\ndbgeng_dir = \"C:\\\\stale\\\\windbg\"\n",
+        )
+        .unwrap();
+
+        let error = prepare_service_update(&source, &paths, false).unwrap_err();
+
+        assert!(error.to_string().contains("removed local debug tool field"));
+        assert!(error.to_string().contains("tools.dbgeng_dir"));
+    }
+
+    #[test]
     fn service_update_replace_helper_swaps_and_cleans_update_dirs() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
@@ -7843,6 +9056,22 @@ allow_py_eval = true
         let capabilities = ServiceCapabilities::from_runtime_config(&runtime);
 
         assert!(capabilities.ida_py_eval);
+    }
+
+    #[test]
+    fn install_runtime_config_does_not_persist_auto_debug_stack() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.root_dir).unwrap();
+
+        let runtime =
+            create_runtime_config_if_missing(&paths, "127.0.0.1:7331".parse().unwrap()).unwrap();
+        let config = fs::read_to_string(&paths.config_path).unwrap();
+
+        assert_eq!(runtime.server.bind, "127.0.0.1:7331".parse().unwrap());
+        assert!(!config.contains("dbgeng_dir"));
+        assert!(!config.contains("ttd_dir"));
+        assert!(!config.contains("WindowsApps"));
     }
 
     #[test]
@@ -8037,7 +9266,7 @@ allow_py_eval = true
         assert_eq!(dev.identity, WorkerIdentity::CurrentUserDevMode);
 
         let installed = ProcessWorkerSupervisor::new_installed_service().unwrap();
-        assert_eq!(installed.identity, WorkerIdentity::ActiveInteractiveUser);
+        assert_eq!(installed.identity, WorkerIdentity::LocalSystem);
     }
 
     #[test]
@@ -9022,6 +10251,108 @@ allow_py_eval = true
     }
 
     #[test]
+    fn recording_ttd_registers_run_trace_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ttd_test_host(MockTtdRunnerMode::CompletedWithTrace);
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "recording.ttd".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "kind": "attach", "pid": 42 },
+                "timeout_ms": 1000,
+                "options": { "accept_eula": true }
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["state"], "completed");
+        assert_eq!(result["operation_status"], "success");
+        assert_eq!(result["target_pid"], 42);
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "recording.ttd.trace")
+        );
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "recording.ttd.index")
+        );
+        let recording_id = result["recording_id"]["id"].as_str().unwrap();
+        let metadata: Value = serde_json::from_str(
+            &fs::read_to_string(
+                workspace
+                    .root()
+                    .join("artifacts")
+                    .join("recordings")
+                    .join(recording_id)
+                    .join("recording.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["status"], "completed");
+        assert_eq!(metadata["mode"], "attach");
+        assert_eq!(metadata["traces"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recording_ttd_timeout_invokes_stop_and_keeps_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ttd_test_host(MockTtdRunnerMode::TimedOutWithTrace);
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "recording.ttd".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "kind": "launch", "executable": "app.exe", "args": [] },
+                "timeout_ms": 1000
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["state"], "timed_out");
+        assert_eq!(result["operation_status"], "success");
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.relative_path.ends_with("recorder-stop.stdout.txt")
+                && artifact.kind == "recording.recorder_output"
+        }));
+    }
+
+    #[test]
+    fn recording_ttd_without_run_trace_is_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ttd_test_host(MockTtdRunnerMode::CompletedWithoutTrace);
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "recording.ttd".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "kind": "attach", "pid": 42 },
+                "timeout_ms": 1000
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["state"], "failed");
+        assert_eq!(result["operation_status"], "failed");
+        assert!(result["error"].as_str().unwrap().contains("no .run trace"));
+    }
+
+    #[test]
     fn recording_launch_starts_target_and_records_root_pid() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
@@ -9544,6 +10875,7 @@ allow_py_eval = true
             );
         }
         assert!(tools.iter().any(|tool| tool["name"] == "workspace.facts"));
+        assert!(tools.iter().any(|tool| tool["name"] == "recording.ttd"));
         assert!(!tools.iter().any(|tool| tool["name"] == "reverse.py_eval"));
         assert!(!tools.iter().any(|tool| tool["name"] == "recording.start"));
         server.stop();
@@ -9657,7 +10989,7 @@ allow_py_eval = true
             "debug.session.create",
             json!({
                 "project_root": temp.path(),
-                "target": { "kind": "dump", "path": "sample.dmp" }
+                "target": { "kind": "file", "path": "sample.dmp" }
             }),
         );
         let session_id = create["session_id"].clone();
@@ -9687,7 +11019,7 @@ allow_py_eval = true
             "debug.session.create",
             json!({
                 "project_root": temp.path(),
-                "target": { "kind": "dump", "path": "sample.dmp" }
+                "target": { "kind": "file", "path": "sample.dmp" }
             }),
         );
         assert!(create.get("session_id").is_some());
@@ -9725,7 +11057,7 @@ allow_py_eval = true
             "debug.session.create",
             json!({
                 "project_root": temp.path(),
-                "target": { "kind": "dump", "path": "sample.dmp" }
+                "target": { "kind": "file", "path": "sample.dmp" }
             }),
         );
         let session_id = create["session_id"].clone();
@@ -9944,7 +11276,7 @@ allow_py_eval = true
             method: "debug.session.create".to_string(),
             params: Some(json!({
                 "project_root": project_root,
-                "target": { "kind": "dump", "path": "sample.dmp" }
+                "target": { "kind": "file", "path": "sample.dmp" }
             })),
         })
     }
@@ -10028,6 +11360,80 @@ allow_py_eval = true
             method: "debug.session.close".to_string(),
             params: Some(json!({ "session_id": session_id })),
         })
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockTtdRunnerMode {
+        CompletedWithTrace,
+        TimedOutWithTrace,
+        CompletedWithoutTrace,
+    }
+
+    struct MockTtdRunner {
+        mode: MockTtdRunnerMode,
+        _temp: tempfile::TempDir,
+    }
+
+    impl TtdRecorderRunner for MockTtdRunner {
+        fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, ServiceError> {
+            fs::write(
+                &invocation.stdout_path,
+                "Recording process sample.exe (42)\n",
+            )?;
+            fs::write(&invocation.stderr_path, "")?;
+            let timed_out = matches!(self.mode, MockTtdRunnerMode::TimedOutWithTrace);
+            if matches!(
+                self.mode,
+                MockTtdRunnerMode::CompletedWithTrace | MockTtdRunnerMode::TimedOutWithTrace
+            ) {
+                let traces_dir = ttd_out_dir(&invocation.args);
+                fs::create_dir_all(&traces_dir)?;
+                fs::write(traces_dir.join("sample.run"), b"run")?;
+                fs::write(traces_dir.join("sample.idx"), b"idx")?;
+            }
+            let stop = if timed_out {
+                let timeout_stop = invocation
+                    .timeout_stop
+                    .as_ref()
+                    .expect("timeout invocation has stop target");
+                fs::write(&timeout_stop.stdout_path, "stopped\n")?;
+                fs::write(&timeout_stop.stderr_path, "")?;
+                Some(TtdStopExit {
+                    stop_target: timeout_stop.stop_target.clone(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                    error: None,
+                })
+            } else {
+                assert!(invocation.timeout_stop.is_some());
+                None
+            };
+            Ok(TtdProcessExit {
+                exit_code: Some(0),
+                timed_out,
+                stop,
+                killed_after_timeout: false,
+            })
+        }
+    }
+
+    fn ttd_test_host(mode: MockTtdRunnerMode) -> ServiceHost {
+        let temp = tempfile::tempdir().unwrap();
+        let ttd_dir = temp.path().join("ttd");
+        fs::create_dir_all(&ttd_dir).unwrap();
+        fs::write(ttd_dir.join("TTD.exe"), b"fake").unwrap();
+        ServiceHost::with_mock_workers()
+            .with_capabilities(ServiceCapabilities {
+                ttd_dir: Some(ttd_dir),
+                ..Default::default()
+            })
+            .with_ttd_runner(Arc::new(MockTtdRunner { mode, _temp: temp }))
+    }
+
+    fn ttd_out_dir(args: &[OsString]) -> PathBuf {
+        args.windows(2)
+            .find_map(|pair| (pair[0] == OsString::from("-out")).then(|| PathBuf::from(&pair[1])))
+            .expect("TTD args contain -out")
     }
 
     struct InstrumentedWorkerSupervisor {

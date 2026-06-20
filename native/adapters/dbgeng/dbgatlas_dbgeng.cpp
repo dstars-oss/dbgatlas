@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <memory>
 #include <new>
 #include <string>
@@ -27,6 +28,15 @@ struct BufferOwner final : ViewOwner {
 };
 
 #ifdef _WIN32
+
+using DebugCreateFn = HRESULT(WINAPI*)(REFIID, void**);
+
+std::mutex g_runtime_mutex;
+HMODULE g_dbgeng_module = nullptr;
+DebugCreateFn g_debug_create = nullptr;
+std::wstring g_dbgeng_loaded_path;
+
+int32_t fail(DA_DbgEngStatus status, std::string message) noexcept;
 
 template <typename T>
 class ComPtr final {
@@ -165,6 +175,98 @@ std::string hresult_message(HRESULT hr) {
     return message;
 }
 
+std::wstring utf8_to_wide(const char* text) {
+    if (text == nullptr || text[0] == '\0') {
+        return std::wstring();
+    }
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nullptr, 0);
+    if (required <= 0) {
+        throw std::runtime_error("UTF-8 path conversion failed");
+    }
+    std::wstring wide(static_cast<size_t>(required), L'\0');
+    const int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide.data(), required);
+    if (written <= 0) {
+        throw std::runtime_error("UTF-8 path conversion failed");
+    }
+    if (!wide.empty() && wide.back() == L'\0') {
+        wide.pop_back();
+    }
+    return wide;
+}
+
+std::string windows_error_message(DWORD error) {
+    char buffer[256] = {};
+    const auto written = FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        error,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        buffer,
+        static_cast<DWORD>(sizeof(buffer)),
+        nullptr);
+    if (written == 0) {
+        return "Win32 error " + std::to_string(error);
+    }
+    std::string message(buffer, written);
+    while (!message.empty() && (message.back() == '\r' || message.back() == '\n')) {
+        message.pop_back();
+    }
+    return message;
+}
+
+std::wstring dbgeng_dll_path_from_dir(const char* dbgeng_dir_utf8) {
+    std::wstring dir = utf8_to_wide(dbgeng_dir_utf8);
+    if (dir.empty()) {
+        return L"dbgeng.dll";
+    }
+    const wchar_t last = dir.back();
+    if (last != L'\\' && last != L'/') {
+        dir.push_back(L'\\');
+    }
+    dir += L"dbgeng.dll";
+    return dir;
+}
+
+int32_t ensure_dbgeng_runtime_loaded(const char* dbgeng_dir_utf8) {
+    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    const std::wstring dll_path = dbgeng_dll_path_from_dir(dbgeng_dir_utf8);
+    if (g_debug_create != nullptr) {
+        if (dbgeng_dir_utf8 == nullptr || dbgeng_dir_utf8[0] == '\0') {
+            return DA_DBGENG_OK;
+        }
+        if (!g_dbgeng_loaded_path.empty() && !dll_path.empty() && _wcsicmp(g_dbgeng_loaded_path.c_str(), dll_path.c_str()) != 0) {
+            return fail(
+                DA_DBGENG_ERR_INTERNAL,
+                "DbgEng runtime is already loaded from a different path");
+        }
+        return DA_DBGENG_OK;
+    }
+
+    HMODULE module = nullptr;
+    if (dll_path == L"dbgeng.dll") {
+        module = LoadLibraryW(dll_path.c_str());
+    } else {
+        module = LoadLibraryExW(dll_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
+    if (module == nullptr) {
+        return fail(
+            DA_DBGENG_ERR_INTERNAL,
+            "LoadLibrary dbgeng.dll failed: " + windows_error_message(GetLastError()));
+    }
+
+    auto debug_create = reinterpret_cast<DebugCreateFn>(GetProcAddress(module, "DebugCreate"));
+    if (debug_create == nullptr) {
+        return fail(
+            DA_DBGENG_ERR_INTERNAL,
+            "GetProcAddress(DebugCreate) failed: " + windows_error_message(GetLastError()));
+    }
+
+    g_dbgeng_module = module;
+    g_debug_create = debug_create;
+    g_dbgeng_loaded_path = dll_path;
+    return DA_DBGENG_OK;
+}
+
 #endif
 
 int32_t fail(DA_DbgEngStatus status, std::string message) noexcept {
@@ -238,8 +340,12 @@ int32_t query_session_interfaces(DbgEngSession& session) {
 }
 
 int32_t create_session(std::unique_ptr<DbgEngSession>& session) {
+    int32_t status = ensure_dbgeng_runtime_loaded(nullptr);
+    if (status != DA_DBGENG_OK) {
+        return status;
+    }
     session = std::make_unique<DbgEngSession>();
-    HRESULT hr = DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(session->client.put()));
+    HRESULT hr = g_debug_create(__uuidof(IDebugClient), reinterpret_cast<void**>(session->client.put()));
     if (FAILED(hr)) {
         return fail_hr("DebugCreate", hr);
     }
@@ -250,6 +356,25 @@ int32_t wait_for_initial_event(DbgEngSession& session, const char* operation) {
     HRESULT hr = session.control->WaitForEvent(0, 30'000);
     if (FAILED(hr)) {
         return fail_hr(operation, hr);
+    }
+    return DA_DBGENG_OK;
+}
+
+int32_t open_debug_file(DbgEngSession& session, const char* path_utf8) {
+    const std::wstring path_wide = utf8_to_wide(path_utf8);
+    ComPtr<IDebugClient4> client4;
+    HRESULT hr = session.client->QueryInterface(__uuidof(IDebugClient4), reinterpret_cast<void**>(client4.put()));
+    if (SUCCEEDED(hr) && client4) {
+        hr = client4->OpenDumpFileWide(path_wide.c_str(), 0);
+        if (FAILED(hr)) {
+            return fail_hr("IDebugClient4::OpenDumpFileWide(open file)", hr);
+        }
+        return DA_DBGENG_OK;
+    }
+
+    hr = session.client->OpenDumpFile(path_utf8);
+    if (FAILED(hr)) {
+        return fail_hr("IDebugClient::OpenDumpFile(open file)", hr);
     }
     return DA_DBGENG_OK;
 }
@@ -310,6 +435,21 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out) {
     });
 }
 
+DA_DBGENG_EXPORT int32_t da_dbgeng_load_runtime(const char* dbgeng_dir_utf8) {
+    return guard([&]() -> int32_t {
+#ifndef _WIN32
+        (void)dbgeng_dir_utf8;
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#else
+        int32_t status = ensure_dbgeng_runtime_loaded(dbgeng_dir_utf8);
+        if (status == DA_DBGENG_OK) {
+            g_last_error.clear();
+        }
+        return status;
+#endif
+    });
+}
+
 DA_DBGENG_EXPORT void da_dbgeng_release_view(void* owner) {
     try {
         delete static_cast<ViewOwner*>(owner);
@@ -336,7 +476,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_last_error(
     });
 }
 
-DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_dump(
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_file(
     const char* path_utf8,
     DA_DbgEngSessionHandle** out_handle) {
     return guard([&]() -> int32_t {
@@ -346,7 +486,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_dump(
         *out_handle = nullptr;
 
         if (path_utf8 == nullptr || path_utf8[0] == '\0') {
-            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "dump path is empty");
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "debug file path is empty");
         }
 
 #ifndef _WIN32
@@ -358,11 +498,11 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_dump(
         if (status != DA_DBGENG_OK) {
             return status;
         }
-        HRESULT hr = session->client->OpenDumpFile(path_utf8);
-        if (FAILED(hr)) {
-            return fail_hr("IDebugClient::OpenDumpFile", hr);
+        status = open_debug_file(*session, path_utf8);
+        if (status != DA_DBGENG_OK) {
+            return status;
         }
-        status = wait_for_initial_event(*session, "IDebugControl::WaitForEvent(open dump)");
+        status = wait_for_initial_event(*session, "IDebugControl::WaitForEvent(open file)");
         if (status != DA_DBGENG_OK) {
             return status;
         }

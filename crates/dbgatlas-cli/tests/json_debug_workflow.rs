@@ -32,7 +32,7 @@ fn cli_json_debug_workflow_returns_recording_refs() {
         "create",
         "--project-root",
         temp.path().to_str().unwrap(),
-        "--dump",
+        "--file",
         dump_path.to_str().unwrap(),
         "--endpoint",
         &endpoint.to_string(),
