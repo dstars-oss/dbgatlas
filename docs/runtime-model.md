@@ -29,7 +29,7 @@ analysis-workspace/
 - `tools.ttd_dir`
 - `tools.ida.install_dir`
 - `tools.ida.python_executable`
-- `tools.ida.vendor_src_dir`（仅用于本机开发/构建 IDA native adapter 的 SDK include/lib 定位；运行时打开 reverse session 不依赖该路径）
+- `tools.ida.vendor_src_dir`（历史兼容配置；IDA native adapter 已维护最小自有 ABI 声明，构建和运行时打开 reverse session 均不依赖该 SDK 路径）
 - `tools.ida.allow_py_eval`（默认 `false`；显式开启高权限 `reverse.py_eval` / IDAPython 执行能力）
 - `process.child_identity`
 - `process.fallback_child_identity`

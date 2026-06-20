@@ -24,6 +24,7 @@ add_library(dbgatlas_etw SHARED
 
 add_library(dbgatlas_ida SHARED
     adapters/ida/dbgatlas_ida.cpp
+    adapters/ida/dbgatlas_ida_runtime.cpp
 )
 
 if(WIN32)
@@ -44,17 +45,8 @@ target_include_directories(dbgatlas_etw
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
-set(DBGATLAS_IDA_SDK_DIR "" CACHE PATH "Path to the IDA SDK root")
-if(NOT DBGATLAS_IDA_SDK_DIR AND DEFINED ENV{DBGATLAS_IDA_SDK_DIR})
-    set(DBGATLAS_IDA_SDK_DIR "$ENV{DBGATLAS_IDA_SDK_DIR}")
-endif()
-if(NOT DBGATLAS_IDA_SDK_DIR)
-    set(DBGATLAS_IDA_SDK_DIR "D:/Installer/ida93sp1/misc/ida-sdk")
-endif()
-
 target_compile_definitions(dbgatlas_ida PRIVATE
     DBGATLAS_NATIVE_BUILD
-    IDALIB_IMPL
     __IDP__
     __EA64__=1
     $<$<PLATFORM_ID:Windows>:__NT__ WIN32 _WINDOWS>
@@ -62,15 +54,11 @@ target_compile_definitions(dbgatlas_ida PRIVATE
 target_include_directories(dbgatlas_ida
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    PRIVATE
-        "${DBGATLAS_IDA_SDK_DIR}/src/include"
 )
 
 if(WIN32)
     target_link_libraries(dbgatlas_dbgeng PRIVATE DbgEng)
     target_link_libraries(dbgatlas_etw PRIVATE Advapi32 Tdh Ole32 OleAut32 uuid)
-    target_link_directories(dbgatlas_ida PRIVATE "${DBGATLAS_IDA_SDK_DIR}/src/lib/x64_win_64")
-    target_link_libraries(dbgatlas_ida PRIVATE ida idalib)
 endif()
 
 if(MSVC)

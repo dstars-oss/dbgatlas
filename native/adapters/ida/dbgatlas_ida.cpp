@@ -1,27 +1,11 @@
 #define NOMINMAX
 #include "dbgatlas_ida.h"
+#include "dbgatlas_ida_runtime.h"
 
 #include <cstring>
 
 #ifdef _WIN32
 #include <windows.h>
-
-#include <ida.hpp>
-#include <auto.hpp>
-#include <bytes.hpp>
-#include <expr.hpp>
-#include <frame.hpp>
-#include <funcs.hpp>
-#include <hexrays.hpp>
-#include <idalib.hpp>
-#include <loader.hpp>
-#include <lines.hpp>
-#include <name.hpp>
-#include <nalt.hpp>
-#include <segment.hpp>
-#include <strlist.hpp>
-#include <typeinf.hpp>
-#include <xref.hpp>
 
 #include <algorithm>
 #include <array>
@@ -134,7 +118,8 @@ DA_IdaTextView make_text_view(const std::string& text) {
 }
 
 std::string qstring_to_string(const qstring& value) {
-    return value.c_str() == nullptr ? std::string() : std::string(value.c_str());
+    const char* text = value.c_str();
+    return text == nullptr ? std::string() : std::string(text, value.length());
 }
 
 std::string json_escape(const std::string& text) {
@@ -1947,6 +1932,7 @@ DA_IDA_EXPORT int32_t da_ida_session_open(
         auto handle = std::make_unique<IdaSessionHandleImpl>();
         handle->owner_thread = std::this_thread::get_id();
         validate_ida_install_dir(install_dir);
+        dbgatlas_ida_runtime_load(install_dir);
         int init_result = init_library(0, nullptr);
         if (init_result != 0) {
             return fail(DA_IDA_ERR_IDA, "init_library failed with result " + std::to_string(init_result));

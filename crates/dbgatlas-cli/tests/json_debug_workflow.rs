@@ -1,7 +1,7 @@
 use dbgatlas_service::{ServiceConfig, ServiceHost, ServiceShutdown, run_http_service_until};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
@@ -157,22 +157,143 @@ fn cli_json_recording_workflow_controls_attach_recordings() {
     server.join().unwrap().unwrap();
 }
 
+#[test]
+fn cli_local_rpc_jsonl_batches_and_resolves_response_refs() {
+    let temp = tempfile::tempdir().unwrap();
+    let requests = temp.path().join("requests.jsonl");
+    std::fs::write(
+        &requests,
+        concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"service.health","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"operation.get","params":{"operation_id":{"id":"$1/result/service"}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let request_path = requests.to_str().unwrap();
+    let worker_exe = temp.path().join("missing-worker.exe");
+    let worker_exe = worker_exe.to_str().unwrap();
+
+    let output = run_dbgatlas_output(&[
+        "rpc",
+        "local",
+        "--requests-jsonl",
+        request_path,
+        "--worker-exe",
+        worker_exe,
+    ]);
+    assert_success(&output);
+    let responses = parse_jsonl_output(&output.stdout);
+
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["result"]["status"], "ok");
+    assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[1]["error"]["code"], -32011);
+    assert!(
+        responses[1]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("DbgAtlas")
+    );
+}
+
+#[test]
+fn cli_local_rpc_jsonl_reports_invalid_response_refs_as_rpc_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let requests = temp.path().join("requests.jsonl");
+    std::fs::write(
+        &requests,
+        concat!(
+            r#"{"jsonrpc":"2.0","id":"health","method":"service.health","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":"bad-ref","method":"operation.get","params":{"operation_id":{"id":"$health/result/missing"}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let request_path = requests.to_str().unwrap();
+
+    let output = run_dbgatlas_output(&["rpc", "local", "--requests-jsonl", request_path]);
+    assert_success(&output);
+    let responses = parse_jsonl_output(&output.stdout);
+
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], "health");
+    assert_eq!(responses[0]["result"]["status"], "ok");
+    assert_eq!(responses[1]["id"], "bad-ref");
+    assert_eq!(responses[1]["error"]["code"], -32602);
+    assert!(
+        responses[1]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("$health/result/missing")
+    );
+}
+
+#[test]
+fn cli_local_rpc_jsonl_rejects_wrong_jsonrpc_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let requests = temp.path().join("requests.jsonl");
+    std::fs::write(
+        &requests,
+        concat!(
+            r#"{"jsonrpc":"1.0","id":1,"method":"service.health","params":{}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let request_path = requests.to_str().unwrap();
+
+    let output = run_dbgatlas_output(&["rpc", "local", "--requests-jsonl", request_path]);
+    assert_success(&output);
+    let responses = parse_jsonl_output(&output.stdout);
+
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["error"]["code"], -32602);
+    assert!(
+        responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("jsonrpc must be `2.0`")
+    );
+    assert!(responses[0].get("result").is_none());
+}
+
 fn run_dbgatlas<const N: usize>(args: [&str; N]) -> Value {
     run_dbgatlas_dynamic(&args)
 }
 
 fn run_dbgatlas_dynamic(args: &[&str]) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_dbgatlas"))
+    let output = run_dbgatlas_output(args);
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn run_dbgatlas_output(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dbgatlas"))
         .args(args)
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn parse_jsonl_output(output: &[u8]) -> Vec<Value> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 fn start_recording_for_cli(project_root: &str, pid: &str, endpoint: &str) -> Value {

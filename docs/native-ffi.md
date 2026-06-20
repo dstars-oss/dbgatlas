@@ -52,7 +52,7 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 ## IDA native adapter ABI
 
-IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。Rust safe wrapper 根据请求中的 IDA install dir 配置 Windows DLL search path，再运行时加载 `dbgatlas_ida.dll`；adapter 正常链接 `ida.dll` / `idalib.dll` 并按需使用 IDA SDK / Hex-Rays SDK header。导出边界只暴露 opaque handle、固定宽度整数和 text view。
+IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。Rust safe wrapper 根据请求中的 IDA install dir 配置 Windows DLL search path，再运行时加载 `dbgatlas_ida.dll`；adapter 维护 IDA 9.3 SP1 最小自有 ABI 声明，并在 session open 时按需加载用户本机安装目录里的 `ida.dll` / `idalib.dll` / Hex-Rays dispatcher。构建不依赖 IDA SDK headers 或 import libs，导出边界只暴露 opaque handle、固定宽度整数和 text view。
 
 当前最小 ABI：
 

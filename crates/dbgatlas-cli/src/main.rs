@@ -1,17 +1,20 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dbgatlas_debug::DebugTarget;
 use dbgatlas_recording::RecordingTarget;
 use dbgatlas_service::{
-    DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcRequest, ServiceConfig, ServiceHost,
-    WindowsServiceApplyUpdateOptions, WindowsServiceInstallOptions, WindowsServiceRunOptions,
-    WindowsServiceUninstallOptions, apply_windows_service_update, install_windows_service,
-    installed_client_config, invoke_http_json_rpc, run_http_service,
+    DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
+    ServiceConfig, ServiceHost, WindowsServiceApplyUpdateOptions, WindowsServiceInstallOptions,
+    WindowsServiceRunOptions, WindowsServiceUninstallOptions, apply_windows_service_update,
+    install_windows_service, installed_client_config, invoke_http_json_rpc, run_http_service,
     run_windows_service_dispatcher, start_windows_service, status_windows_service,
     stop_windows_service, uninstall_windows_service,
 };
 use dbgatlas_workspace::{Workspace, WorkspaceInitOptions};
-use serde_json::json;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -34,6 +37,10 @@ enum Commands {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    Rpc {
+        #[command(subcommand)]
+        command: RpcCommand,
     },
     Debug {
         #[command(subcommand)]
@@ -113,6 +120,16 @@ enum ServiceCommand {
         timeout_ms: u64,
         #[arg(long)]
         no_restart: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RpcCommand {
+    Local {
+        #[arg(long)]
+        requests_jsonl: PathBuf,
+        #[arg(long)]
+        worker_exe: Option<PathBuf>,
     },
 }
 
@@ -267,6 +284,7 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Workspace { command } => run_workspace(command, cli.json),
         Commands::Service { command } => run_service(command, cli.json),
+        Commands::Rpc { command } => run_rpc(command),
         Commands::Debug { command } => run_debug(command, cli.json),
         Commands::Recording { command } => run_recording(command, cli.json),
         Commands::Native { command } => run_native(command, cli.json),
@@ -320,6 +338,62 @@ fn run_workspace(command: WorkspaceCommand, as_json: bool) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn run_rpc(command: RpcCommand) -> Result<()> {
+    match command {
+        RpcCommand::Local {
+            requests_jsonl,
+            worker_exe,
+        } => run_local_rpc(requests_jsonl, worker_exe),
+    }
+}
+
+fn run_local_rpc(requests_jsonl: PathBuf, worker_exe: Option<PathBuf>) -> Result<()> {
+    let worker_exe = worker_exe.map(absolute_path).transpose()?;
+    let host = match worker_exe {
+        Some(worker_exe) => ServiceHost::with_process_worker_exe(worker_exe)?,
+        None => ServiceHost::with_process_workers()?,
+    };
+    let file = File::open(&requests_jsonl)
+        .with_context(|| format!("failed to open {}", requests_jsonl.display()))?;
+    let reader = BufReader::new(file);
+    let mut responses = HashMap::<String, Value>::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = line.with_context(|| {
+            format!(
+                "failed to read JSON-RPC request at {}:{line_number}",
+                requests_jsonl.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let mut request: JsonRpcRequest = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "failed to parse JSON-RPC request at {}:{line_number}",
+                requests_jsonl.display()
+            )
+        })?;
+        let response = if request.jsonrpc != "2.0" {
+            local_rpc_error_response(request.id.clone(), "jsonrpc must be `2.0`".to_string())
+        } else {
+            match resolve_request_refs(&mut request, &responses) {
+                Ok(()) => host.handle_rpc(request),
+                Err(message) => local_rpc_error_response(request.id.clone(), message),
+            }
+        };
+        let response_value = serde_json::to_value(&response)?;
+        if let Some(id) = response.id.as_ref().map(response_id_key) {
+            responses.insert(id, response_value.clone());
+        }
+        println!("{}", serde_json::to_string(&response_value)?);
+    }
+
     Ok(())
 }
 
@@ -715,6 +789,78 @@ fn run_native(command: NativeCommand, as_json: bool) -> Result<()> {
 fn print_json(value: serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+fn resolve_request_refs(
+    request: &mut JsonRpcRequest,
+    responses: &HashMap<String, Value>,
+) -> std::result::Result<(), String> {
+    if let Some(params) = request.params.as_mut() {
+        resolve_response_refs(params, responses)?;
+    }
+    Ok(())
+}
+
+fn resolve_response_refs(
+    value: &mut Value,
+    responses: &HashMap<String, Value>,
+) -> std::result::Result<(), String> {
+    match value {
+        Value::String(text) => {
+            if let Some((id, pointer)) = parse_response_ref(text) {
+                let replacement = responses
+                    .get(id)
+                    .and_then(|response| response.pointer(pointer))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("response reference ${id}{pointer} could not be resolved")
+                    })?;
+                *value = replacement;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                resolve_response_refs(item, responses)?;
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                resolve_response_refs(value, responses)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parse_response_ref(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix('$')?;
+    let slash = rest.find('/')?;
+    let id = &rest[..slash];
+    if id.is_empty() {
+        return None;
+    }
+    Some((id, &rest[slash..]))
+}
+
+fn response_id_key(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn local_rpc_error_response(id: Option<Value>, message: String) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: -32602,
+            message,
+        }),
+    }
 }
 
 fn absolute_path(path: PathBuf) -> Result<PathBuf> {

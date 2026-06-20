@@ -185,6 +185,12 @@ impl ServiceHost {
         Ok(Self::new(Arc::new(ProcessWorkerSupervisor::new()?)))
     }
 
+    pub fn with_process_worker_exe(worker_exe: PathBuf) -> Result<Self, ServiceError> {
+        Ok(Self::new(Arc::new(
+            ProcessWorkerSupervisor::new_with_worker_exe(worker_exe)?,
+        )))
+    }
+
     pub fn with_installed_process_workers() -> Result<Self, ServiceError> {
         Ok(Self::new(Arc::new(
             ProcessWorkerSupervisor::new_installed_service()?,
@@ -2572,6 +2578,7 @@ impl WorkerSupervisor for MockWorkerSupervisor {
 
 pub struct ProcessWorkerSupervisor {
     identity: WorkerIdentity,
+    worker_exe: Option<PathBuf>,
     workers: Mutex<HashMap<String, Arc<ProcessWorkerState>>>,
     job: job::ManagedJob,
 }
@@ -2609,6 +2616,16 @@ impl ProcessWorkerSupervisor {
     pub fn new() -> Result<Self, ServiceError> {
         Ok(Self {
             identity: WorkerIdentity::CurrentUserDevMode,
+            worker_exe: None,
+            workers: Mutex::new(HashMap::new()),
+            job: job::ManagedJob::create_result("DbgAtlasDevWorkers")?,
+        })
+    }
+
+    pub fn new_with_worker_exe(worker_exe: PathBuf) -> Result<Self, ServiceError> {
+        Ok(Self {
+            identity: WorkerIdentity::CurrentUserDevMode,
+            worker_exe: Some(worker_exe),
             workers: Mutex::new(HashMap::new()),
             job: job::ManagedJob::create_result("DbgAtlasDevWorkers")?,
         })
@@ -2617,6 +2634,7 @@ impl ProcessWorkerSupervisor {
     pub fn new_installed_service() -> Result<Self, ServiceError> {
         Ok(Self {
             identity: WorkerIdentity::ActiveInteractiveUser,
+            worker_exe: None,
             workers: Mutex::new(HashMap::new()),
             job: job::ManagedJob::create_result("DbgAtlasInstalledWorkers")?,
         })
@@ -2640,7 +2658,11 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             .expect("generated worker ids are valid");
         let pipe_name = unique_pipe_name(&request.session_id);
         let transport = WorkerTransport::create_server(&pipe_name)?;
-        let worker_exe = worker_executable_path()?;
+        let worker_exe = self
+            .worker_exe
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(worker_executable_path)?;
         let mut child = spawn_worker_process(
             &worker_exe,
             &pipe_name,

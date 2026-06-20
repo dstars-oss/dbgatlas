@@ -8,7 +8,8 @@ fn main() {
     println!("cargo:rerun-if-changed=../../native/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../../native/include/dbgatlas_ida.h");
     println!("cargo:rerun-if-changed=../../native/adapters/ida/dbgatlas_ida.cpp");
-    println!("cargo:rerun-if-env-changed=DBGATLAS_IDA_SDK_DIR");
+    println!("cargo:rerun-if-changed=../../native/adapters/ida/dbgatlas_ida_runtime.cpp");
+    println!("cargo:rerun-if-changed=../../native/adapters/ida/dbgatlas_ida_runtime.h");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -30,10 +31,6 @@ fn main() {
     } else {
         "Debug"
     };
-    let ida_sdk_dir = env::var_os("DBGATLAS_IDA_SDK_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"D:\Installer\ida93sp1\misc\ida-sdk"));
-
     fs::create_dir_all(&build_dir).expect("failed to create CMake build directory");
 
     let mut configure = Command::new("cmake");
@@ -45,8 +42,7 @@ fn main() {
         .arg("-G")
         .arg(generator)
         .arg("-A")
-        .arg(msvc_arch())
-        .arg(format!("-DDBGATLAS_IDA_SDK_DIR={}", ida_sdk_dir.display()));
+        .arg(msvc_arch());
     run(configure, "configure native CMake project");
 
     let mut build = Command::new("cmake");
