@@ -981,7 +981,7 @@ std::string core_decompile(const std::string& args) {
         return "{\"found\":false,\"pseudocode\":null,\"error\":\"function not found\"}";
     }
 
-    if (!init_hexrays_plugin()) {
+    if (!dbgatlas_init_hexrays_plugin()) {
         throw std::runtime_error("Hex-Rays decompiler is not available");
     }
 
@@ -1038,7 +1038,7 @@ std::string core_disasm(const std::string& args) {
                 << ",\"text\":" << json_string(qstring_to_string(line)) << "}";
             ++emitted;
         }
-        asize_t size = get_item_size(ea);
+        asize_t size = dbgatlas_get_item_size(ea);
         ea += size == 0 ? 1 : size;
     }
     out << "]}";
@@ -1115,7 +1115,7 @@ std::string core_xrefs_to_field(const std::string& args) {
                             << ",\"function\":" << function_json(function) << "}";
                     }
                 }
-                asize_t size = get_item_size(ea);
+                asize_t size = dbgatlas_get_item_size(ea);
                 ea += size == 0 ? 1 : size;
             }
         }
@@ -1150,7 +1150,7 @@ std::string core_callees(const std::string& args) {
                         out << function_json(callee);
                     }
                 }
-                asize_t size = get_item_size(ea);
+                asize_t size = dbgatlas_get_item_size(ea);
                 ea += size == 0 ? 1 : size;
             }
         }
@@ -1400,7 +1400,7 @@ std::string core_declare_type(const std::string& args) {
 }
 
 std::string core_force_recompile(const std::string& args) {
-    if (!init_hexrays_plugin()) {
+    if (!dbgatlas_init_hexrays_plugin()) {
         throw std::runtime_error("Hex-Rays decompiler is not available");
     }
     std::vector<std::string> addrs = json_list_arg(args, "addrs");
@@ -1668,7 +1668,7 @@ std::string core_search_text(IdaSessionHandleImpl* handle, const std::string& ar
                         maybe_add_search_row(&rows, "comments", ea, qstring_to_string(rcmt), needle);
                     }
                 }
-                asize_t size = get_item_size(ea);
+                asize_t size = dbgatlas_get_item_size(ea);
                 ea += size == 0 ? 1 : size;
             }
         }
@@ -1937,6 +1937,7 @@ DA_IDA_EXPORT int32_t da_ida_session_open(
         if (init_result != 0) {
             return fail(DA_IDA_ERR_IDA, "init_library failed with result " + std::to_string(init_result));
         }
+        dbgatlas_validate_ida_runtime_version();
         int open_result = open_database(database_path_utf8_copy.c_str(), true, nullptr);
         if (open_result != 0) {
             return fail(DA_IDA_ERR_IDA, "open_database failed with result " + std::to_string(open_result));

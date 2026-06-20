@@ -14,6 +14,17 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
+set(DBGATLAS_IDA_SDK_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../3rdpart/cpp/ida-sdk/include"
+    CACHE PATH "Vendored IDA SDK include directory"
+)
+if(NOT EXISTS "${DBGATLAS_IDA_SDK_INCLUDE_DIR}/pro.h")
+    message(FATAL_ERROR
+        "IDA SDK headers are required at ${DBGATLAS_IDA_SDK_INCLUDE_DIR}; "
+        "expected pro.h from dstars-oss/ida-sdk v9.3.1-release"
+    )
+endif()
+
 add_library(dbgatlas_dbgeng SHARED
     adapters/dbgeng/dbgatlas_dbgeng.cpp
 )
@@ -54,6 +65,10 @@ target_compile_definitions(dbgatlas_ida PRIVATE
 target_include_directories(dbgatlas_ida
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_include_directories(dbgatlas_ida
+    SYSTEM PRIVATE
+        "${DBGATLAS_IDA_SDK_INCLUDE_DIR}"
 )
 
 if(WIN32)

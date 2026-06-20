@@ -5,19 +5,54 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=../../native/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=../../native/include/dbgatlas_ida.h");
-    println!("cargo:rerun-if-changed=../../native/adapters/ida/dbgatlas_ida.cpp");
-    println!("cargo:rerun-if-changed=../../native/adapters/ida/dbgatlas_ida_runtime.cpp");
-    println!("cargo:rerun-if-changed=../../native/adapters/ida/dbgatlas_ida_runtime.h");
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let repo_dir = manifest_dir.join("..").join("..");
+    let native_dir = repo_dir.join("native");
+    let ida_sdk_include_dir = repo_dir
+        .join("3rdpart")
+        .join("cpp")
+        .join("ida-sdk")
+        .join("include");
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("CMakeLists.txt").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("include").join("dbgatlas_ida.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir
+            .join("adapters")
+            .join("ida")
+            .join("dbgatlas_ida.cpp")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir
+            .join("adapters")
+            .join("ida")
+            .join("dbgatlas_ida_runtime.cpp")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir
+            .join("adapters")
+            .join("ida")
+            .join("dbgatlas_ida_runtime.h")
+            .display()
+    );
+    emit_rerun_if_changed_dir(&ida_sdk_include_dir);
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
     ensure_msvc_target();
 
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let native_dir = manifest_dir.join("..").join("..").join("native");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let generator = visual_studio_generator();
     let build_dir = out_dir.join(match generator {
@@ -82,6 +117,21 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
     copy_runtime_dlls(&out_dir, &runtime_dlls);
+}
+
+fn emit_rerun_if_changed_dir(dir: &Path) {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            emit_rerun_if_changed_dir(&path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
 
 fn ensure_msvc_target() {
