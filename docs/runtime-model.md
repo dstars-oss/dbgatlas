@@ -63,7 +63,7 @@ SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe
 
 开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。开发态如需暴露高权限 IDAPython 执行能力，必须显式传入 `--allow-ida-py-eval`。
 
-DbgEng / TTD 路径解析不读取 runtime config 或环境变量中的本地安装路径。安装态 debug worker 默认使用 LocalSystem，由运行时按当前机器状态自动发现候选，避免把 Store WinDbg 的版本化 WindowsApps 路径写死到 `runtime.toml`。
+DbgEng / TTD 路径解析不读取 runtime config 或环境变量中的本地安装路径。安装态 debug worker 默认使用 LocalSystem，由运行时按当前机器状态自动发现候选，避免把 Store WinDbg 的版本化 WindowsApps 路径写死到 `runtime.toml`。当 `.run` replay、用户目录 dump 或 live launch 需要交互用户权限时，调用方可在 `debug.session.create` 传入 `worker_identity: "active_interactive_user"`；TTD `.run` replay 的 target 仍使用 `{ "kind": "file", "path": "trace.run" }`。
 
 - DbgEng：Store WinDbg -> Windows Kits / WDK Debuggers -> System32。
 - TTD：按 DbgEng 候选顺序查找 `<dbgeng_dir>\ttd` -> Store TimeTravelDebugging。
@@ -84,7 +84,7 @@ recording policy 的文档目标：
 - attach 不回填历史，只记录 `recording.start` 之后的事件。
 - WPR/WPAExport 不作为主采集链路，只作为未来诊断、比对或 fallback 方向。
 
-安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。安装态 debug worker 默认使用 LocalSystem；IDA reverse worker 使用 active interactive session 用户，不使用 LocalSystem fallback。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
+安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。安装态 debug worker 默认使用 LocalSystem，并支持请求级 active interactive user override；IDA reverse worker 使用 active interactive session 用户，不使用 LocalSystem fallback。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
 
 ## 校验原则
 

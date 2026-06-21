@@ -61,6 +61,10 @@ unsafe extern "C" {
         pid: u32,
         out_handle: *mut *mut DA_DbgEngSessionHandle,
     ) -> i32;
+    pub fn da_dbgeng_session_launch_process(
+        command_line_utf8: *const c_char,
+        out_handle: *mut *mut DA_DbgEngSessionHandle,
+    ) -> i32;
     pub fn da_dbgeng_session_execute(
         handle: *mut DA_DbgEngSessionHandle,
         command_utf8: *const c_char,

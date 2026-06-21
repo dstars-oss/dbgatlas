@@ -69,7 +69,7 @@ flowchart LR
 - `debug.session.create` 接收 `project_root` 和 target，返回 `session_id`；后续 `debug.eval`、`debug.modules`、`debug.threads`、`debug.stack`、`debug.session.close` 和 `debug.session.kill` 只需要 `session_id`。
 - `reverse.session.open` 接收 `project_root`、IDA database path 和可选 IDA install dir，返回独立的 reverse `session_id`；后续 `reverse.*` 和 `reverse.session.close` 只需要这个 `session_id`。
 - 外部 service API 表达产品能力；内部 worker protocol 表达低层执行、状态、artifact 写入清单和进程控制。两者分层演进。
-- Worker identity 按 capability policy 选择：debug/IDA 默认 active interactive user session，ETW recording 默认 LocalSystem 或显式配置的受控 identity。安装态 IDA worker 不允许 fallback 到 LocalSystem；权限不足时返回结构化错误，不自动提权。
+- Worker identity 按 capability policy 选择：安装态 debug 默认 LocalSystem，可在 `debug.session.create` 请求中用 `worker_identity: "active_interactive_user"` 显式切到交互用户；IDA 默认 active interactive user session；ETW recording 默认 LocalSystem 或显式配置的受控 identity。安装态 IDA worker 不允许 fallback 到 LocalSystem；权限不足时返回结构化错误，不自动提权。
 
 ## 预留但不创建
 

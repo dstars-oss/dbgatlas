@@ -134,16 +134,76 @@ private:
     std::string output_;
 };
 
+class BreakingEventCallbacks final : public DebugBaseEventCallbacks {
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return InterlockedIncrement(&refs_);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto refs = InterlockedDecrement(&refs_);
+        return static_cast<ULONG>(refs);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetInterestMask(PULONG mask) override {
+        if (mask == nullptr) {
+            return E_POINTER;
+        }
+        *mask = DEBUG_EVENT_CREATE_PROCESS | DEBUG_EVENT_EXCEPTION | DEBUG_EVENT_BREAKPOINT;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Breakpoint(PDEBUG_BREAKPOINT bp) override {
+        UNREFERENCED_PARAMETER(bp);
+        return DEBUG_STATUS_BREAK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Exception(PEXCEPTION_RECORD64 exception, ULONG first_chance) override {
+        UNREFERENCED_PARAMETER(exception);
+        UNREFERENCED_PARAMETER(first_chance);
+        return DEBUG_STATUS_BREAK;
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateProcess(
+        ULONG64 image_file_handle,
+        ULONG64 handle,
+        ULONG64 base_offset,
+        ULONG module_size,
+        PCSTR module_name,
+        PCSTR image_name,
+        ULONG check_sum,
+        ULONG time_date_stamp,
+        ULONG64 initial_thread_handle,
+        ULONG64 thread_data_offset,
+        ULONG64 start_offset) override {
+        UNREFERENCED_PARAMETER(image_file_handle);
+        UNREFERENCED_PARAMETER(handle);
+        UNREFERENCED_PARAMETER(base_offset);
+        UNREFERENCED_PARAMETER(module_size);
+        UNREFERENCED_PARAMETER(module_name);
+        UNREFERENCED_PARAMETER(image_name);
+        UNREFERENCED_PARAMETER(check_sum);
+        UNREFERENCED_PARAMETER(time_date_stamp);
+        UNREFERENCED_PARAMETER(initial_thread_handle);
+        UNREFERENCED_PARAMETER(thread_data_offset);
+        UNREFERENCED_PARAMETER(start_offset);
+        return DEBUG_STATUS_BREAK;
+    }
+
+private:
+    volatile LONG refs_ = 1;
+};
+
 struct DbgEngSession final {
     ComPtr<IDebugClient> client;
     ComPtr<IDebugControl> control;
     ComPtr<IDebugSymbols> symbols;
     ComPtr<IDebugDataSpaces> data_spaces;
-    bool attached_process = false;
+    bool detach_processes_on_close = false;
 
     ~DbgEngSession() {
         if (client) {
-            if (attached_process) {
+            if (detach_processes_on_close) {
                 client->DetachProcesses();
             }
             client->EndSession(DEBUG_END_PASSIVE);
@@ -388,10 +448,49 @@ int32_t create_session(std::unique_ptr<DbgEngSession>& session) {
 
 int32_t wait_for_initial_event(DbgEngSession& session, const char* operation) {
     HRESULT hr = session.control->WaitForEvent(0, 30'000);
-    if (FAILED(hr)) {
+    if (hr != S_OK) {
         return fail_hr(operation, hr);
     }
     return DA_DBGENG_OK;
+}
+
+int32_t wait_for_launch_initial_event(DbgEngSession& session) {
+    BreakingEventCallbacks callbacks;
+    IDebugEventCallbacks* previous = nullptr;
+    HRESULT hr = session.client->GetEventCallbacks(&previous);
+    if (FAILED(hr)) {
+        return fail_hr("IDebugClient::GetEventCallbacks(launch process)", hr);
+    }
+
+    hr = session.client->SetEventCallbacks(&callbacks);
+    if (FAILED(hr)) {
+        if (previous != nullptr) {
+            previous->Release();
+        }
+        return fail_hr("IDebugClient::SetEventCallbacks(launch process)", hr);
+    }
+
+    hr = session.control->WaitForEvent(0, 30'000);
+
+    const HRESULT restore_hr = session.client->SetEventCallbacks(previous);
+    if (previous != nullptr) {
+        previous->Release();
+    }
+    if (FAILED(restore_hr)) {
+        return fail_hr("IDebugClient::SetEventCallbacks(restore)", restore_hr);
+    }
+
+    if (hr == S_OK) {
+        return DA_DBGENG_OK;
+    }
+
+    ULONG execution_status = 0;
+    const HRESULT status_hr = session.control->GetExecutionStatus(&execution_status);
+    if (hr == E_UNEXPECTED && SUCCEEDED(status_hr) && execution_status == DEBUG_STATUS_NO_DEBUGGEE) {
+        return DA_DBGENG_OK;
+    }
+
+    return fail_hr("IDebugControl::WaitForEvent(launch process)", hr);
 }
 
 int32_t open_debug_file(DbgEngSession& session, const char* path_utf8) {
@@ -409,6 +508,26 @@ int32_t open_debug_file(DbgEngSession& session, const char* path_utf8) {
     hr = session.client->OpenDumpFile(path_utf8);
     if (FAILED(hr)) {
         return fail_hr("IDebugClient::OpenDumpFile(open file)", hr);
+    }
+    return DA_DBGENG_OK;
+}
+
+int32_t launch_debug_process(DbgEngSession& session, const char* command_line_utf8) {
+    std::wstring command_line_wide = utf8_to_wide(command_line_utf8);
+    ComPtr<IDebugClient4> client4;
+    HRESULT hr = session.client->QueryInterface(__uuidof(IDebugClient4), reinterpret_cast<void**>(client4.put()));
+    if (SUCCEEDED(hr) && client4) {
+        hr = client4->CreateProcessWide(0, command_line_wide.data(), DEBUG_ONLY_THIS_PROCESS);
+        if (FAILED(hr)) {
+            return fail_hr("IDebugClient4::CreateProcessWide(launch process)", hr);
+        }
+        return DA_DBGENG_OK;
+    }
+
+    std::string command_line_ansi(command_line_utf8);
+    hr = session.client->CreateProcess(0, command_line_ansi.data(), DEBUG_ONLY_THIS_PROCESS);
+    if (FAILED(hr)) {
+        return fail_hr("IDebugClient::CreateProcess(launch process)", hr);
     }
     return DA_DBGENG_OK;
 }
@@ -467,7 +586,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out) {
         out->struct_size = sizeof(DA_DbgEngVersion);
         out->flags = 0;
         out->abi_major = 0;
-        out->abi_minor = 2;
+        out->abi_minor = 3;
         out->abi_patch = 0;
         g_last_error.clear();
         return DA_DBGENG_OK;
@@ -584,8 +703,46 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
         if (FAILED(hr)) {
             return fail_hr("IDebugClient::AttachProcess", hr);
         }
-        session->attached_process = true;
+        session->detach_processes_on_close = true;
         (void)session->control->WaitForEvent(0, 1'000);
+        *out_handle = reinterpret_cast<DA_DbgEngSessionHandle*>(session.release());
+        g_last_error.clear();
+        return DA_DBGENG_OK;
+#endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_launch_process(
+    const char* command_line_utf8,
+    DA_DbgEngSessionHandle** out_handle) {
+    return guard([&]() -> int32_t {
+        if (out_handle == nullptr) {
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "out session handle pointer is null");
+        }
+        *out_handle = nullptr;
+
+        if (command_line_utf8 == nullptr || command_line_utf8[0] == '\0') {
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "launch command line is empty");
+        }
+
+#ifndef _WIN32
+        (void)command_line_utf8;
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#else
+        std::unique_ptr<DbgEngSession> session;
+        int32_t status = create_session(session);
+        if (status != DA_DBGENG_OK) {
+            return status;
+        }
+        status = launch_debug_process(*session, command_line_utf8);
+        if (status != DA_DBGENG_OK) {
+            return status;
+        }
+        session->detach_processes_on_close = true;
+        status = wait_for_launch_initial_event(*session);
+        if (status != DA_DBGENG_OK) {
+            return status;
+        }
         *out_handle = reinterpret_cast<DA_DbgEngSessionHandle*>(session.release());
         g_last_error.clear();
         return DA_DBGENG_OK;

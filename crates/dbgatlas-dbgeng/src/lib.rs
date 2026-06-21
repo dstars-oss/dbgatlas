@@ -194,6 +194,90 @@ impl DbgEngSession {
     }
 
     #[cfg(windows)]
+    pub fn launch(
+        executable: impl AsRef<Path>,
+        args: &[String],
+        dbgeng_dir: Option<&Path>,
+    ) -> Result<Self, DbgEngError> {
+        load_runtime(dbgeng_dir)?;
+        let command_line = launch_command_line(executable.as_ref(), args)?;
+        let command_line = std::ffi::CString::new(command_line)?;
+        let mut handle = std::ptr::null_mut();
+        let status = unsafe {
+            dbgatlas_dbgeng_sys::da_dbgeng_session_launch_process(
+                command_line.as_ptr(),
+                &mut handle,
+            )
+        };
+        session_from_status(handle, status)
+    }
+
+    #[cfg(windows)]
+    pub fn launch_with_runtimes(
+        executable: impl AsRef<Path>,
+        args: &[String],
+        dbgeng_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, DbgEngError> {
+        let executable = executable.as_ref();
+        let command_line = launch_command_line(executable, args)?;
+        let command_line = std::ffi::CString::new(command_line)?;
+        if dbgeng_dirs.is_empty() {
+            load_runtime(None)?;
+            let mut handle = std::ptr::null_mut();
+            let status = unsafe {
+                dbgatlas_dbgeng_sys::da_dbgeng_session_launch_process(
+                    command_line.as_ptr(),
+                    &mut handle,
+                )
+            };
+            return session_from_status(handle, status);
+        }
+
+        let mut errors = Vec::new();
+        for dbgeng_dir in dbgeng_dirs {
+            match load_runtime(Some(dbgeng_dir.as_path())) {
+                Ok(()) => {
+                    let mut handle = std::ptr::null_mut();
+                    let status = unsafe {
+                        dbgatlas_dbgeng_sys::da_dbgeng_session_launch_process(
+                            command_line.as_ptr(),
+                            &mut handle,
+                        )
+                    };
+                    return session_from_status(handle, status).map_err(|error| {
+                        DbgEngError::RuntimeCandidatesFailed(format!(
+                            "{}: {error}",
+                            dbgeng_dir.display()
+                        ))
+                    });
+                }
+                Err(error) => errors.push(format!("{}: {error}", dbgeng_dir.display())),
+            }
+        }
+        Err(DbgEngError::RuntimeCandidatesFailed(errors.join("; ")))
+    }
+
+    #[cfg(not(windows))]
+    pub fn launch(
+        executable: impl AsRef<Path>,
+        args: &[String],
+        _dbgeng_dir: Option<&Path>,
+    ) -> Result<Self, DbgEngError> {
+        launch_command_line(executable.as_ref(), args)?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(windows))]
+    pub fn launch_with_runtimes(
+        executable: impl AsRef<Path>,
+        args: &[String],
+        _dbgeng_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, DbgEngError> {
+        launch_command_line(executable.as_ref(), args)?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
     pub fn execute(&self, command: &str) -> Result<String, DbgEngError> {
         let command = command_to_cstring(command)?;
         let mut view = dbgatlas_dbgeng_sys::DA_DbgEngTextView::default();
@@ -422,6 +506,48 @@ fn symbol_path_to_cstring(symbol_path: &str) -> Result<std::ffi::CString, DbgEng
     std::ffi::CString::new(symbol_path).map_err(Into::into)
 }
 
+fn launch_command_line(executable: &Path, args: &[String]) -> Result<String, DbgEngError> {
+    if executable.as_os_str().is_empty() {
+        return Err(DbgEngError::EmptyPath);
+    }
+    let executable = executable
+        .as_os_str()
+        .to_str()
+        .ok_or(DbgEngError::NonUtf8Path)?;
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(quote_windows_arg(executable));
+    for arg in args {
+        parts.push(quote_windows_arg(arg));
+    }
+    Ok(parts.join(" "))
+}
+
+fn quote_windows_arg(arg: &str) -> String {
+    if arg.is_empty() || arg.chars().any(|ch| matches!(ch, ' ' | '\t' | '"')) {
+        let mut quoted = String::with_capacity(arg.len() + 2);
+        quoted.push('"');
+        let mut backslashes = 0usize;
+        for ch in arg.chars() {
+            if ch == '\\' {
+                backslashes += 1;
+            } else if ch == '"' {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            } else {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+        quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+        quoted.push('"');
+        quoted
+    } else {
+        arg.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +630,22 @@ mod tests {
     }
 
     #[test]
+    fn launch_command_line_quotes_windows_args() {
+        let args = vec![
+            "--plain".to_string(),
+            "two words".to_string(),
+            r#"quoted"value"#.to_string(),
+            r#"trail\"#.to_string(),
+        ];
+        let command_line =
+            launch_command_line(Path::new(r"C:\Program Files\App\app.exe"), &args).unwrap();
+        assert_eq!(
+            command_line,
+            r#""C:\Program Files\App\app.exe" --plain "two words" "quoted\"value" trail\"#
+        );
+    }
+
+    #[test]
     fn rejects_zero_memory_read_length() {
         #[cfg(windows)]
         let session = DbgEngSession {
@@ -575,6 +717,23 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_process_waits_for_initial_event() {
+        let _guard = dbgeng_session_test_guard();
+        let comspec = std::env::var_os("ComSpec")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        let args = vec!["/C".to_string(), "exit 0".to_string()];
+
+        let session = DbgEngSession::launch(comspec, &args, None).unwrap();
+        let output = session.execute("|").unwrap();
+        assert!(
+            !output.contains("does not have a current process or thread"),
+            "{output}"
+        );
     }
 
     #[cfg(windows)]

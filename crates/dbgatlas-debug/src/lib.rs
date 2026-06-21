@@ -38,6 +38,7 @@ pub enum DebugTarget {
     },
     Launch {
         executable: PathBuf,
+        #[serde(default)]
         args: Vec<String>,
     },
 }

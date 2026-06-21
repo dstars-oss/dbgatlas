@@ -60,6 +60,6 @@ Recording 使用 recording worker，但仍不向外暴露 worker API。外部只
 ## 安全约束
 
 - worker 启动策略和 identity policy 来自 runtime config，不来自 analysis workspace manifest。
-- 安装态 service 默认 LocalSystem；ETW recording 默认 LocalSystem 或 runtime config 指定的受控 identity；debug/IDA 等 user-session worker 第一版必须使用 active interactive session，不允许 fallback 到 LocalSystem；开发态 `service run` 使用当前用户。
+- 安装态 service 默认 LocalSystem；ETW recording 默认 LocalSystem 或 runtime config 指定的受控 identity；debug worker 默认 LocalSystem，但 `debug.session.create` 可用 `worker_identity: "active_interactive_user"` 为 TTD replay、用户目录 dump 或 live launch 显式选择交互用户；IDA worker 使用 active interactive session，不允许 fallback 到 LocalSystem；开发态 `service run` 使用当前用户。
 - dump、trace、command transcript、memory output 都按敏感 artifact 处理。
 - worker 不把高层判断写成工具事实；解释层仍由人或模型在 `analysis/` 写 Markdown。

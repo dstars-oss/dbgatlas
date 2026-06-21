@@ -26,9 +26,9 @@ resolving user-provided addresses or names to concrete IDA entities.
 - `reverse.xrefs_to`: `{ session_id, addrs }`
 - `reverse.xrefs_to_field`: `{ session_id, queries }`
 - `reverse.callees`: `{ session_id, addrs }`
-- `reverse.rename`: `{ session_id, items }`
-- `reverse.set_comments`: `{ session_id, items }`
-- `reverse.set_type`: `{ session_id, items }`
+- `reverse.rename`: `{ session_id, items: [{ kind: "function" | "global", addr? | name?, new_name }] }`
+- `reverse.set_comments`: `{ session_id, items: [{ addr? | name?, text, repeatable? }] }`
+- `reverse.set_type`: `{ session_id, items: [{ kind: "function" | "global" | "addr", addr? | name?, type }] }`
 - `reverse.declare_type`: `{ session_id, decls }`
 - `reverse.force_recompile`: `{ session_id, addrs? }`
 - `reverse.idb_save`: `{ session_id, path? }`
@@ -107,6 +107,12 @@ IDALib. Successful results contain Hex-Rays C pseudocode with `language: "c"`.
 If Hex-Rays is unavailable, a license is unavailable, or decompilation fails, the
 operation fails and records a `reverse.adapter_error` artifact. Assembly text is only
 available through an explicit `reverse.disasm` call.
+
+Large `reverse.decompile` results keep the complete result in the registered
+`reverse.core` artifact. The inline tool result remains unchanged for small
+functions; if the serialized result is too large for stable MCP transport, the
+inline `pseudocode` is truncated to a preview and the result includes
+`pseudocode_truncated`, `full_result_artifact_ref`, and `full_result_byte_len`.
 
 ## Artifact and operation records
 

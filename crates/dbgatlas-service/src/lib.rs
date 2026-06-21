@@ -14,18 +14,22 @@ use dbgatlas_worker_protocol::{
 };
 use dbgatlas_workspace::{
     ArtifactMetadata, CommandAuditRecord, OperationRecord, OperationStatus, Workspace,
-    WorkspaceError,
+    WorkspaceError, WorkspaceFacts,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -33,6 +37,9 @@ use thiserror::Error;
 pub const INTERNAL_WORKSPACE_DIR: &str = "dbgatlas";
 pub const DEFAULT_SERVICE_PORT: u16 = 7331;
 pub const MAX_MEMORY_READ_LENGTH: u64 = 16 * 1024 * 1024;
+const MAX_INLINE_REVERSE_RESULT_BYTES: usize = 128 * 1024;
+const MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES: usize = 32 * 1024;
+const DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS: u64 = 5_000;
 pub const WINDOWS_SERVICE_NAME: &str = "DbgAtlas";
 pub const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DbgAtlas Service";
 pub const WINDOWS_SERVICE_DESCRIPTION: &str = "DbgAtlas local debugging service";
@@ -457,8 +464,9 @@ impl ServiceHost {
 
     fn mcp_workspace_facts(&self, arguments: Value) -> Result<Value, ServiceError> {
         let params: WorkspaceFactsParams = serde_json::from_value(arguments)?;
-        let workspace = Workspace::open(params.path)?;
-        Ok(serde_json::to_value(workspace.facts()?)?)
+        Ok(serde_json::to_value(workspace_facts_with_fallback(
+            &params.path,
+        )?)?)
     }
 
     fn service_health(&self) -> Result<Value, ServiceError> {
@@ -946,6 +954,7 @@ impl ServiceHost {
             &discovered,
         )?;
         let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
+        let trace_artifacts = ttd_trace_artifact_results(&workspace, &writes, &registered);
         workspace.append_operation(&OperationRecord {
             operation_id: operation_id.clone(),
             adapter_id: "service".to_string(),
@@ -983,6 +992,10 @@ impl ServiceHost {
             "target_pid": target_pid,
             "recorder_exit_code": recorder_exit_code,
             "duration_ms": duration_ms,
+            "primary_trace_path": discovered.traces.first(),
+            "trace_paths": discovered.traces,
+            "trace_index_paths": discovered.trace_indexes,
+            "trace_artifacts": trace_artifacts,
             "artifact_refs": registered.artifacts,
             "raw_output_ref": registered.raw_output,
             "warnings": warnings,
@@ -1132,8 +1145,8 @@ impl ServiceHost {
     }
 
     fn debug_session_create(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        let params: DebugSessionCreateParams = parse_params(params)?;
-        let target = params.target.validate()?;
+        let params = parse_debug_session_create_params(params)?;
+        let target = params.target.clone().validate()?;
         let request = CreateDebugSession {
             target: target.clone(),
             startup_timeout_ms: params.startup_timeout_ms,
@@ -1143,96 +1156,47 @@ impl ServiceHost {
         let operation_id = next_operation_ref();
         let workspace = ensure_project_workspace(&params.project_root)?;
         let session_dir = workspace.ensure_session_artifact_dir(&session_id.id)?;
-        let mut started_worker = None;
-        let mut start_writes = None;
-        let mut start_failures = Vec::new();
-        let dbgeng_attempts =
-            debug_worker_dbgeng_attempts(&request.target, &self.capabilities.dbgeng_dirs);
-        append_service_diagnostic_log(&format!(
-            "debug_session_create_start session_id={} operation_id={} target_kind={} attempt_count={} workspace={}",
-            sanitize_log_value(session_id.id.as_str()),
-            sanitize_log_value(operation_id.id.as_str()),
-            sanitize_log_value(debug_target_kind(&request.target)),
-            dbgeng_attempts.len(),
-            sanitize_log_value(&workspace.root().display().to_string())
-        ));
-        for (attempt_index, dbgeng_dirs) in dbgeng_attempts.into_iter().enumerate() {
+        let mut start = self.try_start_debug_worker(
+            &params,
+            &request,
+            &session_id,
+            &operation_id,
+            &workspace,
+            &session_dir,
+            params.worker_identity.worker_create_identity(),
+            params.worker_identity,
+        );
+        if start.worker.is_none()
+            && should_auto_retry_active_interactive_user(
+                params.worker_identity,
+                &request.target,
+                &start.failures,
+            )
+        {
             append_service_diagnostic_log(&format!(
-                "debug_session_create_attempt session_id={} operation_id={} attempt={} dbgeng_dir_count={}",
+                "debug_session_create_auto_retry_active_user session_id={} operation_id={} target_kind={}",
                 sanitize_log_value(session_id.id.as_str()),
                 sanitize_log_value(operation_id.id.as_str()),
-                attempt_index + 1,
-                dbgeng_dirs.len()
+                sanitize_log_value(debug_target_kind(&request.target))
             ));
-            let worker = self.supervisor.create_worker(WorkerCreateRequest {
-                session_id: session_id.clone(),
-                project_root: params.project_root.clone(),
-                internal_workspace_root: workspace.root().to_path_buf(),
-                artifact_dir: session_dir.clone(),
-                startup_timeout_ms: request.startup_timeout_ms.unwrap_or(5_000),
-                dbgeng_dirs,
-                identity: None,
-            })?;
-            let start = self.supervisor.request_worker(
-                &worker,
-                WorkerRequest::StartDebugSession {
-                    session_id: session_id.clone(),
-                    target: request.target.clone(),
-                    artifact_dir: session_dir.clone(),
-                },
+            let retry = self.try_start_debug_worker(
+                &params,
+                &request,
+                &session_id,
+                &operation_id,
+                &workspace,
+                &session_dir,
+                Some(WorkerIdentity::ActiveInteractiveUser),
+                DebugWorkerIdentity::ActiveInteractiveUser,
             );
-            match start {
-                Ok(WorkerResponse::Ok { writes, .. }) => {
-                    started_worker = Some(worker);
-                    start_writes = Some(writes);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_ok session_id={} operation_id={} attempt={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        attempt_index + 1
-                    ));
-                    break;
-                }
-                Ok(WorkerResponse::Failed { code, message, .. }) => {
-                    let _ = self.supervisor.kill_worker(&worker);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_failed session_id={} operation_id={} attempt={} code={} error={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        attempt_index + 1,
-                        sanitize_log_value(&code),
-                        sanitize_log_value(&message)
-                    ));
-                    start_failures.push(format!("{code}: {message}"));
-                }
-                Ok(other) => {
-                    let _ = self.supervisor.kill_worker(&worker);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_unexpected session_id={} operation_id={} attempt={} response={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        attempt_index + 1,
-                        sanitize_log_value(&format!("{other:?}"))
-                    ));
-                    start_failures.push(format!("unexpected start response: {other:?}"));
-                    break;
-                }
-                Err(error) => {
-                    let _ = self.supervisor.kill_worker(&worker);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_error session_id={} operation_id={} attempt={} error={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        attempt_index + 1,
-                        sanitize_log_value(&error.to_string())
-                    ));
-                    start_failures.push(error.to_string());
-                    break;
-                }
+            if retry.worker.is_some() {
+                start = retry;
+            } else {
+                start.failures.extend(retry.failures);
             }
         }
-        let Some(worker) = started_worker else {
-            let message = start_failures.join(" | ");
+        let Some(worker) = start.worker else {
+            let message = start.failures.join(" | ");
             self.record_failed_session_create(&workspace, &operation_id, &session_id, &message)?;
             append_service_diagnostic_log(&format!(
                 "debug_session_create_failed session_id={} operation_id={} error={}",
@@ -1242,7 +1206,9 @@ impl ServiceHost {
             ));
             return Err(ServiceError::Worker(message));
         };
-        let start_writes = start_writes.expect("worker start writes are set with started worker");
+        let start_writes = start
+            .writes
+            .expect("worker start writes are set with started worker");
         let now = Timestamp::now();
         let registered_start_writes =
             register_worker_writes(&workspace, &operation_id, &start_writes)?;
@@ -1443,8 +1409,141 @@ impl ServiceHost {
         }))
     }
 
+    fn try_start_debug_worker(
+        &self,
+        params: &DebugSessionCreateParams,
+        request: &CreateDebugSession,
+        session_id: &SessionRef,
+        operation_id: &OperationRef,
+        workspace: &Workspace,
+        session_dir: &Path,
+        worker_identity: Option<WorkerIdentity>,
+        failure_identity: DebugWorkerIdentity,
+    ) -> DebugSessionStartAttempt {
+        let mut started_worker = None;
+        let mut start_writes = None;
+        let mut start_failures = Vec::new();
+        let dbgeng_attempts =
+            debug_worker_dbgeng_attempts(&request.target, &self.capabilities.dbgeng_dirs);
+        append_service_diagnostic_log(&format!(
+            "debug_session_create_start session_id={} operation_id={} target_kind={} identity={} attempt_count={} workspace={}",
+            sanitize_log_value(session_id.id.as_str()),
+            sanitize_log_value(operation_id.id.as_str()),
+            sanitize_log_value(debug_target_kind(&request.target)),
+            sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
+            dbgeng_attempts.len(),
+            sanitize_log_value(&workspace.root().display().to_string())
+        ));
+        for (attempt_index, dbgeng_dirs) in dbgeng_attempts.into_iter().enumerate() {
+            append_service_diagnostic_log(&format!(
+                "debug_session_create_attempt session_id={} operation_id={} identity={} attempt={} dbgeng_dir_count={}",
+                sanitize_log_value(session_id.id.as_str()),
+                sanitize_log_value(operation_id.id.as_str()),
+                sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
+                attempt_index + 1,
+                dbgeng_dirs.len()
+            ));
+            let worker = match self.supervisor.create_worker(WorkerCreateRequest {
+                session_id: session_id.clone(),
+                project_root: params.project_root.clone(),
+                internal_workspace_root: workspace.root().to_path_buf(),
+                artifact_dir: session_dir.to_path_buf(),
+                startup_timeout_ms: request
+                    .startup_timeout_ms
+                    .unwrap_or(DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS),
+                dbgeng_dirs,
+                identity: worker_identity.clone(),
+            }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    let message = add_debug_access_denied_hint(error.to_string(), failure_identity);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_error session_id={} operation_id={} identity={} attempt={} error={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
+                        attempt_index + 1,
+                        sanitize_log_value(&message)
+                    ));
+                    start_failures.push(message);
+                    break;
+                }
+            };
+            let start = self.supervisor.request_worker(
+                &worker,
+                WorkerRequest::StartDebugSession {
+                    session_id: session_id.clone(),
+                    target: request.target.clone(),
+                    artifact_dir: session_dir.to_path_buf(),
+                },
+            );
+            match start {
+                Ok(WorkerResponse::Ok { writes, .. }) => {
+                    started_worker = Some(worker);
+                    start_writes = Some(writes);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_ok session_id={} operation_id={} identity={} attempt={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
+                        attempt_index + 1
+                    ));
+                    break;
+                }
+                Ok(WorkerResponse::Failed { code, message, .. }) => {
+                    let _ = self.supervisor.kill_worker(&worker);
+                    let failure = debug_start_failure_message(code, message, failure_identity);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_failed session_id={} operation_id={} identity={} attempt={} code={} error={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
+                        attempt_index + 1,
+                        sanitize_log_value(failure.code.as_str()),
+                        sanitize_log_value(failure.message.as_str())
+                    ));
+                    start_failures.push(failure.to_string());
+                }
+                Ok(other) => {
+                    let _ = self.supervisor.kill_worker(&worker);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_unexpected session_id={} operation_id={} identity={} attempt={} response={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
+                        attempt_index + 1,
+                        sanitize_log_value(&format!("{other:?}"))
+                    ));
+                    start_failures.push(format!("unexpected start response: {other:?}"));
+                    break;
+                }
+                Err(error) => {
+                    let _ = self.supervisor.kill_worker(&worker);
+                    let message = add_debug_access_denied_hint(error.to_string(), failure_identity);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_error session_id={} operation_id={} identity={} attempt={} error={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
+                        attempt_index + 1,
+                        sanitize_log_value(&message)
+                    ));
+                    start_failures.push(message);
+                    break;
+                }
+            }
+        }
+
+        DebugSessionStartAttempt {
+            worker: started_worker,
+            writes: start_writes,
+            failures: start_failures,
+        }
+    }
+
     fn debug_eval(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         let params: DebugEvalParams = parse_params(params)?;
+        validate_optional_timeout_ms(params.timeout_ms)?;
         let request = EvalDebugCommand {
             session_id: params.session_id.clone(),
             command: params.command,
@@ -2224,14 +2323,16 @@ impl ServiceHost {
                 .insert(operation_id.id.as_str().to_string(), operation);
         }
 
-        let worker_response = self.supervisor.request_worker(
-            &session.worker,
+        let worker_response = self.request_worker_with_optional_timeout(
+            &session,
             WorkerRequest::EvalDebugCommand {
                 session_id: session.session_id.clone(),
                 operation_id: operation_id.clone(),
                 command: request.command.clone(),
                 artifact_dir: session.artifact_dir.clone(),
             },
+            &operation_id,
+            request.timeout_ms,
         );
 
         self.finish_command_worker_response(
@@ -2557,6 +2658,56 @@ impl ServiceHost {
         }
     }
 
+    fn request_worker_with_optional_timeout(
+        &self,
+        session: &ManagedSession,
+        request: WorkerRequest,
+        operation_id: &OperationRef,
+        timeout_ms: Option<u64>,
+    ) -> Result<WorkerResponse, ServiceError> {
+        let Some(timeout_ms) = timeout_ms else {
+            return self.supervisor.request_worker(&session.worker, request);
+        };
+        let timeout = Duration::from_millis(timeout_ms);
+        let supervisor = Arc::clone(&self.supervisor);
+        let worker = session.worker.clone();
+        let session_id = session.session_id.clone();
+        let operation_id_for_thread = operation_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let response = supervisor.request_worker(&worker, request);
+            let _ = sender.send(response);
+        });
+
+        match receiver.recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                append_service_diagnostic_log(&format!(
+                    "debug_eval_timeout session_id={} operation_id={} timeout_ms={}",
+                    sanitize_log_value(session_id.id.as_str()),
+                    sanitize_log_value(operation_id.id.as_str()),
+                    timeout_ms
+                ));
+                if let Err(error) = self.supervisor.kill_worker(&session.worker) {
+                    append_service_diagnostic_log(&format!(
+                        "debug_eval_timeout_kill_failed session_id={} operation_id={} error={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(&error.to_string())
+                    ));
+                }
+                self.mark_debug_session_error(&session_id)?;
+                Err(ServiceError::Worker(format!(
+                    "debug operation {} timed out after {} ms; debug worker was killed and the session must be recreated",
+                    operation_id_for_thread, timeout_ms
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ServiceError::Worker(
+                "worker request ended before returning a response".to_string(),
+            )),
+        }
+    }
+
     fn finish_memory_worker_response(
         &self,
         session: &ManagedSession,
@@ -2772,6 +2923,15 @@ impl ServiceHost {
         self.state
             .lock()
             .map_err(|_| ServiceError::Rpc("service state lock poisoned".to_string()))
+    }
+
+    fn mark_debug_session_error(&self, session_id: &SessionRef) -> Result<(), ServiceError> {
+        let mut state = self.lock_state()?;
+        if let Some(session) = state.sessions.get_mut(session_id.id.as_str()) {
+            session.state = DebugSessionState::Error;
+            session.updated_at = Timestamp::now();
+        }
+        Ok(())
     }
 
     fn operation_status(
@@ -3286,11 +3446,12 @@ impl ProcessWorkerSupervisor {
 impl WorkerSupervisor for ProcessWorkerSupervisor {
     fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
         let started = Instant::now();
-        let dbgeng_dir_count = request.dbgeng_dirs.len();
         let worker_id = Id::new(format!("worker-{}", request.session_id.id.as_str()))
             .expect("generated worker ids are valid");
         let pipe_name = unique_pipe_name(&request.session_id);
         let identity = request.identity.unwrap_or_else(|| self.identity.clone());
+        let dbgeng_dirs = prepare_dbgeng_dirs_for_worker_identity(&identity, &request.dbgeng_dirs)?;
+        let dbgeng_dir_count = dbgeng_dirs.len();
         append_service_diagnostic_log(&format!(
             "worker_create_start worker_id={} session_id={} identity={} startup_timeout_ms={} dbgeng_dir_count={}",
             sanitize_log_value(worker_id.as_str()),
@@ -3310,7 +3471,7 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             &pipe_name,
             request.session_id.id.as_str(),
             &identity,
-            &request.dbgeng_dirs,
+            &dbgeng_dirs,
         )?;
         self.job.assign_process(&child)?;
         let connected = match transport.connect(request.startup_timeout_ms) {
@@ -4393,6 +4554,26 @@ fn ttd_recording_writes(
     Ok(writes)
 }
 
+fn ttd_trace_artifact_results(
+    workspace: &Workspace,
+    writes: &[WorkerArtifactWrite],
+    registered: &RegisteredWorkerWrites,
+) -> Vec<Value> {
+    writes
+        .iter()
+        .zip(registered.artifacts.iter())
+        .filter(|(write, _)| write.kind == "recording.ttd.trace")
+        .map(|(write, artifact_ref)| {
+            json!({
+                "path": workspace.root().join(&write.relative_path),
+                "relative_path": &write.relative_path,
+                "artifact_ref": artifact_ref,
+                "byte_len": write.byte_len,
+            })
+        })
+        .collect()
+}
+
 fn discovered_ttd_write(
     recording_id: &RecordingRef,
     artifact_dir: &Path,
@@ -4615,6 +4796,7 @@ fn record_successful_reverse_core_operation(
     let core_file = format!("core/{}.jsonl", operation_id.id.as_str());
     let byte_len = write_jsonl_file(&session.artifact_dir.join(&core_file), &event)?;
     let artifact_id = next_artifact_ref();
+    let response_result = reverse_core_response_result(&core, &artifact_id, byte_len)?;
     workspace.register_artifact(&ArtifactMetadata {
         artifact_id: artifact_id.clone(),
         kind: "reverse.core".to_string(),
@@ -4658,7 +4840,7 @@ fn record_successful_reverse_core_operation(
         "operation_status": "success",
         "artifact_refs": [artifact_id],
         "function": core.function,
-        "result": core.result,
+        "result": response_result,
         "warnings": core.warnings,
         "operation": {
             "status": "success",
@@ -4666,6 +4848,54 @@ fn record_successful_reverse_core_operation(
             "raw_output_ref": null
         }
     }))
+}
+
+fn reverse_core_response_result(
+    core: &ReverseCoreFunctionResult,
+    artifact_id: &ArtifactRef,
+    artifact_byte_len: u64,
+) -> Result<Value, ServiceError> {
+    if core.function != "decompile"
+        || serde_json::to_vec(&core.result)?.len() <= MAX_INLINE_REVERSE_RESULT_BYTES
+    {
+        return Ok(core.result.clone());
+    }
+
+    let mut result = core.result.clone();
+    if let Value::Object(object) = &mut result {
+        if let Some(Value::String(pseudocode)) = object.get_mut("pseudocode") {
+            if pseudocode.len() > MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES {
+                *pseudocode =
+                    truncate_utf8_bytes(pseudocode, MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES)
+                        .to_string();
+            }
+        }
+        object.insert("pseudocode_truncated".to_string(), json!(true));
+        object.insert(
+            "full_result_artifact_ref".to_string(),
+            serde_json::to_value(artifact_id)?,
+        );
+        object.insert("full_result_byte_len".to_string(), json!(artifact_byte_len));
+        return Ok(result);
+    }
+
+    Ok(json!({
+        "pseudocode_truncated": true,
+        "preview": result,
+        "full_result_artifact_ref": artifact_id,
+        "full_result_byte_len": artifact_byte_len,
+    }))
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn recording_response(
@@ -5661,6 +5891,172 @@ fn worker_executable_path() -> Result<PathBuf, ServiceError> {
         "dbgatlas-worker"
     };
     Ok(directory.join(file_name))
+}
+
+fn prepare_dbgeng_dirs_for_worker_identity(
+    identity: &WorkerIdentity,
+    dbgeng_dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>, ServiceError> {
+    #[cfg(windows)]
+    {
+        if matches!(identity, WorkerIdentity::ActiveInteractiveUser) {
+            return prepare_active_user_dbgeng_dirs(dbgeng_dirs, &active_user_dbgeng_cache_root());
+        }
+    }
+
+    Ok(dbgeng_dirs.to_vec())
+}
+
+#[cfg(windows)]
+fn prepare_active_user_dbgeng_dirs(
+    dbgeng_dirs: &[PathBuf],
+    cache_root: &Path,
+) -> Result<Vec<PathBuf>, ServiceError> {
+    dbgeng_dirs
+        .iter()
+        .map(|dir| {
+            if is_windowsapps_windbg_dbgeng_dir(dir) {
+                match cache_windowsapps_dbgeng_dir_for_active_user(dir, cache_root) {
+                    Ok(cached) => Ok(cached),
+                    Err(error) => {
+                        append_service_diagnostic_log(&format!(
+                            "dbgeng_runtime_cache_failed source={} error={}",
+                            sanitize_log_value(&dir.display().to_string()),
+                            sanitize_log_value(&error.to_string())
+                        ));
+                        Ok(dir.clone())
+                    }
+                }
+            } else {
+                Ok(dir.clone())
+            }
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn active_user_dbgeng_cache_root() -> PathBuf {
+    default_windows_service_paths()
+        .var_dir
+        .join("runtime-cache")
+        .join("dbgeng")
+}
+
+#[cfg(windows)]
+fn is_windowsapps_windbg_dbgeng_dir(path: &Path) -> bool {
+    let path = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    path.contains("\\windowsapps\\microsoft.windbg_")
+}
+
+#[cfg(windows)]
+fn cache_windowsapps_dbgeng_dir_for_active_user(
+    source_dir: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf, ServiceError> {
+    let key = dbgeng_cache_key(source_dir);
+    let destination = cache_root.join(key);
+    let marker = destination.join(".dbgatlas-cache-complete");
+    if marker.is_file() && destination.join("dbgeng.dll").is_file() {
+        return Ok(destination);
+    }
+
+    fs::create_dir_all(cache_root)?;
+    let staging_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let staging = cache_root.join(format!(
+        "{}.staging-{}-{staging_nonce:x}",
+        destination
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("dbgeng"),
+        std::process::id()
+    ));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    if destination.exists() {
+        fs::remove_dir_all(&destination)?;
+    }
+
+    copy_dir_recursive(source_dir, &staging)?;
+    fs::write(
+        staging.join(".dbgatlas-cache-complete"),
+        source_dir.display().to_string(),
+    )?;
+    match fs::rename(&staging, &destination) {
+        Ok(()) => {}
+        Err(_error) if marker.is_file() && destination.join("dbgeng.dll").is_file() => {
+            let _ = fs::remove_dir_all(&staging);
+            append_service_diagnostic_log(&format!(
+                "dbgeng_runtime_cache_race_reused destination={}",
+                sanitize_log_value(&destination.display().to_string())
+            ));
+            return Ok(destination);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    append_service_diagnostic_log(&format!(
+        "dbgeng_runtime_cached source={} destination={}",
+        sanitize_log_value(&source_dir.display().to_string()),
+        sanitize_log_value(&destination.display().to_string())
+    ));
+    Ok(destination)
+}
+
+#[cfg(windows)]
+fn dbgeng_cache_key(source_dir: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    source_dir
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .hash(&mut hasher);
+    let hash = hasher.finish();
+    let label = source_dir
+        .parent()
+        .and_then(Path::file_name)
+        .or_else(|| source_dir.file_name())
+        .and_then(OsStr::to_str)
+        .map(sanitize_cache_label)
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| "dbgeng".to_string());
+    format!("{label}-{hash:016x}")
+}
+
+#[cfg(windows)]
+fn sanitize_cache_label(label: &str) -> String {
+    label
+        .chars()
+        .take(96)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), ServiceError> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn spawn_worker_process(
@@ -7925,12 +8321,19 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "debug.session.create",
-            "Create a debug session from a file, attach, or launch target.",
+            "Create a debug session from a file, attach, or launch target. Use kind=file with a .run path for TTD replay.",
             json!({
                 "type": "object",
                 "properties": {
                     "project_root": { "type": "string" },
-                    "target": { "type": "object" }
+                    "target": debug_target_schema(),
+                    "startup_timeout_ms": { "type": "integer" },
+                    "worker_identity": {
+                        "type": "string",
+                        "enum": ["default", "active_interactive_user"],
+                        "default": "default",
+                        "description": "Use active_interactive_user for user-session TTD replay or live launch when the installed service default LocalSystem identity cannot access the target."
+                    }
                 },
                 "required": ["project_root", "target"]
             }),
@@ -7942,7 +8345,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "project_root": { "type": "string" },
-                    "target": { "type": "object" },
+                    "target": ttd_recording_target_schema(),
                     "timeout_ms": { "type": "integer" },
                     "options": { "type": "object" }
                 },
@@ -7956,14 +8359,18 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "object" },
-                    "command": { "type": "string" }
+                    "command": { "type": "string" },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional command timeout in milliseconds. On timeout DbgAtlas kills the debug worker and the session must be recreated."
+                    }
                 },
                 "required": ["session_id", "command"]
             }),
         ),
         mcp_tool(
             "debug.modules",
-            "List modules for a debug session.",
+            "List modules for a debug session. In TTD replay, modules that were loaded and unloaded outside the current position may require targeted TTD calls or memory evidence.",
             mcp_session_schema(),
         ),
         mcp_tool(
@@ -8154,17 +8561,26 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         mcp_tool(
             "reverse.rename",
             "Rename IDA functions or globals.",
-            mcp_reverse_core_schema_required(json!({ "items": {} }), &["items"]),
+            mcp_reverse_core_schema_required(
+                json!({ "items": reverse_rename_items_schema() }),
+                &["items"],
+            ),
         ),
         mcp_tool(
             "reverse.set_comments",
             "Set IDA comments at addresses.",
-            mcp_reverse_core_schema_required(json!({ "items": {} }), &["items"]),
+            mcp_reverse_core_schema_required(
+                json!({ "items": reverse_set_comments_items_schema() }),
+                &["items"],
+            ),
         ),
         mcp_tool(
             "reverse.set_type",
             "Apply C types to IDA functions, globals, or addresses.",
-            mcp_reverse_core_schema_required(json!({ "items": {} }), &["items"]),
+            mcp_reverse_core_schema_required(
+                json!({ "items": reverse_set_type_items_schema() }),
+                &["items"],
+            ),
         ),
         mcp_tool(
             "reverse.declare_type",
@@ -8326,6 +8742,130 @@ fn mcp_tool(name: &str, description: &str, input_schema: Value) -> Value {
     })
 }
 
+fn debug_target_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "file" },
+                    "path": {
+                        "type": "string",
+                        "description": "Path to a dump or TTD .run trace. TTD replay uses kind=file, not kind=ttd."
+                    }
+                },
+                "required": ["kind", "path"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "attach" },
+                    "pid": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["kind", "pid"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "launch" },
+                    "executable": { "type": "string" },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": []
+                    }
+                },
+                "required": ["kind", "executable"]
+            }
+        ]
+    })
+}
+
+fn ttd_recording_target_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "launch" },
+                    "executable": { "type": "string" },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": []
+                    }
+                },
+                "required": ["kind", "executable"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "attach" },
+                    "pid": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["kind", "pid"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "monitor" },
+                    "program": { "type": "string" },
+                    "cmd_line_filter": { "type": "string" }
+                },
+                "required": ["kind", "program"]
+            }
+        ]
+    })
+}
+
+fn reverse_rename_items_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["function", "global"] },
+                "addr": {},
+                "name": { "type": "string" },
+                "new_name": { "type": "string" }
+            },
+            "required": ["kind", "new_name"]
+        }
+    })
+}
+
+fn reverse_set_comments_items_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "addr": {},
+                "name": { "type": "string" },
+                "text": { "type": "string" },
+                "repeatable": { "type": "boolean", "default": false }
+            },
+            "required": ["text"]
+        }
+    })
+}
+
+fn reverse_set_type_items_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["function", "global", "addr"] },
+                "addr": {},
+                "name": { "type": "string" },
+                "type": { "type": "string" }
+            },
+            "required": ["kind", "type"]
+        }
+    })
+}
+
 fn mcp_session_schema() -> Value {
     json!({
         "type": "object",
@@ -8379,6 +8919,25 @@ struct DebugSessionCreateParams {
     target: DebugTarget,
     #[serde(default)]
     startup_timeout_ms: Option<u64>,
+    #[serde(default)]
+    worker_identity: DebugWorkerIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DebugWorkerIdentity {
+    #[default]
+    Default,
+    ActiveInteractiveUser,
+}
+
+impl DebugWorkerIdentity {
+    fn worker_create_identity(self) -> Option<WorkerIdentity> {
+        match self {
+            Self::Default => None,
+            Self::ActiveInteractiveUser => Some(WorkerIdentity::ActiveInteractiveUser),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -8534,20 +9093,39 @@ pub fn run_http_service_until(
         let config = config.clone();
         let host = host.clone();
         std::thread::spawn(move || {
-            let response = match handle_http_stream(&mut stream, &config, &host, Some(peer_addr)) {
-                Ok(response) => response,
+            let response_result = handle_http_stream(&mut stream, &config, &host, Some(peer_addr));
+            let (response, write_stage) = match response_result {
+                Ok(response) => (response, "write_response"),
                 Err(error) => match http_json_response(
                     http_status_for(&error),
                     &JsonRpcResponse::error(None, rpc_error_for(error)),
                 ) {
-                    Ok(response) => response,
+                    Ok(response) => (response, "write_error_response"),
                     Err(error) => {
-                        let _ = stream.write_all(error.to_string().as_bytes());
+                        if let Err(write_error) = stream.write_all(error.to_string().as_bytes()) {
+                            append_http_diagnostic_log(
+                                "write_error_response",
+                                &DiagnosticContext {
+                                    remote_addr: Some(peer_addr.to_string()),
+                                    ..Default::default()
+                                },
+                                &write_error.to_string(),
+                            );
+                        }
                         return;
                     }
                 },
             };
-            let _ = stream.write_all(response.as_bytes());
+            if let Err(error) = stream.write_all(response.as_bytes()) {
+                append_http_diagnostic_log(
+                    write_stage,
+                    &DiagnosticContext {
+                        remote_addr: Some(peer_addr.to_string()),
+                        ..Default::default()
+                    },
+                    &error.to_string(),
+                );
+            }
         });
     }
     append_service_diagnostic_log(&format!(
@@ -8786,6 +9364,171 @@ fn ensure_project_workspace(project_root: &Path) -> Result<Workspace, ServiceErr
     }
 }
 
+fn workspace_facts_with_fallback(path: &Path) -> Result<WorkspaceFacts, ServiceError> {
+    match Workspace::open(path) {
+        Ok(workspace) => return Ok(workspace.facts()?),
+        Err(WorkspaceError::ManifestNotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let internal_workspace = path.join(INTERNAL_WORKSPACE_DIR);
+    match Workspace::open(&internal_workspace) {
+        Ok(workspace) => return Ok(workspace.facts()?),
+        Err(WorkspaceError::ManifestNotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    for artifacts_root in workspace_facts_artifact_candidates(path) {
+        if artifacts_root.is_dir() {
+            return fallback_workspace_facts_from_artifacts(&artifacts_root);
+        }
+    }
+
+    Err(WorkspaceError::ManifestNotFound(path.join("dbgatlas-workspace.json")).into())
+}
+
+fn workspace_facts_artifact_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("artifacts"))
+    {
+        candidates.push(path.to_path_buf());
+    }
+    candidates.push(path.join("artifacts"));
+    candidates.push(path.join(INTERNAL_WORKSPACE_DIR).join("artifacts"));
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.iter().any(|seen| seen == &candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn fallback_workspace_facts_from_artifacts(
+    artifacts_root: &Path,
+) -> Result<WorkspaceFacts, ServiceError> {
+    let mut artifacts: Vec<ArtifactMetadata> =
+        read_json_lines_optional(&artifacts_root.join("artifacts.jsonl"))?;
+    if artifacts.is_empty() {
+        artifacts = scan_synthetic_artifacts(artifacts_root)?;
+    }
+    Ok(WorkspaceFacts {
+        artifacts,
+        operations: read_json_lines_optional(&artifacts_root.join("operations.jsonl"))?,
+        command_audit: read_json_lines_optional(&artifacts_root.join("command_audit.jsonl"))?,
+    })
+}
+
+fn read_json_lines_optional<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, ServiceError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path)?;
+    let mut values = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        values.push(serde_json::from_str(line)?);
+    }
+    Ok(values)
+}
+
+fn scan_synthetic_artifacts(artifacts_root: &Path) -> Result<Vec<ArtifactMetadata>, ServiceError> {
+    let workspace_root = artifacts_root.parent().unwrap_or(artifacts_root);
+    let mut files = Vec::new();
+    collect_artifact_files(artifacts_root, &mut files)?;
+    files.sort();
+
+    let mut artifacts = Vec::new();
+    for (index, path) in files.into_iter().enumerate() {
+        let relative_path = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
+            .to_path_buf();
+        let byte_len = fs::metadata(&path).ok().map(|metadata| metadata.len());
+        artifacts.push(ArtifactMetadata {
+            artifact_id: ArtifactRef::new(
+                Id::new(format!("artifact-synthetic-{}", index + 1))
+                    .expect("synthetic artifact ids are valid"),
+            ),
+            kind: infer_synthetic_artifact_kind(artifacts_root, &path),
+            relative_path,
+            created_at: Timestamp::now(),
+            operation_id: None,
+            byte_len,
+            description: Some("discovered artifact (workspace manifest missing)".to_string()),
+        });
+    }
+    Ok(artifacts)
+}
+
+fn collect_artifact_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), ServiceError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_artifact_files(&path, files)?;
+        } else if file_type.is_file() && !is_workspace_index_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_workspace_index_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "artifacts.jsonl" | "operations.jsonl" | "command_audit.jsonl"
+            )
+        })
+}
+
+fn infer_synthetic_artifact_kind(artifacts_root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(artifacts_root).unwrap_or(path);
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match components.as_slice() {
+        ["recordings", ..] if file_name == "recording.json" => "recording.metadata".to_string(),
+        ["recordings", ..] if file_name == "events.jsonl" => "recording.events.ttd".to_string(),
+        ["recordings", _, "events", event_file] => {
+            let category = event_file.strip_suffix(".jsonl").unwrap_or(event_file);
+            format!("recording.events.{category}")
+        }
+        ["recordings", ..] if file_name == "trace.etl" => "recording.trace".to_string(),
+        ["recordings", ..] if extension == "run" => "recording.ttd.trace".to_string(),
+        ["recordings", ..] if extension == "idx" => "recording.ttd.index".to_string(),
+        ["recordings", ..] if file_name.starts_with("recorder") => {
+            "recording.recorder_output".to_string()
+        }
+        ["sessions", ..] => "debug.artifact".to_string(),
+        ["reverse_sessions", _, "core", ..] => "reverse.core".to_string(),
+        ["reverse_sessions", _, "errors", ..] => "reverse.adapter_error".to_string(),
+        ["reverse_sessions", ..] => "reverse.artifact".to_string(),
+        _ => "artifact.file".to_string(),
+    }
+}
+
 fn validate_config(config: &ServiceConfig) -> Result<(), ServiceError> {
     if !config.bind.ip().is_loopback() {
         return Err(ServiceError::NonLoopbackBind(config.bind));
@@ -8798,6 +9541,27 @@ fn validate_config(config: &ServiceConfig) -> Result<(), ServiceError> {
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<T, ServiceError> {
     serde_json::from_value(params.unwrap_or(Value::Object(Default::default()))).map_err(Into::into)
+}
+
+fn parse_debug_session_create_params(
+    params: Option<Value>,
+) -> Result<DebugSessionCreateParams, ServiceError> {
+    let value = params.unwrap_or(Value::Object(Default::default()));
+    let ttd_target = value
+        .get("target")
+        .and_then(|target| target.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("ttd"));
+    serde_json::from_value(value).map_err(|error| {
+        if ttd_target {
+            ServiceError::Rpc(
+                "debug.session.create does not accept target kind `ttd`; use `{ \"kind\": \"file\", \"path\": \"trace.run\" }` for TTD .run replay"
+                    .to_string(),
+            )
+        } else {
+            error.into()
+        }
+    })
 }
 
 fn parse_u64_param(value: &Value, field: &'static str) -> Result<u64, ServiceError> {
@@ -8827,6 +9591,88 @@ fn parse_u64_param(value: &Value, field: &'static str) -> Result<u64, ServiceErr
 
 fn worker_failed_message(code: String, message: String) -> String {
     format!("{code}: {message}")
+}
+
+struct DebugStartFailure {
+    code: String,
+    message: String,
+}
+
+struct DebugSessionStartAttempt {
+    worker: Option<WorkerHandle>,
+    writes: Option<Vec<WorkerArtifactWrite>>,
+    failures: Vec<String>,
+}
+
+impl std::fmt::Display for DebugStartFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+fn debug_start_failure_message(
+    code: String,
+    message: String,
+    worker_identity: DebugWorkerIdentity,
+) -> DebugStartFailure {
+    DebugStartFailure {
+        code,
+        message: add_debug_access_denied_hint(message, worker_identity),
+    }
+}
+
+fn should_auto_retry_active_interactive_user(
+    requested_identity: DebugWorkerIdentity,
+    target: &DebugTarget,
+    failures: &[String],
+) -> bool {
+    requested_identity == DebugWorkerIdentity::Default
+        && debug_target_can_need_active_interactive_user(target)
+        && failures
+            .iter()
+            .any(|message| is_access_denied_message(message))
+}
+
+fn debug_target_can_need_active_interactive_user(target: &DebugTarget) -> bool {
+    matches!(target, DebugTarget::File { path } if is_ttd_run_file(path))
+        || matches!(target, DebugTarget::Launch { .. })
+}
+
+fn debug_worker_identity_label(identity: Option<&WorkerIdentity>) -> &'static str {
+    match identity {
+        None => "default",
+        Some(WorkerIdentity::LocalSystem) => "local_system",
+        Some(WorkerIdentity::ActiveInteractiveUser) => "active_interactive_user",
+        Some(WorkerIdentity::CurrentUserDevMode) => "current_user_dev_mode",
+    }
+}
+
+fn add_debug_access_denied_hint(message: String, worker_identity: DebugWorkerIdentity) -> String {
+    if worker_identity == DebugWorkerIdentity::Default && is_access_denied_message(&message) {
+        format!(
+            "{message}; if this is an installed service using the default LocalSystem debug worker, retry debug.session.create with worker_identity:\"active_interactive_user\" for user-session TTD replay or live launch"
+        )
+    } else {
+        message
+    }
+}
+
+fn is_access_denied_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("access is denied")
+        || lower.contains("os error 5")
+        || lower.contains("0x80070005")
+        || lower.contains("e_accessdenied")
+        || message.contains("拒绝访问")
+}
+
+fn validate_optional_timeout_ms(timeout_ms: Option<u64>) -> Result<(), ServiceError> {
+    if timeout_ms == Some(0) {
+        return Err(ServiceError::Rpc(
+            "timeout_ms must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn session_relative_path(session_id: &SessionRef, suffix: &str) -> PathBuf {
@@ -9195,7 +10041,8 @@ mod windows_active_user_process {
         let session_id = unsafe { WTSGetActiveConsoleSessionId() };
         if session_id == u32::MAX {
             return Err(ServiceError::Worker(
-                "no active interactive session is available for IDA worker".to_string(),
+                "no active interactive session is available for active interactive worker"
+                    .to_string(),
             ));
         }
 
@@ -9923,6 +10770,107 @@ allow_py_eval = true
     }
 
     #[test]
+    fn debug_session_create_rejects_ttd_kind_with_file_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "debug.session.create".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "kind": "ttd", "path": "trace.run" }
+            })),
+        });
+
+        let error = response.error.unwrap();
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("kind `ttd`"));
+        assert!(error.message.contains("kind\": \"file"));
+    }
+
+    #[test]
+    fn debug_session_create_accepts_active_interactive_user_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = Arc::new(RecordingIdentitySupervisor {
+            identities: Mutex::new(Vec::new()),
+        });
+        let host = ServiceHost::new(supervisor.clone());
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "debug.session.create".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "worker_identity": "active_interactive_user",
+                "target": { "kind": "file", "path": "sample.dmp" }
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(
+            supervisor.identities.lock().unwrap().as_slice(),
+            &[Some(WorkerIdentity::ActiveInteractiveUser)]
+        );
+    }
+
+    #[test]
+    fn debug_session_create_launch_defaults_missing_args_to_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "debug.session.create".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "kind": "launch", "executable": "cmd.exe" }
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["operation_status"], "success");
+    }
+
+    #[test]
+    fn debug_session_create_access_denied_suggests_active_user_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::new(Arc::new(AccessDeniedStartSupervisor));
+        let response = create_debug_session(&host, temp.path());
+
+        let error = response.error.unwrap();
+        assert!(error.message.contains("worker_identity"));
+        assert!(error.message.contains("active_interactive_user"));
+    }
+
+    #[test]
+    fn ttd_run_session_create_auto_retries_active_user_on_access_denied() {
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = Arc::new(AccessDeniedThenActiveSupervisor {
+            identities: Mutex::new(Vec::new()),
+        });
+        let host = ServiceHost::new(supervisor.clone()).with_capabilities(ServiceCapabilities {
+            dbgeng_dirs: vec![PathBuf::from(r"C:\DbgEng")],
+            ..Default::default()
+        });
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "debug.session.create".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "kind": "file", "path": "trace.run" }
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(
+            supervisor.identities.lock().unwrap().as_slice(),
+            &[None, Some(WorkerIdentity::ActiveInteractiveUser)]
+        );
+    }
+
+    #[test]
     fn failed_session_create_is_recorded_as_failed_operation() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::new(Arc::new(FailingStartSupervisor));
@@ -9988,6 +10936,91 @@ allow_py_eval = true
 
         let installed = ProcessWorkerSupervisor::new_installed_service().unwrap();
         assert_eq!(installed.identity, WorkerIdentity::LocalSystem);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_user_worker_caches_windowsapps_dbgeng_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp
+            .path()
+            .join("WindowsApps")
+            .join("Microsoft.WinDbg_1.0.0.0_x64__8wekyb3d8bbwe")
+            .join("amd64");
+        fs::create_dir_all(source.join("ttd")).unwrap();
+        fs::write(source.join("dbgeng.dll"), b"dbgeng").unwrap();
+        fs::write(source.join("ttd").join("TTDReplay.dll"), b"ttd").unwrap();
+        let cache_root = temp.path().join("cache");
+
+        let cached = cache_windowsapps_dbgeng_dir_for_active_user(&source, &cache_root).unwrap();
+        assert_ne!(cached, source);
+        assert!(cached.join("dbgeng.dll").is_file());
+        assert!(cached.join("ttd").join("TTDReplay.dll").is_file());
+
+        let active =
+            prepare_active_user_dbgeng_dirs(std::slice::from_ref(&source), &cache_root).unwrap();
+        assert_ne!(active[0], source);
+
+        let system = prepare_dbgeng_dirs_for_worker_identity(
+            &WorkerIdentity::LocalSystem,
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert_eq!(system[0], source);
+    }
+
+    #[test]
+    fn mcp_tool_schemas_expose_structured_targets_and_write_items() {
+        let tools = mcp_tool_descriptors(ServiceCapabilities::default());
+        let debug = tools
+            .iter()
+            .find(|tool| tool["name"] == "debug.session.create")
+            .unwrap();
+        assert!(debug["description"].as_str().unwrap().contains("kind=file"));
+        assert!(debug["inputSchema"]["properties"]["target"]["oneOf"].is_array());
+        assert_eq!(
+            debug["inputSchema"]["properties"]["target"]["oneOf"][2]["required"],
+            json!(["kind", "executable"])
+        );
+        assert_eq!(
+            debug["inputSchema"]["properties"]["worker_identity"]["enum"][1],
+            "active_interactive_user"
+        );
+        let eval = tools
+            .iter()
+            .find(|tool| tool["name"] == "debug.eval")
+            .unwrap();
+        assert_eq!(
+            eval["inputSchema"]["properties"]["timeout_ms"]["type"],
+            "integer"
+        );
+
+        let recording = tools
+            .iter()
+            .find(|tool| tool["name"] == "recording.ttd")
+            .unwrap();
+        assert_eq!(
+            recording["inputSchema"]["properties"]["target"]["oneOf"][0]["required"],
+            json!(["kind", "executable"])
+        );
+        assert_eq!(
+            recording["inputSchema"]["properties"]["target"]["oneOf"][2]["required"],
+            json!(["kind", "program"])
+        );
+        assert_eq!(
+            recording["inputSchema"]["properties"]["target"]["oneOf"][2]["properties"]["cmd_line_filter"]
+                ["type"],
+            "string"
+        );
+
+        let rename = tools
+            .iter()
+            .find(|tool| tool["name"] == "reverse.rename")
+            .unwrap();
+        assert_eq!(
+            rename["inputSchema"]["properties"]["items"]["items"]["properties"]["new_name"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -10081,6 +11114,39 @@ allow_py_eval = true
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].command, ".echo fails");
         assert!(matches!(audit[0].status, OperationStatus::Failed));
+    }
+
+    #[test]
+    fn debug_eval_timeout_kills_worker_and_marks_session_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = Arc::new(InstrumentedWorkerSupervisor::with_delay(200));
+        let host = ServiceHost::new(supervisor);
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let eval = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "debug.eval".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "command": "TTD.Calls(\"KERNELBASE!LoadLibraryExW\")",
+                "timeout_ms": 10
+            })),
+        });
+
+        let error = eval.error.unwrap();
+        assert!(error.message.contains("timed out after 10 ms"));
+
+        let state = host.lock_state().unwrap();
+        let session = state.sessions.values().next().unwrap();
+        assert_eq!(session.state, DebugSessionState::Error);
+        let operation = state
+            .operations
+            .values()
+            .find(|operation| operation.capability == "debug.eval")
+            .unwrap();
+        assert_eq!(operation.status, ServiceOperationStatus::Failed);
     }
 
     #[test]
@@ -10672,6 +11738,34 @@ allow_py_eval = true
     }
 
     #[test]
+    fn reverse_decompile_large_result_returns_preview_with_artifact_ref() {
+        let artifact_id = ArtifactRef::new(Id::new("artifact-large-decompile").unwrap());
+        let core = ReverseCoreFunctionResult {
+            function: "decompile".to_string(),
+            result: json!({
+                "addr": 0x140001000u64,
+                "function_name": "big_function",
+                "language": "c",
+                "pseudocode": "x".repeat(MAX_INLINE_REVERSE_RESULT_BYTES + 1),
+            }),
+            warnings: Vec::new(),
+        };
+
+        let result = reverse_core_response_result(&core, &artifact_id, 200_000).unwrap();
+
+        assert_eq!(result["pseudocode_truncated"], true);
+        assert_eq!(
+            result["pseudocode"].as_str().unwrap().len(),
+            MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES
+        );
+        assert_eq!(
+            result["full_result_artifact_ref"]["id"],
+            "artifact-large-decompile"
+        );
+        assert_eq!(result["full_result_byte_len"], 200_000);
+    }
+
+    #[test]
     fn reverse_core_functions_cover_pagination_empty_and_invalid_input() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
@@ -11012,6 +12106,26 @@ allow_py_eval = true
         assert_eq!(result["state"], "completed");
         assert_eq!(result["operation_status"], "success");
         assert_eq!(result["target_pid"], 42);
+        assert!(
+            result["primary_trace_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("sample.run")
+        );
+        assert_eq!(result["trace_paths"].as_array().unwrap().len(), 1);
+        assert_eq!(result["trace_index_paths"].as_array().unwrap().len(), 1);
+        assert_eq!(result["trace_artifacts"].as_array().unwrap().len(), 1);
+        let trace_relative_path = result["trace_artifacts"][0]["relative_path"]
+            .as_str()
+            .unwrap()
+            .replace('/', "\\");
+        assert_eq!(
+            trace_relative_path,
+            format!(
+                "artifacts\\recordings\\{}\\traces\\sample.run",
+                result["recording_id"]["id"].as_str().unwrap()
+            )
+        );
 
         let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
         let artifacts = workspace.list_artifacts().unwrap();
@@ -11934,6 +13048,37 @@ allow_py_eval = true
     }
 
     #[test]
+    fn workspace_facts_falls_back_to_project_artifacts_without_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp
+            .path()
+            .join(INTERNAL_WORKSPACE_DIR)
+            .join("artifacts")
+            .join("recordings")
+            .join("recording-1")
+            .join("traces")
+            .join("sample.run");
+        fs::create_dir_all(trace.parent().unwrap()).unwrap();
+        fs::write(&trace, b"run").unwrap();
+
+        let facts = workspace_facts_with_fallback(temp.path()).unwrap();
+
+        let artifact = facts
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "recording.ttd.trace")
+            .unwrap();
+        assert_eq!(artifact.byte_len, Some(3));
+        assert!(
+            artifact
+                .artifact_id
+                .id
+                .as_str()
+                .starts_with("artifact-synthetic-")
+        );
+    }
+
+    #[test]
     fn http_mcp_rejects_missing_bearer_token() {
         let server = start_mock_http_service();
         let response = post_json(
@@ -12286,6 +13431,16 @@ allow_py_eval = true
             .expect("TTD args contain -out")
     }
 
+    struct RecordingIdentitySupervisor {
+        identities: Mutex<Vec<Option<WorkerIdentity>>>,
+    }
+
+    struct AccessDeniedStartSupervisor;
+
+    struct AccessDeniedThenActiveSupervisor {
+        identities: Mutex<Vec<Option<WorkerIdentity>>>,
+    }
+
     struct InstrumentedWorkerSupervisor {
         active: AtomicU64,
         max_active: AtomicU64,
@@ -12304,6 +13459,153 @@ allow_py_eval = true
     struct FailingReverseCloseSupervisor;
 
     struct FailingReverseCoreSupervisor;
+
+    impl WorkerSupervisor for RecordingIdentitySupervisor {
+        fn create_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            self.identities
+                .lock()
+                .unwrap()
+                .push(request.identity.clone());
+            Ok(WorkerHandle {
+                worker_id: Id::new(format!("test-worker-{}", request.session_id.id.as_str()))
+                    .unwrap(),
+                session_id: request.session_id,
+                pipe_name: "test-pipe".to_string(),
+                identity: request
+                    .identity
+                    .unwrap_or(WorkerIdentity::CurrentUserDevMode),
+            })
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            mock_worker_response(request)
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for AccessDeniedStartSupervisor {
+        fn create_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Ok(test_worker_handle(request.session_id))
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::StartDebugSession { .. } => Ok(WorkerResponse::Failed {
+                    code: "start_failed".to_string(),
+                    message:
+                        "native call failed with status 500: HRESULT 0x80070005: Access is denied."
+                            .to_string(),
+                    writes: Vec::new(),
+                }),
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for AccessDeniedThenActiveSupervisor {
+        fn create_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            self.identities
+                .lock()
+                .unwrap()
+                .push(request.identity.clone());
+            let identity = request.identity.unwrap_or(WorkerIdentity::LocalSystem);
+            Ok(WorkerHandle {
+                worker_id: Id::new(format!("test-worker-{}", request.session_id.id.as_str()))
+                    .unwrap(),
+                session_id: request.session_id,
+                pipe_name: "test-pipe".to_string(),
+                identity,
+            })
+        }
+
+        fn request_worker(
+            &self,
+            worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::StartDebugSession { .. }
+                    if worker.identity != WorkerIdentity::ActiveInteractiveUser =>
+                {
+                    Ok(WorkerResponse::Failed {
+                        code: "start_failed".to_string(),
+                        message:
+                            "native call failed with status 500: HRESULT 0x80070005: Access is denied."
+                                .to_string(),
+                        writes: Vec::new(),
+                    })
+                }
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
 
     impl WorkerSupervisor for FailingStartSupervisor {
         fn create_worker(

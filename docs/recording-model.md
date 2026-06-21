@@ -93,7 +93,7 @@ artifacts/
 `recording.json` 记录低层可审计 metadata，包括：
 
 - `recording_id`
-- `target`：launch executable/args 或 attach pid。
+- `target`：launch executable/args、attach pid，或 monitor program/cmd_line_filter。
 - `mode`：`launch` 或 `attach`。
 - `root_pid`
 - `process_tree_filter`
@@ -106,7 +106,7 @@ artifacts/
 
 `events/*.jsonl` 是按 category 拆分的低层事件流。每一行是一条规范化事件，同时保留 ETW provenance 和 raw payload，方便后续审计和重新解释。
 
-TTD recording 使用同一 `artifacts/recordings/<recording_id>/` namespace。`recording.json` 的 `adapter.kind` 为 `ttd`，`traces/*.run` / `traces/*.idx` 登记为 `recording.ttd.trace` / `recording.ttd.index`，recorder stdout/stderr 登记为 `recording.recorder_output`，事件审计写入 `events.jsonl`。
+TTD recording 使用同一 `artifacts/recordings/<recording_id>/` namespace。`recording.json` 的 `adapter.kind` 为 `ttd`，`traces/*.run` / `traces/*.idx` 登记为 `recording.ttd.trace` / `recording.ttd.index`，recorder stdout/stderr 登记为 `recording.recorder_output`，事件审计写入 `events.jsonl`。`recording.ttd` tool result 也会直接返回 `primary_trace_path`、`trace_paths`、`trace_index_paths` 和 `.run` 对应的 `trace_artifacts`，便于后续用 `debug.session.create` 的 `{ "kind": "file", "path": "<trace.run>" }` replay。
 
 `timeout_ms` 到达时，DbgAtlas 会先执行 `TTD.exe -stop <target> -wait 10`，再等待 recorder 进程退出和落盘；只有 recorder 在 stop 后仍不退出时才兜底终止 recorder 进程，并在 metadata warnings 中记录。
 

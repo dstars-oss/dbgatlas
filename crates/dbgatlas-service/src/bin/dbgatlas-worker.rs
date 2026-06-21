@@ -236,11 +236,8 @@ impl WorkerState {
             DebugTarget::Attach { pid } => {
                 DbgEngSession::attach_with_runtimes(pid, &self.dbgeng_dirs)
             }
-            DebugTarget::Launch { .. } => {
-                return WorkerResponse::failed(
-                    "unsupported_target",
-                    "launch targets are not supported in MVP1",
-                );
+            DebugTarget::Launch { executable, args } => {
+                DbgEngSession::launch_with_runtimes(executable, &args, &self.dbgeng_dirs)
             }
         };
 

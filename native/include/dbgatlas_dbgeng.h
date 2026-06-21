@@ -57,6 +57,9 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_file(
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
     uint32_t pid,
     DA_DbgEngSessionHandle** out_handle);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_launch_process(
+    const char* command_line_utf8,
+    DA_DbgEngSessionHandle** out_handle);
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_execute(
     DA_DbgEngSessionHandle* handle,
     const char* command_utf8,
