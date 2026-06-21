@@ -290,14 +290,28 @@ impl ServiceHost {
     }
 
     pub fn handle_mcp(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        let context = DiagnosticContext::from_rpc(&request);
         if request.id.is_none() {
-            let _ = self.handle_mcp_method(request);
+            if let Err(error) = self.handle_mcp_method(request) {
+                append_service_diagnostic_log(&format!(
+                    "mcp_dispatch_error {} error={}",
+                    context.log_fields(),
+                    sanitize_log_value(&error.to_string())
+                ));
+            }
             return None;
         }
         let id = request.id.clone();
         Some(match self.handle_mcp_method(request) {
             Ok(result) => JsonRpcResponse::result(id, result),
-            Err(error) => JsonRpcResponse::error(id, mcp_error_for(error)),
+            Err(error) => {
+                append_service_diagnostic_log(&format!(
+                    "mcp_dispatch_error {} error={}",
+                    context.log_fields(),
+                    sanitize_log_value(&error.to_string())
+                ));
+                JsonRpcResponse::error(id, mcp_error_for(error))
+            }
         })
     }
 
@@ -319,10 +333,11 @@ impl ServiceHost {
             "tools/call" => {
                 let params: ToolCallParams =
                     serde_json::from_value(request.params.unwrap_or_else(|| json!({})))?;
-                let result = self.call_mcp_tool_output(
-                    &params.name,
-                    params.arguments.unwrap_or_else(|| json!({})),
-                )?;
+                let arguments = params.arguments.unwrap_or_else(|| json!({}));
+                let result = self.call_mcp_tool_output(&params.name, arguments.clone())?;
+                if result.is_error {
+                    append_mcp_tool_error_log(&params.name, &arguments, &result);
+                }
                 Ok(json!({
                     "content": [{
                         "type": "text",
@@ -412,9 +427,17 @@ impl ServiceHost {
             jsonrpc: "2.0".to_string(),
             id: Some(json!(1)),
             method: method.to_string(),
-            params: Some(arguments),
+            params: Some(arguments.clone()),
         });
-        Ok(mcp_service_response_result(response))
+        let mut output = mcp_service_response_result(response);
+        if let Some(operation_id) = output
+            .operation_id
+            .clone()
+            .or_else(|| self.latest_operation_id_from_arguments(&arguments))
+        {
+            output.set_operation_id(operation_id);
+        }
+        Ok(output)
     }
 
     fn reverse_py_eval(&self, params: Option<Value>) -> Result<Value, ServiceError> {
@@ -1542,7 +1565,9 @@ impl ServiceHost {
                 "ida_install_dir": ida_install_dir,
                 "created_at": now,
                 "mode": "native_dynamic_idalib",
-                "writes_idb": false
+                "writes_idb": false,
+                "open_operation_writes_idb": false,
+                "session_write_capable": true
             });
             let session_metadata_file = "sessions/session.json";
             let byte_len = write_json_file(&artifact_dir.join(&session_metadata_file), &metadata)?;
@@ -1861,9 +1886,10 @@ impl ServiceHost {
                     artifacts: artifacts.clone(),
                     raw_output: None,
                 })?;
-                self.finish_operation_in_memory(
+                self.record_failed_operation_in_memory(
                     &operation_id,
-                    ServiceOperationStatus::Failed,
+                    &capability,
+                    Some(params.session_id.clone()),
                     error.clone(),
                     artifacts,
                     None,
@@ -1890,9 +1916,10 @@ impl ServiceHost {
                     artifacts: artifacts.clone(),
                     raw_output: None,
                 })?;
-                self.finish_operation_in_memory(
+                self.record_failed_operation_in_memory(
                     &operation_id,
-                    ServiceOperationStatus::Failed,
+                    &capability,
+                    Some(params.session_id.clone()),
                     error.clone(),
                     artifacts,
                     None,
@@ -1919,9 +1946,10 @@ impl ServiceHost {
                     artifacts: artifacts.clone(),
                     raw_output: None,
                 })?;
-                self.finish_operation_in_memory(
+                self.record_failed_operation_in_memory(
                     &operation_id,
-                    ServiceOperationStatus::Failed,
+                    &capability,
+                    Some(params.session_id.clone()),
                     message,
                     artifacts,
                     None,
@@ -2629,6 +2657,16 @@ impl ServiceHost {
             .map(|operation| operation.status.clone()))
     }
 
+    fn latest_operation_id_from_arguments(&self, arguments: &Value) -> Option<String> {
+        let session_id = extract_ref_id_field(arguments, "session_id")?;
+        let state = self.state.lock().ok()?;
+        state
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.last_operation.as_ref())
+            .map(|operation_id| operation_id.id.as_str().to_string())
+    }
+
     fn start_ttd_recording(
         &self,
         recording_id: RecordingRef,
@@ -2687,6 +2725,40 @@ impl ServiceHost {
             operation.artifacts = artifacts;
             operation.raw_output = raw_output;
             operation.updated_at = Timestamp::now();
+        }
+        Ok(())
+    }
+
+    fn record_failed_operation_in_memory(
+        &self,
+        operation_id: &OperationRef,
+        capability: &str,
+        session_id: Option<SessionRef>,
+        summary: String,
+        artifacts: Vec<ArtifactRef>,
+        raw_output: Option<ArtifactRef>,
+    ) -> Result<(), ServiceError> {
+        let now = Timestamp::now();
+        let mut operation = ServiceOperation::failed(
+            operation_id.clone(),
+            capability,
+            session_id.clone(),
+            summary,
+        );
+        operation.artifacts = artifacts.clone();
+        operation.raw_output = raw_output;
+        operation.updated_at = now;
+
+        let mut state = self.lock_state()?;
+        state
+            .operations
+            .insert(operation_id.id.as_str().to_string(), operation);
+        if let Some(session_id) = session_id {
+            if let Some(session) = state.sessions.get_mut(session_id.id.as_str()) {
+                session.updated_at = now;
+                session.last_operation = Some(operation_id.clone());
+                session.artifacts.extend(artifacts);
+            }
         }
         Ok(())
     }
@@ -7207,20 +7279,51 @@ impl JsonRpcResponse {
 struct ToolCallOutput {
     value: Value,
     is_error: bool,
+    operation_id: Option<String>,
+    error_code: Option<i64>,
+    error_message: Option<String>,
 }
 
 impl ToolCallOutput {
     fn success(value: Value) -> Self {
+        let operation_id = extract_ref_id_field(&value, "operation_id");
         Self {
             value,
             is_error: false,
+            operation_id,
+            error_code: None,
+            error_message: None,
         }
     }
 
     fn error(value: Value) -> Self {
+        let operation_id = extract_ref_id_field(&value, "operation_id");
+        let error_code = value
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64);
+        let error_message = value
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         Self {
             value,
             is_error: true,
+            operation_id,
+            error_code,
+            error_message,
+        }
+    }
+
+    fn set_operation_id(&mut self, operation_id: String) {
+        self.operation_id = Some(operation_id.clone());
+        if self.is_error {
+            if let Value::Object(object) = &mut self.value {
+                object
+                    .entry("operation_id")
+                    .or_insert_with(|| json!({ "id": operation_id }));
+            }
         }
     }
 }
@@ -7235,6 +7338,154 @@ fn mcp_service_response_result(response: JsonRpcResponse) -> ToolCallOutput {
         }));
     }
     ToolCallOutput::success(response.result.unwrap_or_else(|| json!(null)))
+}
+
+#[derive(Default)]
+struct DiagnosticContext {
+    path: Option<String>,
+    rpc_method: Option<String>,
+    mcp_tool: Option<String>,
+    session_id: Option<String>,
+    operation_id: Option<String>,
+}
+
+impl DiagnosticContext {
+    fn from_rpc(request: &JsonRpcRequest) -> Self {
+        let mut context = Self {
+            rpc_method: Some(request.method.clone()),
+            ..Default::default()
+        };
+        if request.method == "tools/call" {
+            if let Some(params) = &request.params {
+                context.mcp_tool = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if let Some(arguments) = params.get("arguments") {
+                    context.session_id = extract_ref_id_field(arguments, "session_id");
+                    context.operation_id = extract_ref_id_field(arguments, "operation_id");
+                }
+            }
+        } else if let Some(params) = &request.params {
+            context.session_id = extract_ref_id_field(params, "session_id");
+            context.operation_id = extract_ref_id_field(params, "operation_id");
+        }
+        context
+    }
+
+    fn log_fields(&self) -> String {
+        format!(
+            "path={} rpc_method={} mcp_tool={} session_id={} operation_id={}",
+            log_value(self.path.as_deref()),
+            log_value(self.rpc_method.as_deref()),
+            log_value(self.mcp_tool.as_deref()),
+            log_value(self.session_id.as_deref()),
+            log_value(self.operation_id.as_deref())
+        )
+    }
+}
+
+fn append_mcp_tool_error_log(name: &str, arguments: &Value, result: &ToolCallOutput) {
+    let session_id = extract_ref_id_field(arguments, "session_id");
+    let operation_id = result
+        .operation_id
+        .clone()
+        .or_else(|| extract_ref_id_field(arguments, "operation_id"));
+    let error_code = result
+        .error_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let error_message = result.error_message.as_deref().unwrap_or("unknown");
+    append_service_diagnostic_log(&format!(
+        "mcp_tool_error tool={} session_id={} operation_id={} error_code={} error={}",
+        sanitize_log_value(name),
+        log_value(session_id.as_deref()),
+        log_value(operation_id.as_deref()),
+        sanitize_log_value(&error_code),
+        sanitize_log_value(error_message)
+    ));
+}
+
+fn append_http_diagnostic_log(stage: &str, context: &DiagnosticContext, error: &str) {
+    append_service_diagnostic_log(&format!(
+        "http_request_error stage={} {} error={}",
+        sanitize_log_value(stage),
+        context.log_fields(),
+        sanitize_log_value(error)
+    ));
+}
+
+fn append_service_diagnostic_log(message: &str) {
+    let timestamp = Timestamp::now().unix_millis;
+    let day = (timestamp / 86_400_000) as i64;
+    let log_path = default_windows_service_paths()
+        .log_dir
+        .join(format!("service-{}.log", log_utc_date_from_unix_day(day)));
+    let _ = fs::create_dir_all(log_path.parent().unwrap_or_else(|| Path::new(".")));
+    let line = format!("{timestamp} {}\n", sanitize_log_value(message));
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+}
+
+fn log_value(value: Option<&str>) -> String {
+    value
+        .map(sanitize_log_value)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn sanitize_log_value(value: &str) -> String {
+    let mut sanitized = String::new();
+    for ch in value.chars() {
+        if sanitized.len() >= 512 {
+            sanitized.push_str("...");
+            break;
+        }
+        if ch.is_control() || ch.is_whitespace() {
+            sanitized.push(' ');
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    if sanitized.is_empty() {
+        "empty".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn extract_ref_id_field(value: &Value, field: &str) -> Option<String> {
+    value.get(field).and_then(extract_ref_id_value)
+}
+
+fn extract_ref_id_value(value: &Value) -> Option<String> {
+    value.as_str().map(ToOwned::to_owned).or_else(|| {
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn log_utc_date_from_unix_day(day: i64) -> String {
+    let (year, month, day) = log_date_from_unix_day(day);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn log_date_from_unix_day(day: i64) -> (i32, u32, u32) {
+    let z = day + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2).div_euclid(153);
+    let d = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
 }
 
 fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
@@ -7916,14 +8167,46 @@ fn handle_http_stream(
     config: &ServiceConfig,
     host: &ServiceHost,
 ) -> Result<String, ServiceError> {
-    let request = read_http_request(stream)?;
-    authorize_http_request(&request, config)?;
-    if request.method != "POST" {
-        return Err(ServiceError::UnsupportedHttpMethod(request.method));
+    let request = match read_http_request(stream) {
+        Ok(request) => request,
+        Err(error) => {
+            append_http_diagnostic_log(
+                "read_request",
+                &DiagnosticContext::default(),
+                &error.to_string(),
+            );
+            return Err(error);
+        }
+    };
+    let mut context = DiagnosticContext {
+        path: Some(request.path.clone()),
+        ..Default::default()
+    };
+    if let Err(error) = authorize_http_request(&request, config) {
+        append_http_diagnostic_log("authorize", &context, &error.to_string());
+        return Err(error);
     }
-    let rpc: JsonRpcRequest = serde_json::from_slice(&request.body)?;
+    if request.method != "POST" {
+        let error = ServiceError::UnsupportedHttpMethod(request.method);
+        append_http_diagnostic_log("method", &context, &error.to_string());
+        return Err(error);
+    }
+    let rpc: JsonRpcRequest = match serde_json::from_slice(&request.body) {
+        Ok(rpc) => rpc,
+        Err(error) => {
+            append_http_diagnostic_log("parse_json_rpc", &context, &error.to_string());
+            return Err(error.into());
+        }
+    };
+    let rpc_context = DiagnosticContext::from_rpc(&rpc);
+    context.rpc_method = rpc_context.rpc_method;
+    context.mcp_tool = rpc_context.mcp_tool;
+    context.session_id = rpc_context.session_id;
+    context.operation_id = rpc_context.operation_id;
     if rpc.jsonrpc != "2.0" {
-        return Err(ServiceError::Rpc("jsonrpc must be `2.0`".to_string()));
+        let error = ServiceError::Rpc("jsonrpc must be `2.0`".to_string());
+        append_http_diagnostic_log("jsonrpc_version", &context, &error.to_string());
+        return Err(error);
     }
     match request.path.as_str() {
         "/rpc" => http_json_response(200, &host.handle_rpc(rpc)),
@@ -7931,9 +8214,11 @@ fn handle_http_stream(
             Some(response) => http_json_response(200, &response),
             None => Ok(http_empty_response(202, "Accepted")),
         },
-        other => Err(ServiceError::InvalidHttpRequest(format!(
-            "unsupported path `{other}`"
-        ))),
+        other => {
+            let error = ServiceError::InvalidHttpRequest(format!("unsupported path `{other}`"));
+            append_http_diagnostic_log("path", &context, &error.to_string());
+            Err(error)
+        }
     }
 }
 
@@ -9893,6 +10178,26 @@ allow_py_eval = true
     }
 
     #[test]
+    fn reverse_session_metadata_describes_write_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let _session_id = open_reverse_session(&host, temp.path());
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        let session_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "reverse.session")
+            .unwrap();
+        let metadata_path = workspace.root().join(&session_artifact.relative_path);
+        let metadata: Value =
+            serde_json::from_str(&fs::read_to_string(metadata_path).unwrap()).unwrap();
+        assert_eq!(metadata["writes_idb"], false);
+        assert_eq!(metadata["open_operation_writes_idb"], false);
+        assert_eq!(metadata["session_write_capable"], true);
+    }
+
+    #[test]
     fn reverse_core_legacy_names_are_not_accepted() {
         let temp = tempfile::tempdir().unwrap();
         let host = ServiceHost::with_mock_workers();
@@ -11049,6 +11354,111 @@ allow_py_eval = true
     }
 
     #[test]
+    fn http_mcp_reverse_query_funcs_sort_by_returns_tool_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let server = start_mock_http_service();
+        let open = mcp_tool_call(
+            server.endpoint,
+            "reverse.session.open",
+            json!({
+                "project_root": temp.path(),
+                "database_path": database
+            }),
+        );
+        let result = mcp_tool_call(
+            server.endpoint,
+            "reverse.query_funcs",
+            json!({
+                "session_id": open["session_id"],
+                "filter": "parse",
+                "sort_by": "name",
+                "offset": 0,
+                "count": 20
+            }),
+        );
+
+        assert_eq!(result["operation_status"], "success");
+        assert_eq!(result["function"], "query_funcs");
+        assert_eq!(result["result"]["items"][0]["name"], "parse_args");
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        assert!(
+            workspace
+                .list_operations()
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation.capability == "reverse.query_funcs"
+                        && matches!(operation.status, OperationStatus::Success)
+                })
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_reverse_core_error_is_tool_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let server = start_mock_http_service_with_host(ServiceHost::new(Arc::new(
+            FailingReverseCoreSupervisor,
+        )));
+        let open = mcp_tool_call(
+            server.endpoint,
+            "reverse.session.open",
+            json!({
+                "project_root": temp.path(),
+                "database_path": database
+            }),
+        );
+        let body = mcp_tool_call_body(
+            server.endpoint,
+            "reverse.decompile",
+            json!({
+                "session_id": open["session_id"],
+                "addr": "0x140001000"
+            }),
+        );
+
+        assert_eq!(body["result"]["isError"], true, "{body}");
+        let text: Value =
+            serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["error"]["code"], -32000);
+        assert!(
+            text["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("mock IDA core function failed")
+        );
+        assert!(
+            text["operation_id"]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("op-")
+        );
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        assert!(
+            workspace
+                .list_artifacts()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact.kind == "reverse.adapter_error")
+        );
+        assert!(
+            workspace
+                .list_operations()
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation.capability == "reverse.decompile"
+                        && matches!(operation.status, OperationStatus::Failed)
+                })
+        );
+        server.stop();
+    }
+
+    #[test]
     fn http_mcp_workspace_facts_reads_recording_layer() {
         let temp = tempfile::tempdir().unwrap();
         let server = start_mock_http_service();
@@ -11247,7 +11657,7 @@ allow_py_eval = true
         serde_json::from_str(body).unwrap()
     }
 
-    fn mcp_tool_call(endpoint: SocketAddr, name: &str, arguments: Value) -> Value {
+    fn mcp_tool_call_body(endpoint: SocketAddr, name: &str, arguments: Value) -> Value {
         let response = post_json(
             endpoint,
             "/mcp",
@@ -11264,7 +11674,11 @@ allow_py_eval = true
             }),
         );
         assert_eq!(http_status(&response), 200);
-        let body = http_body_json(&response);
+        http_body_json(&response)
+    }
+
+    fn mcp_tool_call(endpoint: SocketAddr, name: &str, arguments: Value) -> Value {
+        let body = mcp_tool_call_body(endpoint, name, arguments);
         assert_eq!(body["result"]["isError"], false, "{body}");
         serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }

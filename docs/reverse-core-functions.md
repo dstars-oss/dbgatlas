@@ -56,6 +56,11 @@ function/global/address-level edits. Local variable rename, stack frame edits,
 append-comment mode, operand/struct-field typing, and regex text search are
 intentionally deferred.
 
+`reverse.session.open` itself does not modify the IDB. Session metadata keeps
+the legacy `writes_idb: false` field for compatibility and also records
+`open_operation_writes_idb: false` plus `session_write_capable: true` to make it
+explicit that later calls in the same reverse session may write to the database.
+
 `reverse.py_eval` is a prototype high-privilege escape hatch that executes
 Python code in the open IDA context through IDAPython's external language
 interface. It captures `stdout`, `stderr`, and traceback text in the tool result,
@@ -67,7 +72,8 @@ in `runtime.toml`; in development service mode it is controlled by
 
 `reverse.search_text` performs case-insensitive substring search over `strings`,
 `names`, `disasm`, `comments`, or `all`. `reverse.find_bytes` supports byte
-patterns such as `48 8B ?? ??`. Search-style tools return `items`, `offset`,
+patterns such as `48 8B ?? ??` and compact even-length hex such as
+`488b9090` or `0x488b9090`. Search-style tools return `items`, `offset`,
 `count`, `total`, and `next_offset`. `reverse.find_bytes` stops scanning after it
 has enough matches to answer the requested page plus `next_offset`; when
 `next_offset` is non-null, `total` is the observed lower bound rather than an

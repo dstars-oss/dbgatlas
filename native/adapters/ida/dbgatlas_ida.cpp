@@ -1361,6 +1361,39 @@ struct BytePattern {
     std::vector<bool> wildcard;
 };
 
+bool is_hex_text(const std::string& text) {
+    if (text.empty()) {
+        return false;
+    }
+    for (char ch : text) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string strip_hex_prefix_copy(const std::string& token) {
+    if (token.rfind("0x", 0) == 0 || token.rfind("0X", 0) == 0) {
+        return token.substr(2);
+    }
+    return token;
+}
+
+std::invalid_argument byte_pattern_error(
+    const std::string& pattern,
+    const std::string& token,
+    const std::string& reason) {
+    return std::invalid_argument(
+        "invalid byte pattern `" + pattern + "`: token `" + token + "` " + reason +
+        "; expected bytes like `48 8B ?? ??` or compact even-length hex like `488b9090`");
+}
+
+void append_pattern_byte(BytePattern* result, uint8_t value, bool wildcard) {
+    result->bytes.push_back(value);
+    result->wildcard.push_back(wildcard);
+}
+
 BytePattern parse_byte_pattern(const std::string& pattern) {
     BytePattern result;
     size_t pos = 0;
@@ -1371,18 +1404,35 @@ BytePattern parse_byte_pattern(const std::string& pattern) {
         while (end < pattern.size() && std::isspace(static_cast<unsigned char>(pattern[end])) == 0) ++end;
         std::string token = pattern.substr(pos, end - pos);
         if (token == "?" || token == "??") {
-            result.bytes.push_back(0);
-            result.wildcard.push_back(true);
+            append_pattern_byte(&result, 0, true);
         } else {
-            uint64_t value = 0;
-            if (token.rfind("0x", 0) != 0 && token.rfind("0X", 0) != 0) {
-                token = "0x" + token;
+            std::string hex = strip_hex_prefix_copy(token);
+            if (hex.empty()) {
+                throw byte_pattern_error(pattern, token, "is empty after the hex prefix");
             }
-            if (!parse_u64_text(token, &value) || value > 0xff) {
-                throw std::invalid_argument("invalid byte pattern token");
+            if (!is_hex_text(hex)) {
+                throw byte_pattern_error(pattern, token, "contains non-hex characters");
             }
-            result.bytes.push_back(static_cast<uint8_t>(value));
-            result.wildcard.push_back(false);
+            if (hex.size() > 2) {
+                if ((hex.size() % 2) != 0) {
+                    throw byte_pattern_error(pattern, token, "has an odd number of compact hex digits");
+                }
+                for (size_t i = 0; i < hex.size(); i += 2) {
+                    uint64_t value = 0;
+                    std::string byte_text = "0x" + hex.substr(i, 2);
+                    if (!parse_u64_text(byte_text, &value) || value > 0xff) {
+                        throw byte_pattern_error(pattern, token, "contains an invalid compact hex byte");
+                    }
+                    append_pattern_byte(&result, static_cast<uint8_t>(value), false);
+                }
+            } else {
+                uint64_t value = 0;
+                std::string byte_text = "0x" + hex;
+                if (!parse_u64_text(byte_text, &value) || value > 0xff) {
+                    throw byte_pattern_error(pattern, token, "is greater than 0xff");
+                }
+                append_pattern_byte(&result, static_cast<uint8_t>(value), false);
+            }
         }
         pos = end;
     }
