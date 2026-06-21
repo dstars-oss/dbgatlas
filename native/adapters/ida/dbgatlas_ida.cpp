@@ -232,6 +232,8 @@ std::string json_scalar_text(const Json& value) {
 }
 
 uint64_t json_u64_value(const Json& value, const std::string& key) {
+    // MCP/Rust callers may pass JSON numbers, decimal strings, or 0x address
+    // strings. Normalize them here instead of repeating parsing in each core function.
     if (value.is_number_unsigned()) {
         return value.get<uint64_t>();
     }
@@ -276,6 +278,8 @@ std::string json_string_arg(const Json& args, const char* key) {
 }
 
 std::vector<std::string> json_list_value(const Json& value) {
+    // Accept arrays and comma-separated strings so CLI, MCP tools, and scripts
+    // can pass list arguments in their natural shape.
     std::vector<std::string> result;
     if (value.is_null()) {
         return result;
@@ -326,6 +330,7 @@ std::vector<Json> json_items_arg(const Json& args, const char* key) {
 }
 
 bool json_bool_arg(const Json& args, const char* key, bool fallback) {
+    // Accept bool, 0/1, and true/false strings for compatibility with older scripts.
     const Json* value = json_arg(args, key);
     if (value == nullptr) {
         return fallback;
@@ -1310,6 +1315,8 @@ std::string core_py_eval(const Json& args) {
         throw std::invalid_argument("code is required");
     }
 
+    // Native only executes and captures stdout/stderr/traceback. The Rust
+    // service runtime policy owns the security opt-in for this high-privilege path.
     extlang_object_t python = find_extlang_by_name("Python");
     if (python == nullptr) {
         python = find_extlang_by_ext("py");
@@ -1725,6 +1732,8 @@ std::string core_query_entities(IdaSessionHandleImpl* handle, const Json& args) 
 
 std::string execute_core_function(IdaSessionHandleImpl* handle, const std::string& function, const std::string& args) {
     Json parsed_args = parse_json_args(args);
+    // Native core-function dispatch table. Adding a function also requires
+    // Rust wrapper, service/MCP descriptors, docs, and round-trip tests.
     if (function == "lookup_funcs") return core_lookup_funcs(parsed_args);
     if (function == "int_convert") return core_int_convert(parsed_args);
     if (function == "list_funcs") return core_list_funcs(parsed_args);

@@ -1146,9 +1146,24 @@ impl ServiceHost {
         let mut started_worker = None;
         let mut start_writes = None;
         let mut start_failures = Vec::new();
-        for dbgeng_dirs in
-            debug_worker_dbgeng_attempts(&request.target, &self.capabilities.dbgeng_dirs)
-        {
+        let dbgeng_attempts =
+            debug_worker_dbgeng_attempts(&request.target, &self.capabilities.dbgeng_dirs);
+        append_service_diagnostic_log(&format!(
+            "debug_session_create_start session_id={} operation_id={} target_kind={} attempt_count={} workspace={}",
+            sanitize_log_value(session_id.id.as_str()),
+            sanitize_log_value(operation_id.id.as_str()),
+            sanitize_log_value(debug_target_kind(&request.target)),
+            dbgeng_attempts.len(),
+            sanitize_log_value(&workspace.root().display().to_string())
+        ));
+        for (attempt_index, dbgeng_dirs) in dbgeng_attempts.into_iter().enumerate() {
+            append_service_diagnostic_log(&format!(
+                "debug_session_create_attempt session_id={} operation_id={} attempt={} dbgeng_dir_count={}",
+                sanitize_log_value(session_id.id.as_str()),
+                sanitize_log_value(operation_id.id.as_str()),
+                attempt_index + 1,
+                dbgeng_dirs.len()
+            ));
             let worker = self.supervisor.create_worker(WorkerCreateRequest {
                 session_id: session_id.clone(),
                 project_root: params.project_root.clone(),
@@ -1170,19 +1185,47 @@ impl ServiceHost {
                 Ok(WorkerResponse::Ok { writes, .. }) => {
                     started_worker = Some(worker);
                     start_writes = Some(writes);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_ok session_id={} operation_id={} attempt={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        attempt_index + 1
+                    ));
                     break;
                 }
                 Ok(WorkerResponse::Failed { code, message, .. }) => {
                     let _ = self.supervisor.kill_worker(&worker);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_failed session_id={} operation_id={} attempt={} code={} error={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        attempt_index + 1,
+                        sanitize_log_value(&code),
+                        sanitize_log_value(&message)
+                    ));
                     start_failures.push(format!("{code}: {message}"));
                 }
                 Ok(other) => {
                     let _ = self.supervisor.kill_worker(&worker);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_unexpected session_id={} operation_id={} attempt={} response={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        attempt_index + 1,
+                        sanitize_log_value(&format!("{other:?}"))
+                    ));
                     start_failures.push(format!("unexpected start response: {other:?}"));
                     break;
                 }
                 Err(error) => {
                     let _ = self.supervisor.kill_worker(&worker);
+                    append_service_diagnostic_log(&format!(
+                        "debug_session_create_attempt_error session_id={} operation_id={} attempt={} error={}",
+                        sanitize_log_value(session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        attempt_index + 1,
+                        sanitize_log_value(&error.to_string())
+                    ));
                     start_failures.push(error.to_string());
                     break;
                 }
@@ -1191,6 +1234,12 @@ impl ServiceHost {
         let Some(worker) = started_worker else {
             let message = start_failures.join(" | ");
             self.record_failed_session_create(&workspace, &operation_id, &session_id, &message)?;
+            append_service_diagnostic_log(&format!(
+                "debug_session_create_failed session_id={} operation_id={} error={}",
+                sanitize_log_value(session_id.id.as_str()),
+                sanitize_log_value(operation_id.id.as_str()),
+                sanitize_log_value(&message)
+            ));
             return Err(ServiceError::Worker(message));
         };
         let start_writes = start_writes.expect("worker start writes are set with started worker");
@@ -1241,6 +1290,13 @@ impl ServiceHost {
         state
             .sessions
             .insert(session_id.id.as_str().to_string(), session.clone());
+
+        append_service_diagnostic_log(&format!(
+            "debug_session_create_complete session_id={} operation_id={} artifact_count={}",
+            sanitize_log_value(session_id.id.as_str()),
+            sanitize_log_value(operation_id.id.as_str()),
+            registered_start_writes.artifacts.len()
+        ));
 
         Ok(json!({
             "session_id": session_id,
@@ -2332,6 +2388,15 @@ impl ServiceHost {
                     artifacts: registered.artifacts.clone(),
                     raw_output: registered.raw_output.clone(),
                 })?;
+                append_operation_diagnostic_log(
+                    capability,
+                    &session.session_id,
+                    &operation_id,
+                    &workspace_status,
+                    registered.artifacts.len(),
+                    registered.raw_output.as_ref(),
+                    None,
+                );
                 result.raw_output = registered.raw_output.clone();
                 let response = command_result_response(&result, workspace_status, &registered)?;
 
@@ -2387,9 +2452,18 @@ impl ServiceHost {
                     &operation_id,
                     ServiceOperationStatus::Failed,
                     message.clone(),
-                    registered.artifacts,
-                    registered.raw_output,
+                    registered.artifacts.clone(),
+                    registered.raw_output.clone(),
                 )?;
+                append_operation_diagnostic_log(
+                    capability,
+                    &session.session_id,
+                    &operation_id,
+                    &OperationStatus::Failed,
+                    registered.artifacts.len(),
+                    registered.raw_output.as_ref(),
+                    Some(&format!("{code}: {message}")),
+                );
                 Err(ServiceError::Worker(format!("{code}: {message}")))
             }
             Ok(other) => {
@@ -2421,6 +2495,15 @@ impl ServiceHost {
                     Vec::new(),
                     None,
                 )?;
+                append_operation_diagnostic_log(
+                    capability,
+                    &session.session_id,
+                    &operation_id,
+                    &OperationStatus::Failed,
+                    0,
+                    None,
+                    Some(&message),
+                );
                 Err(ServiceError::Worker(message))
             }
             Err(error) => {
@@ -2447,7 +2530,7 @@ impl ServiceHost {
                     capability: capability.to_string(),
                     command: audit_command,
                     created_at: Timestamp::now(),
-                    status,
+                    status: status.clone(),
                     artifacts: Vec::new(),
                     raw_output: None,
                 })?;
@@ -2460,6 +2543,15 @@ impl ServiceHost {
                         None,
                     )?;
                 }
+                append_operation_diagnostic_log(
+                    capability,
+                    &session.session_id,
+                    &operation_id,
+                    &status,
+                    0,
+                    None,
+                    Some(&error.to_string()),
+                );
                 Err(error)
             }
         }
@@ -2513,6 +2605,15 @@ impl ServiceHost {
                     artifacts: registered.artifacts.clone(),
                     raw_output: registered.raw_output.clone(),
                 })?;
+                append_operation_diagnostic_log(
+                    "debug.read_memory",
+                    &session.session_id,
+                    &operation_id,
+                    &status,
+                    registered.artifacts.len(),
+                    registered.raw_output.as_ref(),
+                    None,
+                );
                 let response = memory_result_response(&result, status, &registered)?;
 
                 let mut state = self.lock_state()?;
@@ -2562,9 +2663,18 @@ impl ServiceHost {
                     &operation_id,
                     ServiceOperationStatus::Failed,
                     message.clone(),
-                    registered.artifacts,
-                    registered.raw_output,
+                    registered.artifacts.clone(),
+                    registered.raw_output.clone(),
                 )?;
+                append_operation_diagnostic_log(
+                    "debug.read_memory",
+                    &session.session_id,
+                    &operation_id,
+                    &OperationStatus::Failed,
+                    registered.artifacts.len(),
+                    registered.raw_output.as_ref(),
+                    Some(&format!("{code}: {message}")),
+                );
                 Err(ServiceError::Worker(format!("{code}: {message}")))
             }
             Ok(other) => {
@@ -2596,6 +2706,15 @@ impl ServiceHost {
                     Vec::new(),
                     None,
                 )?;
+                append_operation_diagnostic_log(
+                    "debug.read_memory",
+                    &session.session_id,
+                    &operation_id,
+                    &OperationStatus::Failed,
+                    0,
+                    None,
+                    Some(&message),
+                );
                 Err(ServiceError::Worker(message))
             }
             Err(error) => {
@@ -2622,7 +2741,7 @@ impl ServiceHost {
                     capability: "debug.read_memory".to_string(),
                     command: audit_command,
                     created_at: Timestamp::now(),
-                    status,
+                    status: status.clone(),
                     artifacts: Vec::new(),
                     raw_output: None,
                 })?;
@@ -2635,6 +2754,15 @@ impl ServiceHost {
                         None,
                     )?;
                 }
+                append_operation_diagnostic_log(
+                    "debug.read_memory",
+                    &session.session_id,
+                    &operation_id,
+                    &status,
+                    0,
+                    None,
+                    Some(&error.to_string()),
+                );
                 Err(error)
             }
         }
@@ -3157,16 +3285,26 @@ impl ProcessWorkerSupervisor {
 
 impl WorkerSupervisor for ProcessWorkerSupervisor {
     fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
+        let started = Instant::now();
+        let dbgeng_dir_count = request.dbgeng_dirs.len();
         let worker_id = Id::new(format!("worker-{}", request.session_id.id.as_str()))
             .expect("generated worker ids are valid");
         let pipe_name = unique_pipe_name(&request.session_id);
+        let identity = request.identity.unwrap_or_else(|| self.identity.clone());
+        append_service_diagnostic_log(&format!(
+            "worker_create_start worker_id={} session_id={} identity={} startup_timeout_ms={} dbgeng_dir_count={}",
+            sanitize_log_value(worker_id.as_str()),
+            sanitize_log_value(request.session_id.id.as_str()),
+            sanitize_log_value(&format!("{:?}", identity)),
+            request.startup_timeout_ms,
+            dbgeng_dir_count,
+        ));
         let transport = WorkerTransport::create_server(&pipe_name)?;
         let worker_exe = self
             .worker_exe
             .clone()
             .map(Ok)
             .unwrap_or_else(worker_executable_path)?;
-        let identity = request.identity.unwrap_or_else(|| self.identity.clone());
         let mut child = spawn_worker_process(
             &worker_exe,
             &pipe_name,
@@ -3180,6 +3318,14 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                append_service_diagnostic_log(&format!(
+                    "worker_create_failed worker_id={} session_id={} identity={} duration_ms={} error={}",
+                    sanitize_log_value(worker_id.as_str()),
+                    sanitize_log_value(request.session_id.id.as_str()),
+                    sanitize_log_value(&format!("{:?}", identity)),
+                    started.elapsed().as_millis(),
+                    sanitize_log_value(&error.to_string())
+                ));
                 return Err(error);
             }
         };
@@ -3191,6 +3337,14 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             .lock()
             .map_err(|_| ServiceError::Worker("worker registry lock poisoned".to_string()))?
             .insert(worker_id.as_str().to_string(), state);
+        append_service_diagnostic_log(&format!(
+            "worker_create_complete worker_id={} session_id={} identity={} duration_ms={} dbgeng_dir_count={}",
+            sanitize_log_value(worker_id.as_str()),
+            sanitize_log_value(request.session_id.id.as_str()),
+            sanitize_log_value(&format!("{:?}", identity)),
+            started.elapsed().as_millis(),
+            dbgeng_dir_count,
+        ));
         Ok(WorkerHandle {
             worker_id,
             pipe_name,
@@ -3209,7 +3363,7 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             .transport
             .lock()
             .map_err(|_| ServiceError::Worker("worker transport lock poisoned".to_string()))?;
-        transport.request(request)
+        transport.request(worker, request)
     }
 
     fn cancel_worker_operation(
@@ -3220,22 +3374,41 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
     ) -> Result<WorkerCancelOutcome, ServiceError> {
         let worker_state = self.get_worker(worker)?;
         if let Ok(mut transport) = worker_state.transport.try_lock() {
-            let _ = transport.request(WorkerRequest::CancelOperation {
-                session_id: session_id.clone(),
-                operation_id: operation_id.clone(),
-            })?;
+            let _ = transport.request(
+                worker,
+                WorkerRequest::CancelOperation {
+                    session_id: session_id.clone(),
+                    operation_id: operation_id.clone(),
+                },
+            )?;
+            append_service_diagnostic_log(&format!(
+                "worker_cancel_notified worker_id={} session_id={} operation_id={}",
+                sanitize_log_value(worker.worker_id.as_str()),
+                sanitize_log_value(session_id.id.as_str()),
+                sanitize_log_value(operation_id.id.as_str())
+            ));
             return Ok(WorkerCancelOutcome::Notified);
         }
+        // worker pipe 同一时间只能服务一个请求；拿不到锁说明目标请求仍在执行。
+        // 这时继续排队 cancel 已经无法及时生效，只能终止 worker 保证上层 operation 进入终态。
         self.kill_worker(worker)?;
+        append_service_diagnostic_log(&format!(
+            "worker_cancel_killed worker_id={} session_id={} operation_id={}",
+            sanitize_log_value(worker.worker_id.as_str()),
+            sanitize_log_value(session_id.id.as_str()),
+            sanitize_log_value(operation_id.id.as_str())
+        ));
         Ok(WorkerCancelOutcome::WorkerKilled)
     }
 
     fn close_worker(&self, worker: &WorkerHandle) -> Result<(), ServiceError> {
+        let started = Instant::now();
         let worker_state = self
             .workers
             .lock()
             .map_err(|_| ServiceError::Worker("worker registry lock poisoned".to_string()))?
             .remove(worker.worker_id.as_str());
+        let found = worker_state.is_some();
         if let Some(worker_state) = worker_state {
             let mut child = worker_state
                 .child
@@ -3243,15 +3416,25 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
                 .map_err(|_| ServiceError::Worker("worker process lock poisoned".to_string()))?;
             let _ = child.wait();
         }
+        append_service_diagnostic_log(&format!(
+            "worker_close worker_id={} session_id={} identity={} found={} duration_ms={}",
+            sanitize_log_value(worker.worker_id.as_str()),
+            sanitize_log_value(worker.session_id.id.as_str()),
+            sanitize_log_value(&format!("{:?}", worker.identity)),
+            found,
+            started.elapsed().as_millis(),
+        ));
         Ok(())
     }
 
     fn kill_worker(&self, worker: &WorkerHandle) -> Result<(), ServiceError> {
+        let started = Instant::now();
         let worker_state = self
             .workers
             .lock()
             .map_err(|_| ServiceError::Worker("worker registry lock poisoned".to_string()))?
             .remove(worker.worker_id.as_str());
+        let found = worker_state.is_some();
         if let Some(worker_state) = worker_state {
             let mut child = worker_state
                 .child
@@ -3260,6 +3443,14 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             let _ = child.kill();
             let _ = child.wait();
         }
+        append_service_diagnostic_log(&format!(
+            "worker_kill worker_id={} session_id={} identity={} found={} duration_ms={}",
+            sanitize_log_value(worker.worker_id.as_str()),
+            sanitize_log_value(worker.session_id.id.as_str()),
+            sanitize_log_value(&format!("{:?}", worker.identity)),
+            found,
+            started.elapsed().as_millis(),
+        ));
         Ok(())
     }
 }
@@ -5504,10 +5695,22 @@ fn worker_process_args(pipe_name: &str, session_id: &str, dbgeng_dirs: &[PathBuf
     args
 }
 
+fn debug_target_kind(target: &DebugTarget) -> &'static str {
+    match target {
+        DebugTarget::File { path } if is_ttd_run_file(path) => "ttd_run_file",
+        DebugTarget::File { .. } => "dump_file",
+        DebugTarget::Attach { .. } => "attach",
+        DebugTarget::Launch { .. } => "launch",
+    }
+}
+
 fn debug_worker_dbgeng_attempts(
     target: &DebugTarget,
     dbgeng_dirs: &[PathBuf],
 ) -> Vec<Vec<PathBuf>> {
+    // DbgEng DLL 一旦加载到进程内就不能可靠切换版本；TTD `.run` 又常常依赖
+    // Store/SDK 版本差异。因此 `.run` 每个候选目录用独立 worker 尝试，
+    // 普通 dump/attach 仍把候选一次性交给 worker，避免不必要的进程 churn。
     if matches!(target, DebugTarget::File { path } if is_ttd_run_file(path))
         && dbgeng_dirs.len() > 1
     {
@@ -5902,6 +6105,8 @@ fn discover_service_config_payload(
     source_dir: &Path,
     paths: &ServiceInstallPaths,
 ) -> Result<Option<ServicePayloadFile>, ServiceError> {
+    // release payload 可以携带新的 runtime.toml 来调整 bind/proxy/工具策略；
+    // token 是机器本地密钥，只能留在安装态 etc\token，不能由 payload 覆盖。
     let candidates = [
         source_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
         source_dir
@@ -5930,6 +6135,8 @@ fn discover_service_config_payload(
 }
 
 fn validate_update_runtime_config(path: &Path) -> Result<(), ServiceError> {
+    // 先按 TOML 结构拒绝任何 token 形态，再交给 dbgatlas-runtime 做版本和字段校验。
+    // 这样 updater 即使被传入错误 payload，也不会把 bearer token 写进 runtime.toml。
     let input = fs::read_to_string(path)?;
     reject_runtime_config_token_keys(&input)?;
     reject_runtime_config_local_debug_tool_keys(&input)?;
@@ -6344,9 +6551,13 @@ mod windows_service_control {
         }
         let child = command.spawn()?;
         append_service_log(&format!(
-            "accepted service.update from {}; updater pid={}",
+            "accepted service.update from {}; updater pid={} restart={} timeout_ms={} payload_files={} config_payload={}",
             prepared.source_dir.display(),
-            child.id()
+            child.id(),
+            options.restart,
+            options.timeout_ms,
+            prepared.bin_payload.len(),
+            prepared.config_payload.is_some()
         ));
         Ok(prepared.response)
     }
@@ -6362,9 +6573,13 @@ mod windows_service_control {
         let suffix = update_dir_suffix();
         let staging_dir = paths.root_dir.join(format!("bin.next-{suffix}"));
         append_service_log(&format!(
-            "starting service apply-update from {}; staging {}",
+            "starting service apply-update from {}; staging {}; restart={} timeout_ms={} payload_files={} config_payload={}",
             prepared.source_dir.display(),
-            staging_dir.display()
+            staging_dir.display(),
+            options.restart,
+            options.timeout_ms,
+            prepared.bin_payload.len(),
+            prepared.config_payload.is_some()
         ));
         copy_update_payload_to_staging(&prepared.bin_payload, &staging_dir)?;
         let staged_config_payload = prepared
@@ -6899,20 +7114,130 @@ impl WorkerTransport {
         create_worker_pipe_server(pipe_name)
     }
 
-    fn request(&mut self, request: WorkerRequest) -> Result<WorkerResponse, ServiceError> {
+    fn request(
+        &mut self,
+        worker: &WorkerHandle,
+        request: WorkerRequest,
+    ) -> Result<WorkerResponse, ServiceError> {
         let request_id = next_worker_request_id();
+        let method = request.method_name();
+        let session_id = request.session_id().id.as_str().to_string();
+        let operation_id = request
+            .operation_id()
+            .map(|operation| operation.id.as_str().to_string());
+        let started = Instant::now();
+        append_worker_transport_log(
+            "start",
+            worker,
+            method,
+            &request_id,
+            &session_id,
+            operation_id.as_deref(),
+            None,
+            None,
+            started.elapsed(),
+        );
         let envelope = WorkerEnvelope::new(request_id.clone(), request);
-        let line = encode_jsonl(&envelope)?;
-        self.file.write_all(line.as_bytes())?;
-        self.file.flush()?;
-        let response_line = read_jsonl_line(&mut self.file)?;
-        let response: WorkerEnvelope<WorkerResponse> = decode_jsonl(&response_line)?;
+        let line = encode_jsonl(&envelope).map_err(|error| {
+            append_worker_transport_log(
+                "encode_failed",
+                worker,
+                method,
+                &request_id,
+                &session_id,
+                operation_id.as_deref(),
+                None,
+                Some(&error.to_string()),
+                started.elapsed(),
+            );
+            ServiceError::from(error)
+        })?;
+        if let Err(error) = self.file.write_all(line.as_bytes()) {
+            append_worker_transport_log(
+                "write_failed",
+                worker,
+                method,
+                &request_id,
+                &session_id,
+                operation_id.as_deref(),
+                None,
+                Some(&error.to_string()),
+                started.elapsed(),
+            );
+            return Err(error.into());
+        }
+        if let Err(error) = self.file.flush() {
+            append_worker_transport_log(
+                "flush_failed",
+                worker,
+                method,
+                &request_id,
+                &session_id,
+                operation_id.as_deref(),
+                None,
+                Some(&error.to_string()),
+                started.elapsed(),
+            );
+            return Err(error.into());
+        }
+        let response_line = read_jsonl_line(&mut self.file).map_err(|error| {
+            append_worker_transport_log(
+                "read_failed",
+                worker,
+                method,
+                &request_id,
+                &session_id,
+                operation_id.as_deref(),
+                None,
+                Some(&error.to_string()),
+                started.elapsed(),
+            );
+            error
+        })?;
+        let response: WorkerEnvelope<WorkerResponse> =
+            decode_jsonl(&response_line).map_err(|error| {
+                append_worker_transport_log(
+                    "decode_failed",
+                    worker,
+                    method,
+                    &request_id,
+                    &session_id,
+                    operation_id.as_deref(),
+                    None,
+                    Some(&error.to_string()),
+                    started.elapsed(),
+                );
+                ServiceError::from(error)
+            })?;
         if response.request_id != request_id {
-            return Err(ServiceError::Worker(format!(
+            let message = format!(
                 "worker response id mismatch: expected {request_id}, got {}",
                 response.request_id
-            )));
+            );
+            append_worker_transport_log(
+                "response_id_mismatch",
+                worker,
+                method,
+                &request_id,
+                &session_id,
+                operation_id.as_deref(),
+                None,
+                Some(&message),
+                started.elapsed(),
+            );
+            return Err(ServiceError::Worker(format!("{message}")));
         }
+        append_worker_transport_log(
+            "complete",
+            worker,
+            method,
+            &request_id,
+            &session_id,
+            operation_id.as_deref(),
+            Some(worker_response_kind(&response.message)),
+            None,
+            started.elapsed(),
+        );
         Ok(response.message)
     }
 }
@@ -7342,8 +7667,10 @@ fn mcp_service_response_result(response: JsonRpcResponse) -> ToolCallOutput {
 
 #[derive(Default)]
 struct DiagnosticContext {
+    remote_addr: Option<String>,
     path: Option<String>,
     rpc_method: Option<String>,
+    rpc_id: Option<String>,
     mcp_tool: Option<String>,
     session_id: Option<String>,
     operation_id: Option<String>,
@@ -7353,6 +7680,7 @@ impl DiagnosticContext {
     fn from_rpc(request: &JsonRpcRequest) -> Self {
         let mut context = Self {
             rpc_method: Some(request.method.clone()),
+            rpc_id: request.id.as_ref().map(rpc_id_for_log),
             ..Default::default()
         };
         if request.method == "tools/call" {
@@ -7375,9 +7703,11 @@ impl DiagnosticContext {
 
     fn log_fields(&self) -> String {
         format!(
-            "path={} rpc_method={} mcp_tool={} session_id={} operation_id={}",
+            "remote={} path={} rpc_method={} rpc_id={} mcp_tool={} session_id={} operation_id={}",
+            log_value(self.remote_addr.as_deref()),
             log_value(self.path.as_deref()),
             log_value(self.rpc_method.as_deref()),
+            log_value(self.rpc_id.as_deref()),
             log_value(self.mcp_tool.as_deref()),
             log_value(self.session_id.as_deref()),
             log_value(self.operation_id.as_deref())
@@ -7415,6 +7745,76 @@ fn append_http_diagnostic_log(stage: &str, context: &DiagnosticContext, error: &
     ));
 }
 
+fn append_http_success_log(status: u16, duration: Duration, context: &DiagnosticContext) {
+    append_service_diagnostic_log(&format!(
+        "http_request_complete status={} duration_ms={} {}",
+        status,
+        duration.as_millis(),
+        context.log_fields()
+    ));
+}
+
+fn append_worker_transport_log(
+    event: &str,
+    worker: &WorkerHandle,
+    method: &str,
+    request_id: &str,
+    session_id: &str,
+    operation_id: Option<&str>,
+    response: Option<&str>,
+    error: Option<&str>,
+    duration: Duration,
+) {
+    append_service_diagnostic_log(&format!(
+        "worker_transport event={} worker_id={} identity={} method={} request_id={} session_id={} operation_id={} response={} duration_ms={} error={}",
+        sanitize_log_value(event),
+        sanitize_log_value(worker.worker_id.as_str()),
+        sanitize_log_value(&format!("{:?}", worker.identity)),
+        sanitize_log_value(method),
+        sanitize_log_value(request_id),
+        sanitize_log_value(session_id),
+        log_value(operation_id),
+        log_value(response),
+        duration.as_millis(),
+        log_value(error),
+    ));
+}
+
+fn worker_response_kind(response: &WorkerResponse) -> &'static str {
+    match response {
+        WorkerResponse::Ok { .. } => "ok",
+        WorkerResponse::DebugCommand { .. } => "debug_command",
+        WorkerResponse::DebugMemory { .. } => "debug_memory",
+        WorkerResponse::ReverseSessionOpened { .. } => "reverse_session_opened",
+        WorkerResponse::ReverseFunctionLookup { .. } => "reverse_function_lookup",
+        WorkerResponse::ReverseCoreFunction { .. } => "reverse_core_function",
+        WorkerResponse::Failed { .. } => "failed",
+    }
+}
+
+fn append_operation_diagnostic_log(
+    capability: &str,
+    session_id: &SessionRef,
+    operation_id: &OperationRef,
+    status: &OperationStatus,
+    artifact_count: usize,
+    raw_output: Option<&ArtifactRef>,
+    error: Option<&str>,
+) {
+    // 这里故意只记录 refs 和摘要级错误，不记录命令正文、token 或完整参数。
+    // 需要复现时再通过 workspace JSONL 和 artifact refs 进入事实层。
+    append_service_diagnostic_log(&format!(
+        "operation_recorded capability={} session_id={} operation_id={} status={} artifact_count={} raw_output_ref={} error={}",
+        sanitize_log_value(capability),
+        sanitize_log_value(session_id.id.as_str()),
+        sanitize_log_value(operation_id.id.as_str()),
+        sanitize_log_value(&format!("{status:?}")),
+        artifact_count,
+        log_value(raw_output.map(|artifact| artifact.id.as_str())),
+        log_value(error)
+    ));
+}
+
 fn append_service_diagnostic_log(message: &str) {
     let timestamp = Timestamp::now().unix_millis;
     let day = (timestamp / 86_400_000) as i64;
@@ -7434,6 +7834,16 @@ fn log_value(value: Option<&str>) -> String {
     value
         .map(sanitize_log_value)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn rpc_id_for_log(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Null => "null".to_string(),
+        _ => "complex".to_string(),
+    }
 }
 
 fn sanitize_log_value(value: &str) -> String {
@@ -8108,8 +8518,12 @@ pub fn run_http_service_until(
     validate_config(&config)?;
     let listener = TcpListener::bind(config.bind)?;
     listener.set_nonblocking(true)?;
+    append_service_diagnostic_log(&format!(
+        "http_service_start bind={}",
+        sanitize_log_value(&config.bind.to_string())
+    ));
     while !shutdown.is_stopping() {
-        let (mut stream, _) = match listener.accept() {
+        let (mut stream, peer_addr) = match listener.accept() {
             Ok(accepted) => accepted,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
@@ -8120,7 +8534,7 @@ pub fn run_http_service_until(
         let config = config.clone();
         let host = host.clone();
         std::thread::spawn(move || {
-            let response = match handle_http_stream(&mut stream, &config, &host) {
+            let response = match handle_http_stream(&mut stream, &config, &host, Some(peer_addr)) {
                 Ok(response) => response,
                 Err(error) => match http_json_response(
                     http_status_for(&error),
@@ -8136,6 +8550,10 @@ pub fn run_http_service_until(
             let _ = stream.write_all(response.as_bytes());
         });
     }
+    append_service_diagnostic_log(&format!(
+        "http_service_stop bind={}",
+        sanitize_log_value(&config.bind.to_string())
+    ));
     Ok(())
 }
 
@@ -8166,19 +8584,25 @@ fn handle_http_stream(
     stream: &mut TcpStream,
     config: &ServiceConfig,
     host: &ServiceHost,
+    peer_addr: Option<SocketAddr>,
 ) -> Result<String, ServiceError> {
+    let started = Instant::now();
     let request = match read_http_request(stream) {
         Ok(request) => request,
         Err(error) => {
             append_http_diagnostic_log(
                 "read_request",
-                &DiagnosticContext::default(),
+                &DiagnosticContext {
+                    remote_addr: peer_addr.map(|addr| addr.to_string()),
+                    ..Default::default()
+                },
                 &error.to_string(),
             );
             return Err(error);
         }
     };
     let mut context = DiagnosticContext {
+        remote_addr: peer_addr.map(|addr| addr.to_string()),
         path: Some(request.path.clone()),
         ..Default::default()
     };
@@ -8209,10 +8633,22 @@ fn handle_http_stream(
         return Err(error);
     }
     match request.path.as_str() {
-        "/rpc" => http_json_response(200, &host.handle_rpc(rpc)),
+        "/rpc" => {
+            let response = http_json_response(200, &host.handle_rpc(rpc))?;
+            append_http_success_log(200, started.elapsed(), &context);
+            Ok(response)
+        }
         "/mcp" => match host.handle_mcp(rpc) {
-            Some(response) => http_json_response(200, &response),
-            None => Ok(http_empty_response(202, "Accepted")),
+            Some(response) => {
+                let response = http_json_response(200, &response)?;
+                append_http_success_log(200, started.elapsed(), &context);
+                Ok(response)
+            }
+            None => {
+                let response = http_empty_response(202, "Accepted");
+                append_http_success_log(202, started.elapsed(), &context);
+                Ok(response)
+            }
         },
         other => {
             let error = ServiceError::InvalidHttpRequest(format!("unsupported path `{other}`"));

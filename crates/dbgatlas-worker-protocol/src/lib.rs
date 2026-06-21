@@ -84,6 +84,22 @@ pub enum WorkerRequest {
 }
 
 impl WorkerRequest {
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            WorkerRequest::StartDebugSession { .. } => "start_debug_session",
+            WorkerRequest::EvalDebugCommand { .. } => "eval_debug_command",
+            WorkerRequest::AddSymbols { .. } => "add_symbols",
+            WorkerRequest::ReadMemory { .. } => "read_memory",
+            WorkerRequest::OpenReverseSession { .. } => "open_reverse_session",
+            WorkerRequest::LookupReverseFunction { .. } => "lookup_reverse_function",
+            WorkerRequest::ReverseCoreFunction { .. } => "reverse_core_function",
+            WorkerRequest::CloseReverseSession { .. } => "close_reverse_session",
+            WorkerRequest::CloseSession { .. } => "close_session",
+            WorkerRequest::KillSession { .. } => "kill_session",
+            WorkerRequest::CancelOperation { .. } => "cancel_operation",
+        }
+    }
+
     pub fn session_id(&self) -> &SessionRef {
         match self {
             WorkerRequest::StartDebugSession { session_id, .. }
@@ -97,6 +113,22 @@ impl WorkerRequest {
             | WorkerRequest::CloseSession { session_id }
             | WorkerRequest::KillSession { session_id }
             | WorkerRequest::CancelOperation { session_id, .. } => session_id,
+        }
+    }
+
+    pub fn operation_id(&self) -> Option<&OperationRef> {
+        match self {
+            WorkerRequest::EvalDebugCommand { operation_id, .. }
+            | WorkerRequest::AddSymbols { operation_id, .. }
+            | WorkerRequest::ReadMemory { operation_id, .. }
+            | WorkerRequest::CancelOperation { operation_id, .. } => Some(operation_id),
+            WorkerRequest::StartDebugSession { .. }
+            | WorkerRequest::OpenReverseSession { .. }
+            | WorkerRequest::LookupReverseFunction { .. }
+            | WorkerRequest::ReverseCoreFunction { .. }
+            | WorkerRequest::CloseReverseSession { .. }
+            | WorkerRequest::CloseSession { .. }
+            | WorkerRequest::KillSession { .. } => None,
         }
     }
 }
@@ -468,6 +500,30 @@ mod tests {
         for request in requests {
             assert_eq!(request.session_id(), &session_id);
         }
+    }
+
+    #[test]
+    fn request_diagnostic_helpers_are_stable() {
+        let session_id = SessionRef::new(Id::new("session-001").unwrap());
+        let operation_id = OperationRef::new(Id::new("op-001").unwrap());
+        let request = WorkerRequest::EvalDebugCommand {
+            session_id: session_id.clone(),
+            operation_id: operation_id.clone(),
+            command: ".echo hi".to_string(),
+            artifact_dir: PathBuf::from("artifacts"),
+        };
+
+        assert_eq!(request.method_name(), "eval_debug_command");
+        assert_eq!(request.session_id(), &session_id);
+        assert_eq!(request.operation_id(), Some(&operation_id));
+
+        let request = WorkerRequest::OpenReverseSession {
+            session_id,
+            ida_install_dir: PathBuf::from("ida"),
+            database_path: PathBuf::from("sample.i64"),
+        };
+        assert_eq!(request.method_name(), "open_reverse_session");
+        assert_eq!(request.operation_id(), None);
     }
 
     #[test]

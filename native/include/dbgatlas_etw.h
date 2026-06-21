@@ -67,6 +67,8 @@ typedef struct DA_EtwEventExtractionResult {
     uint32_t stack_frames_unresolved;
     uint32_t file_path_resolved;
     uint32_t file_path_unresolved;
+    /* Extraction quality signals, not hard errors. Rust/service records them
+       in recording metadata so traces can be reviewed or replayed if needed. */
     uint32_t matched_op_end;
     uint32_t unmatched_op_end;
     uint32_t incomplete_io;
@@ -79,6 +81,9 @@ typedef struct DA_EtwStackTraceStatus {
     uint32_t flags;
     uint32_t requested;
     uint32_t enabled;
+    /* Provider/kernel stack tracing is best-effort. When permissions, OS
+       version, or provider support are insufficient, collection continues
+       and warning_count exposes the downgrade. */
     uint32_t provider_stack_enabled;
     uint32_t provider_stack_warning_count;
     uint32_t kernel_stack_enabled;

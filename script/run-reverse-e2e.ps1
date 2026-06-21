@@ -122,10 +122,18 @@ if ([string]::IsNullOrWhiteSpace($Token)) {
     throw "DBGATLAS_TOKEN is required, or pass -Token."
 }
 
+Write-Host "DbgAtlas reverse E2E context:"
+Write-Host "  repo root: $RepoRoot"
+Write-Host "  MCP URL: $McpUrl"
+Write-Host "  IDA install dir: $IdaInstallDir"
+Write-Host "  rebuild IDB: $RebuildIdb"
+
 $workRoot = Join-Path $RepoRoot "temp\reverse-e2e"
 $workspaceRoot = Join-Path $workRoot "workspace-root"
 $runsRoot = Join-Path $workRoot "runs"
 New-Item -ItemType Directory -Force -Path $workRoot, $workspaceRoot, $runsRoot | Out-Null
+Write-Host "  work root: $workRoot"
+Write-Host "  workspace root: $workspaceRoot"
 
 $fixtureC = Join-Path $workRoot "dbgatlas_reverse_fixture.c"
 $fixtureExe = Join-Path $workRoot "dbgatlas_reverse_fixture.exe"
@@ -187,6 +195,7 @@ int main(int argc, const char **argv) {
 Set-Content -LiteralPath $fixtureC -Value $fixtureSource -Encoding ASCII
 
 $vsDevCmd = Resolve-VsDevCmd -Requested $VsDevCmd
+Write-Host "Using VsDevCmd: $vsDevCmd"
 $buildScript = @"
 @echo off
 setlocal
@@ -196,10 +205,14 @@ cl /nologo /Zi /Od /W4 /D_CRT_SECURE_NO_WARNINGS /Fo"$fixtureObj" /Fd"$fixturePd
 exit /b %errorlevel%
 "@
 Set-Content -LiteralPath $buildCmd -Value $buildScript -Encoding ASCII
+Write-Host "Building reverse fixture: $fixtureExe"
 & cmd.exe /c $buildCmd
 if ($LASTEXITCODE -ne 0) {
     throw "Fixture build failed with exit code $LASTEXITCODE"
 }
+Write-Host "Fixture build output:"
+Write-Host "  exe: $fixtureExe"
+Write-Host "  pdb: $fixturePdb"
 
 $idaCreateScript = @'
 import ida_auto
@@ -221,6 +234,7 @@ if (-not (Test-Path -LiteralPath $idaExe)) {
     throw "idat.exe was not found: $idaExe"
 }
 if ($RebuildIdb -or -not (Test-Path -LiteralPath $baseIdb)) {
+    Write-Host "Creating base IDB: $baseIdb"
     if ($RebuildIdb -and (Test-Path -LiteralPath $baseIdb)) {
         Remove-Item -LiteralPath $baseIdb -Force
     }
@@ -228,11 +242,16 @@ if ($RebuildIdb -or -not (Test-Path -LiteralPath $baseIdb)) {
     if ($LASTEXITCODE -ne 0) {
         throw "IDA database creation failed with exit code $LASTEXITCODE"
     }
+} else {
+    Write-Host "Reusing cached base IDB: $baseIdb"
 }
 
 $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+# baseIdb 是可复用基线；每次 MCP 测试复制成 timestamped work IDB，
+# 避免 rename/comment/save 等写操作污染下一轮测试。
 $workIdb = Join-Path $runsRoot "dbgatlas_reverse_fixture.mcp-work.$stamp.i64"
 Copy-Item -LiteralPath $baseIdb -Destination $workIdb -Force
+Write-Host "Working IDB: $workIdb"
 
 $session = $null
 try {
@@ -242,6 +261,7 @@ try {
         ida_install_dir = $IdaInstallDir
     }
     $session = $open.Value.session_id
+    Write-Host "Opened reverse session: $($session.id)"
 
     $lookup = Invoke-McpTool "reverse.lookup_funcs" @{
         session_id = $session
@@ -249,6 +269,7 @@ try {
     }
     $entry = Get-FunctionAddress $lookup "fixture_entry"
     $helper = Get-FunctionAddress $lookup "helper_mix"
+    Write-Host "Resolved fixture_entry=0x$("{0:x}" -f $entry), helper_mix=0x$("{0:x}" -f $helper)"
 
     $queryFuncs = Invoke-McpTool "reverse.query_funcs" @{
         session_id = $session
@@ -312,9 +333,11 @@ try {
         session_id = $session
     }
     Assert-True ([bool]$save.Value.result.ok) "idb_save failed"
+    Write-Host "Saved work IDB."
 }
 finally {
     if ($null -ne $session) {
+        Write-Host "Closing reverse session: $($session.id)"
         Invoke-McpTool "reverse.session.close" @{ session_id = $session } -AllowError | Out-Null
     }
 }

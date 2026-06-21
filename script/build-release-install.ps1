@@ -45,6 +45,7 @@ function Assert-ReleasePayload {
             throw "Release payload is incomplete: missing $path"
         }
     }
+    Write-Host "Required release payload files are present: $($required -join ', ')"
 }
 
 function Copy-OptionalRuntimePayload {
@@ -102,6 +103,11 @@ if (-not (Test-Path -LiteralPath $installScript -PathType Leaf)) {
     throw "Missing install script: $installScript"
 }
 
+Write-Host "DbgAtlas release build context:"
+Write-Host "  repo root: $repoRoot"
+Write-Host "  release dir: $releaseDir"
+Write-Host "  bind: $Bind"
+Write-Host "  BuildOnly=$BuildOnly NoStart=$NoStart NoForce=$NoForce"
 Write-Host "Building DbgAtlas release payload..."
 Push-Location $repoRoot
 try {

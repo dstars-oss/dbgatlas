@@ -68,6 +68,8 @@ artifacts/recordings/<recording_id>/
 
 当前不定义完整 Case/Evidence/Timeline schema。后续只有在具体能力需要稳定交换格式时再补 schema。
 
+当前仓库没有独立 `schemas/` 目录作为稳定交换格式来源；service 和 workspace 代码中的 JSON/JSONL shape 先服务已实现能力。新增 Case/Evidence/Timeline 等 schema 前，需要先有对应能力、迁移策略和验证入口，避免把尚未实现的高层解释层伪装成工具事实层。
+
 runtime config 不属于 manifest。DbgEng/ETW/TTD/IDA 安装路径、symbol path、proxy、recording presets 和 worker process policy 由 `dbgatlas-runtime` 管理。
 
 ## Metadata

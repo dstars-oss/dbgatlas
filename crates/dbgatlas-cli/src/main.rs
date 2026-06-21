@@ -840,6 +840,8 @@ fn resolve_client_connection(
             token: token.clone(),
         });
     }
+    // 默认连接顺序：显式参数 > 安装态 etc/runtime.toml + etc/token > 开发态 dev default。
+    // token 只进入 Authorization header，不在普通 CLI 输出中打印。
     let installed = installed_client_config()?;
     let dev = ServiceConfig::dev_default();
     Ok(ClientConnection {

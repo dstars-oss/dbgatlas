@@ -353,6 +353,9 @@ impl Workspace {
         &self,
         path: &Path,
     ) -> Result<(), WorkspaceError> {
+        // artifact 路径必须停留在 workspace 的 artifacts/ 事实层里。
+        // 这里先规范化已存在的根目录，再规范化目标路径最近的已存在祖先，
+        // 这样能挡住 `artifacts/linked/...` 这类 symlink/junction 逃逸。
         let artifact_root = canonicalize_existing_path(&self.root.join(ARTIFACTS_DIR))?;
         let workspace_root = canonicalize_existing_path(&self.root)?;
         if !artifact_root.starts_with(&workspace_root) {
@@ -461,6 +464,8 @@ fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), Worksp
         create_dir(parent)?;
     }
 
+    // workspace 的事实索引采用 append-only JSONL：便于人工审计，也避免
+    // 工具运行中途失败时重写整份索引造成更大的损坏面。
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -482,6 +487,8 @@ fn read_json_lines<T: DeserializeOwned>(path: PathBuf) -> Result<Vec<T>, Workspa
         return Ok(Vec::new());
     }
 
+    // 读取端保持宽容：空文件或空行代表“暂无事实”，但非空坏 JSON
+    // 仍立即报错，防止上层基于损坏索引继续分析。
     let file = File::open(&path).map_err(|source| WorkspaceError::Io {
         path: path.clone(),
         source,

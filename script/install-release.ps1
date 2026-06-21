@@ -42,6 +42,9 @@ function Get-DbgatlasServiceStatus {
     $output = & $Exe @("--json", "service", "status") 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Could not query existing service status; install will report the concrete error if this matters."
+        if ($output) {
+            Write-Host "status output: $((($output | Select-Object -First 1) | Out-String).Trim())"
+        }
         return $null
     }
 
@@ -51,6 +54,9 @@ function Get-DbgatlasServiceStatus {
     }
     catch {
         Write-Host "Could not parse existing service status; install will continue."
+        if ($output) {
+            Write-Host "status output: $((($output | Select-Object -First 1) | Out-String).Trim())"
+        }
         return $null
     }
 }
@@ -64,6 +70,7 @@ function Wait-DbgatlasHealth {
 
     $lastOutput = $null
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Write-Host "Health check attempt $attempt/$Attempts..."
         $output = & $Exe @("--json", "service", "health") 2>&1
         if ($LASTEXITCODE -eq 0) {
             $output
@@ -77,9 +84,11 @@ function Wait-DbgatlasHealth {
     }
 
     if ($lastOutput) {
+        Write-Host "Last service health output:"
         $lastOutput | ForEach-Object { Write-Host $_ }
     }
-    throw "DbgAtlas service did not become healthy after $Attempts attempts."
+    $logDir = Join-Path $env:ProgramData "DbgAtlas\var\log"
+    throw "DbgAtlas service did not become healthy after $Attempts attempts. Check service logs under $logDir."
 }
 
 function Assert-ReleasePayload {
@@ -93,12 +102,13 @@ function Assert-ReleasePayload {
         "dbgatlas_ida.dll"
     )
 
-    foreach ($name in $required) {
+foreach ($name in $required) {
         $path = Join-Path $ReleaseDir $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Release payload is incomplete: missing $path"
         }
     }
+    Write-Host "Required release payload files are present: $($required -join ', ')"
 }
 
 Assert-Windows
@@ -111,6 +121,11 @@ $repoRootPath = (Resolve-Path -LiteralPath $RepoRoot).Path
 $releaseDir = Join-Path $repoRootPath "target\release"
 $dbgatlasExe = Join-Path $releaseDir "dbgatlas.exe"
 
+Write-Host "DbgAtlas release install context:"
+Write-Host "  repo root: $repoRootPath"
+Write-Host "  release dir: $releaseDir"
+Write-Host "  bind: $Bind"
+Write-Host "  NoStart=$NoStart NoForce=$NoForce"
 Assert-ReleasePayload -ReleaseDir $releaseDir
 
 $existingStatus = Get-DbgatlasServiceStatus -Exe $dbgatlasExe

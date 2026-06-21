@@ -214,6 +214,35 @@ std::string windows_error_message(DWORD error) {
     return message;
 }
 
+std::string wide_to_utf8(const std::wstring& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int required = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        text.c_str(),
+        static_cast<int>(text.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (required <= 0) {
+        return "<unprintable path>";
+    }
+    std::string output(static_cast<size_t>(required), '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        text.c_str(),
+        static_cast<int>(text.size()),
+        output.data(),
+        required,
+        nullptr,
+        nullptr);
+    return output;
+}
+
 std::wstring dbgeng_dll_path_from_dir(const char* dbgeng_dir_utf8) {
     std::wstring dir = utf8_to_wide(dbgeng_dir_utf8);
     if (dir.empty()) {
@@ -230,6 +259,9 @@ std::wstring dbgeng_dll_path_from_dir(const char* dbgeng_dir_utf8) {
 int32_t ensure_dbgeng_runtime_loaded(const char* dbgeng_dir_utf8) {
     std::lock_guard<std::mutex> guard(g_runtime_mutex);
     const std::wstring dll_path = dbgeng_dll_path_from_dir(dbgeng_dir_utf8);
+    // DbgEng is process-global once DebugCreate comes from one dbgeng.dll.
+    // Version fallback must happen in separate worker processes owned by
+    // the Rust service instead of switching DLL paths in this process.
     if (g_debug_create != nullptr) {
         if (dbgeng_dir_utf8 == nullptr || dbgeng_dir_utf8[0] == '\0') {
             return DA_DBGENG_OK;
@@ -237,7 +269,8 @@ int32_t ensure_dbgeng_runtime_loaded(const char* dbgeng_dir_utf8) {
         if (!g_dbgeng_loaded_path.empty() && !dll_path.empty() && _wcsicmp(g_dbgeng_loaded_path.c_str(), dll_path.c_str()) != 0) {
             return fail(
                 DA_DBGENG_ERR_INTERNAL,
-                "DbgEng runtime is already loaded from a different path");
+                "DbgEng runtime is already loaded from " + wide_to_utf8(g_dbgeng_loaded_path) +
+                    "; requested " + wide_to_utf8(dll_path));
         }
         return DA_DBGENG_OK;
     }
@@ -251,7 +284,8 @@ int32_t ensure_dbgeng_runtime_loaded(const char* dbgeng_dir_utf8) {
     if (module == nullptr) {
         return fail(
             DA_DBGENG_ERR_INTERNAL,
-            "LoadLibrary dbgeng.dll failed: " + windows_error_message(GetLastError()));
+            "LoadLibrary dbgeng.dll failed at " + wide_to_utf8(dll_path) + ": " +
+                windows_error_message(GetLastError()));
     }
 
     auto debug_create = reinterpret_cast<DebugCreateFn>(GetProcAddress(module, "DebugCreate"));
@@ -384,6 +418,9 @@ DbgEngSession* session_from_handle(DA_DbgEngSessionHandle* handle) {
 }
 
 int32_t execute_command(DbgEngSession& session, const char* command_utf8, DA_DbgEngTextView* out) {
+    // Temporarily replace the output callback to capture this command only.
+    // Always restore the previous callback before returning so later commands
+    // or other DbgEng clients do not write into the wrong buffer.
     CapturingOutputCallbacks callbacks;
     IDebugOutputCallbacks* previous = nullptr;
     HRESULT hr = session.client->GetOutputCallbacks(&previous);
@@ -409,6 +446,8 @@ int32_t execute_command(DbgEngSession& session, const char* command_utf8, DA_Dbg
         return fail_hr("IDebugClient::SetOutputCallbacks(restore)", restore_hr);
     }
     if (FAILED(hr)) {
+        // Do not include command_utf8 here: native errors can flow into
+        // persistent service diagnostics, while commands may contain secrets.
         return fail_hr("IDebugControl::Execute", hr);
     }
 
@@ -535,6 +574,9 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
         if (status != DA_DBGENG_OK) {
             return status;
         }
+        // Use non-invasive/no-suspend attach: read target state without taking
+        // over the debug lifecycle. Destruction detaches passively so closing a
+        // DbgAtlas session does not terminate the target process.
         HRESULT hr = session->client->AttachProcess(
             0,
             pid,
@@ -666,7 +708,14 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_read_virtual(
             length,
             &bytes_read);
         if (FAILED(hr)) {
-            return fail_hr("IDebugDataSpaces::ReadVirtual", hr);
+            char operation[128] = {};
+            std::snprintf(
+                operation,
+                sizeof(operation),
+                "IDebugDataSpaces::ReadVirtual(address=0x%llX,length=%u)",
+                static_cast<unsigned long long>(address),
+                length);
+            return fail_hr(operation, hr);
         }
         owner->bytes.resize(std::min<size_t>(owner->bytes.size(), bytes_read));
         out->data = owner->bytes.empty() ? nullptr : owner->bytes.data();

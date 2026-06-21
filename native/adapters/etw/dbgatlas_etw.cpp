@@ -453,6 +453,9 @@ std::string file_name_from_path(const std::string& path) {
 EventMetadata event_metadata(PEVENT_RECORD record) {
     EventMetadata metadata;
     ULONG buffer_size = 0;
+    // TDH metadata varies across Windows/provider versions. Use field-name
+    // heuristics for common pid/path/status data; missing metadata keeps the
+    // raw event usable instead of failing the whole collection.
     ULONG status = TdhGetEventInformation(record, 0, nullptr, nullptr, &buffer_size);
     if (status != ERROR_INSUFFICIENT_BUFFER || buffer_size == 0) {
         return metadata;
@@ -778,6 +781,8 @@ std::optional<DecodedStackWalkEvent> decode_stack_walk_raw_data(PEVENT_RECORD re
         return std::nullopt;
     }
     const auto* data = static_cast<const unsigned char*>(record->UserData);
+    // StackWalk sometimes exposes named TDH fields and sometimes only raw payload.
+    // Normalize both paths to event_timestamp/pid/tid/address list for later matching.
     DecodedStackWalkEvent stack;
     std::memcpy(&stack.event_timestamp, data, sizeof(int64_t));
     std::memcpy(&stack.stack_process, data + 8, sizeof(uint32_t));
@@ -843,6 +848,8 @@ void append_stack_addresses(std::vector<uint64_t>& target, const std::vector<uin
 }
 
 std::vector<uint64_t> take_matching_pending_stack(ExtractionContext& context, long long timestamp, uint32_t pid, uint32_t tid) {
+    // Standalone StackWalk events can arrive before their target events. Prefer
+    // timestamp+pid+tid, then fall back to timestamp+pid to preserve stack clues.
     auto it = context.pending_stacks_by_timestamp.find(timestamp);
     if (it == context.pending_stacks_by_timestamp.end()) {
         return {};
@@ -1245,6 +1252,9 @@ void process_file_io_event(ExtractionContext& context, PEVENT_RECORD record, con
         context.skipped_events += 1;
         return;
     }
+    // File I/O is usually split into begin/op/end records. Cache CREATE/READ/WRITE
+    // by IrpPtr, merge OP_END completion data, and record unmatched/incomplete
+    // work as quality counters instead of failing the whole trace.
     FileEventRecord event = decoded_file_event(context, record, metadata);
     const uint32_t opcode = record->EventHeader.EventDescriptor.Opcode;
     context.file_io_raw_sequence += 1;
@@ -1666,6 +1676,9 @@ public:
         const char* category = event_category(metadata.names);
         const bool keep_for_output = category != nullptr && preset_enabled(context_.preset_flags, category);
         const bool keep_for_module_map = category != nullptr && std::strcmp(category, "image") == 0;
+        // Filtered ETL must keep more than final output categories: StackWalk
+        // pairs with later events, image events build the module map, and FileIo
+        // OP_END completes cached begin records.
         const bool keep_for_stack_walk = keep_stack_walk_for_filter(context_, record, metadata);
         const bool keep_for_file_completion = keep_file_completion_for_filter(context_, record, category);
         const bool needs_process_tree_filter = !keep_for_stack_walk && !keep_for_file_completion;
@@ -1710,6 +1723,8 @@ struct ProviderSpec final {
 std::vector<ProviderSpec> provider_specs(uint32_t preset_flags) {
     std::vector<ProviderSpec> providers;
     ULONGLONG process_keywords = 0;
+    // Kernel provider keyword values come from Windows ETW classic-provider
+    // conventions. Image load stays on with process/thread for stack/module context.
     const uint32_t collection_flags = preset_flags == 0 ? 0 : preset_flags | DA_ETW_PRESET_IMAGE;
     if ((collection_flags & DA_ETW_PRESET_PROCESS) != 0) {
         process_keywords |= 0x10;
@@ -1737,6 +1752,8 @@ std::vector<ProviderSpec> provider_specs(uint32_t preset_flags) {
 
 std::vector<CLASSIC_EVENT_ID> stack_trace_events(uint32_t preset_flags) {
     std::vector<CLASSIC_EVENT_ID> events;
+    // Kernel stack tracing is best-effort. Record warning_count on failure and
+    // continue collecting events so permissions/OS differences do not abort recording.
     const uint32_t collection_flags = preset_flags == 0 ? 0 : preset_flags | DA_ETW_PRESET_IMAGE;
     auto add = [&events](const GUID& guid, UCHAR type) {
         CLASSIC_EVENT_ID event = {};

@@ -318,6 +318,9 @@ fn resolve_dbgeng_dir_from_roots(roots: &ToolSearchRoots) -> Option<ToolLocation
 }
 
 fn resolve_dbgeng_dirs_from_roots(roots: &ToolSearchRoots) -> Vec<ToolLocation> {
+    // 自动发现只反映当前机器状态，不写进 workspace manifest。
+    // 优先级保持为 Store WinDbg -> Windows SDK/WDK -> System32，便于新版本优先，
+    // 同时在 Store 包不可用时仍能降级到更稳定的系统/SDK 调试器。
     let mut locations = Vec::new();
     if let Some(dir) = find_store_dbgeng_dir(&roots.program_files_windows_apps) {
         push_tool_location(&mut locations, dir, ToolPathSource::AppStore);
@@ -343,6 +346,8 @@ fn resolve_ttd_dir_from_roots(
     dbgeng_candidates: &[ToolLocation],
     roots: &ToolSearchRoots,
 ) -> Option<ToolLocation> {
+    // TTD.exe 通常与对应版本的 dbgeng.dll 配套；先查 dbgeng sibling，
+    // 再查独立 Store TimeTravelDebugging 包，避免跨版本组合导致重放失败。
     for dbgeng in dbgeng_candidates {
         if let Some(dir) = find_ttd_in_dir(&dbgeng.dir.join("ttd")) {
             return Some(ToolLocation {

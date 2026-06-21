@@ -43,6 +43,35 @@ std::string narrow_symbol_error(const char* dll, const char* name) {
     return out.str();
 }
 
+std::string wide_to_utf8(const std::wstring& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int required = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        text.c_str(),
+        static_cast<int>(text.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (required <= 0) {
+        return "<unprintable path>";
+    }
+    std::string output(static_cast<size_t>(required), '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        text.c_str(),
+        static_cast<int>(text.size()),
+        output.data(),
+        required,
+        nullptr,
+        nullptr);
+    return output;
+}
+
 using init_library_fn = int(idaapi*)(int, char*[]);
 using open_database_fn = int(idaapi*)(const char*, bool, const char*);
 using close_database_fn = void(idaapi*)(bool);
@@ -171,7 +200,8 @@ HMODULE load_dll(const std::wstring& path, const char* name) {
     HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (module == nullptr) {
         std::ostringstream out;
-        out << "failed to load " << name << " from IDA install dir, GetLastError=" << GetLastError();
+        out << "failed to load " << name << " at " << wide_to_utf8(path)
+            << ", GetLastError=" << GetLastError();
         throw std::runtime_error(out.str());
     }
     return module;
@@ -210,9 +240,14 @@ void validate_library_version(const IdaApis& api) {
 void dbgatlas_ida_runtime_load(const std::wstring& install_dir) {
     std::lock_guard<std::mutex> guard(g_runtime_mutex);
     std::wstring normalized_install_dir = normalize_install_dir(install_dir);
+    // Build against vendored IDA SDK headers, but bind ida.dll/idalib.dll from
+    // the user's installation at runtime. IDA runtime state is process-global,
+    // so one process can safely bind only one install_dir.
     if (g_api.ida != nullptr && g_api.idalib != nullptr) {
         if (_wcsicmp(g_loaded_install_dir.c_str(), normalized_install_dir.c_str()) != 0) {
-            throw std::runtime_error("IDA runtime is already loaded from a different install_dir");
+            throw std::runtime_error(
+                "IDA runtime is already loaded from " + wide_to_utf8(g_loaded_install_dir) +
+                "; requested " + wide_to_utf8(normalized_install_dir));
         }
         return;
     }

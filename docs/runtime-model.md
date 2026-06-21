@@ -57,6 +57,8 @@ SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe
 
 安装态 service 还暴露 `service.update` JSON-RPC/MCP 方法，接收一个已经构建好的 payload 目录。该方法只完成校验并启动独立 updater 进程，然后异步返回 accepted；updater 会先复制到 `bin.next-*`，停止服务，使用 rename 将旧 `bin` 移到 `bin.old-*` 并把新 payload 放到 `bin`，最后按请求重启服务并 best-effort 清理旧目录。payload 根目录的 `runtime.toml` 或 `etc/runtime.toml` 会在校验通过后覆盖安装态 `etc/runtime.toml`；payload 中的 `token` 不会复制，安装态 token 始终保留。payload `runtime.toml` 本身也不得包含 `token` / `token_file` / `bearer_token` 等 token 字段。更新结果写入 service 日志。
 
+`service.update` 排障优先看 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`：`accepted service.update` 表示请求已通过校验并启动 updater；`starting service apply-update` 表示子进程开始 staged 替换；残留 `bin.next-*` 多半表示替换前中断，残留 `bin.old-*` 表示新 payload 已经接管但清理失败或被占用。日志确认后再调用 `dbgatlas --json service health` 检查重启后的 HTTP/RPC/MCP endpoint。
+
 安装态 service 日志写入 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 
 开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。开发态如需暴露高权限 IDAPython 执行能力，必须显式传入 `--allow-ida-py-eval`。

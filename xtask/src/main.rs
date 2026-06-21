@@ -28,6 +28,12 @@ fn main() -> ExitCode {
 }
 
 fn run_fast_checks() -> ExitCode {
+    // check-fast 只覆盖不依赖 native adapter/linker 的 Rust-only 快速回归。
+    // CLI/service/native adapter 的端到端验证仍需单独跑 workspace tests 或 release build。
+    eprintln!(
+        "running fast Rust-only checks for packages: {}",
+        FAST_TEST_PACKAGES.join(", ")
+    );
     let mut command = Command::new("cargo");
     command.arg("test");
     for package in FAST_TEST_PACKAGES {
@@ -38,6 +44,9 @@ fn run_fast_checks() -> ExitCode {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => {
             eprintln!("fast checks failed with status {status}");
+            eprintln!(
+                "next diagnostic step: run `cargo test --workspace` or the release build script for native/service coverage"
+            );
             ExitCode::FAILURE
         }
         Err(error) => {

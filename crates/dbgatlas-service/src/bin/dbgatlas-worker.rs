@@ -26,6 +26,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut pipe = open_pipe(&args.pipe)?;
     let mut state = WorkerState::new(args.session_id.clone(), args.dbgeng_dirs);
     loop {
+        // worker 与 service 之间只走一行一个 JSON envelope 的 pipe 协议。
+        // 运行诊断由 service 侧记录；worker 只负责执行 native capability 并回传 artifact 写入声明。
         let line = read_jsonl_line(&mut pipe)?;
         let request: WorkerEnvelope<WorkerRequest> = decode_jsonl(&line)?;
         let is_terminal_request = matches!(
@@ -219,6 +221,8 @@ impl WorkerState {
                 WorkerResponse::ok("debug session killed")
             }
             WorkerRequest::CancelOperation { .. } => {
+                // 真实的强制取消由 service supervisor 负责；worker 能收到该请求时，
+                // 说明 pipe 空闲，返回 ack 让上层把 operation 标记为 canceled 即可。
                 WorkerResponse::ok("operation cancel acknowledged")
             }
         }
@@ -363,6 +367,8 @@ fn write_command_response(
     artifact_dir: &Path,
     description: &str,
 ) -> Result<WorkerResponse, std::io::Error> {
+    // 每次命令同时写 raw output、transcript 和 events。service 会注册这些路径，
+    // 并把 artifact refs 返回给 CLI/MCP；worker 不直接修改 workspace 索引。
     let raw_relative_path = session_relative_path(
         &session_id,
         &format!("raw/{}.txt", operation_id.id.as_str()),
