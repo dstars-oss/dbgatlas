@@ -1,6 +1,6 @@
 # Recording Model
 
-DbgAtlas 的 recording 能力负责采集、过滤和归档低层运行时事件材料。MVP 3 先以 ETW API 为主线，后续 TTD recording 也归入同一个 `recording` namespace，而不是单独暴露一套平行概念。
+DbgAtlas 的 recording 能力负责采集、过滤和归档低层运行时事件材料。Recording 以 ETW API 为主线，TTD recording 也归入同一个 `recording` namespace，而不是单独暴露一套平行概念。
 
 recording 是独立产品能力，不依赖 debug session。debug、reverse 和 report workflow 可以引用 recording artifact，但 recording lifecycle 本身不要求已有 debug session。
 
@@ -13,14 +13,14 @@ recording 是独立产品能力，不依赖 debug session。debug、reverse 和 
 
 ## Non-goals
 
-- MVP 3 不以 WPR/WPAExport 作为主采集链路。WPAExport 只作为后续诊断、比对或 fallback 方向。
-- MVP 3 不定义高层 Case、Evidence 或 Timeline 结论 schema。
-- MVP 3 不生成全局 `timeline.jsonl`。按时间排序视图由读取方根据 category 文件中的 timestamp 合并。
-- MVP 3 不记录归因、根因、风险判断或其他分析结论到工具事实层。
+- 不以 WPR/WPAExport 作为主采集链路。WPAExport 只作为后续诊断、比对或 fallback 方向。
+- 不定义高层 Case、Evidence 或 Timeline 结论 schema。
+- 不生成全局 `timeline.jsonl`。按时间排序视图由读取方根据 category 文件中的 timestamp 合并。
+- 不记录归因、根因、风险判断或其他分析结论到工具事实层。
 
 ## Lifecycle
 
-公开 capability namespace 使用 `recording.*`。MVP 3 文档目标至少包括：
+公开 capability namespace 使用 `recording.*`。Recording lifecycle 包括：
 
 - `recording.start`：启动一次 recording，并返回 `recording_id`、`operation_id` 和初始 artifact 引用。
 - `recording.stop`：停止 recording，flush 过滤后的 ETL 和事件文件，并登记最终 artifact metadata。
@@ -47,7 +47,7 @@ dbgatlas recording ttd --project-root <path> --monitor <program> --timeout-ms <m
 
 ## Collection
 
-MVP 3 采用 C++ ETW adapter + Rust safe wrapper 的边界：
+Recording 采用 C++ ETW adapter + Rust safe wrapper 的边界：
 
 - C++ adapter 负责 ETW session、provider enable、实时事件消费、基础预处理、过滤和输出 flush。
 - Rust wrapper 和 domain manager 负责参数校验、worker 编排、operation 状态、artifact 登记和 service/CLI/MCP 入口。
@@ -62,11 +62,11 @@ MVP 3 采用 C++ ETW adapter + Rust safe wrapper 的边界：
 - `registry`
 - `network`
 
-后续可以在不破坏 preset 主路径的前提下增加高级 override，但 MVP 3 文档和验收不依赖用户自定义 provider。
+后续可以在不破坏 preset 主路径的前提下增加高级 override，但 recording 主路径和验收不依赖用户自定义 provider。
 
 ## Artifact Layout
 
-MVP 3 的目标布局使用统一 recording namespace：
+Recording artifact layout 使用统一 recording namespace：
 
 ```text
 artifacts/
@@ -112,11 +112,11 @@ TTD recording 使用同一 `artifacts/recordings/<recording_id>/` namespace。`r
 
 若 native ETW session 启动或停止失败，`trace.etl` 可以退化为文本 fallback artifact，用于保留失败原因和审计线索。此时 `recording.json` 必须显式记录 `trace.valid_etl=false` 和 `trace.fallback_reason`，读取方不能把该文件当作可由 ETW/WPA/DbgEng 打开的有效 ETL。真实 ETL artifact 应记录 `trace.valid_etl=true`。
 
-现有 `artifacts/profiles/` 与 `artifacts/ttd_recordings/` 是早期预留布局。MVP 3 文档目标以 `artifacts/recordings/<recording_id>/` 为准；实现阶段需要决定旧 helper 的迁移、兼容或保留策略。
+现有 `artifacts/profiles/` 与 `artifacts/ttd_recordings/` 是早期预留布局。当前 recording 文档以 `artifacts/recordings/<recording_id>/` 为准；旧 helper 仅作为兼容背景保留。
 
 ## Event Schema
 
-MVP 3 定义完整的低层 ETW-derived event schema，但不定义高层 Timeline/Evidence schema。每类事件应包含稳定规范字段，并保留原始 ETW 信息。
+Recording 定义低层 ETW-derived event schema，但不定义高层 Timeline/Evidence schema。每类事件应包含稳定规范字段，并保留原始 ETW 信息。
 
 规范字段至少包括 timestamp、category、event_type、pid、tid、process identity、image identity、operation ref 和 artifact ref。category-specific 字段只记录 ETW 或 adapter 能机械提取的低层事实。
 
@@ -178,7 +178,7 @@ ETW recording 默认尽力为写入 `events/*.jsonl` 的事件补充调用堆栈
 
 ## Acceptance
 
-MVP 3 实现完成后应能验证：
+验收应能验证：
 
 - launch 一个进程，并记录 root process tree 的 process/thread/image/file/registry/network 事件。
 - attach 到已有 pid，只记录 start 之后的事件，并在 metadata 标明 attach mode。

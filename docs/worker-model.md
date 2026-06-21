@@ -34,10 +34,10 @@ stateDiagram-v2
 
 ## 调用模型
 
-- service 为每个 session 分配一个 worker 和请求队列，MVP 默认 session:worker 为 1:1。
+- service 为每个 session 分配一个 worker 和请求队列，当前默认 session:worker 为 1:1。
 - 同一 session 内只允许一个 command/eval/start/close 操作处于 running。
-- MVP 1 的 per-session worker 持有真实 DbgEng session；`eval`、`modules`、`threads`、`stack`、`add_symbols` 和 `read_memory` 都通过同一 worker 串行执行。
-- MVP 4 的 IDA native adapter 在独立 reverse session 的 `dbgatlas-worker.exe` 内运行；每个 IDA database 对应一个 worker 子进程。worker 内部再由 Rust safe wrapper 放到专用线程持有 native handle，满足 IDALib 同一线程调用约束。service/RPC 请求通过 worker protocol 串行发送 open/lookup/close，service 只登记 operation/artifact。
+- per-session worker 持有真实 DbgEng session；`eval`、`modules`、`threads`、`stack`、`add_symbols` 和 `read_memory` 都通过同一 worker 串行执行。
+- IDA native adapter 在独立 reverse session 的 `dbgatlas-worker.exe` 内运行；每个 IDA database 对应一个 worker 子进程。worker 内部再由 Rust safe wrapper 放到专用线程持有 native handle，满足 IDALib 同一线程调用约束。service/RPC 请求通过 worker protocol 串行发送 open/lookup/close，service 只登记 operation/artifact。
 - 创建 debug session 时调用方传入 `project_root`；service 内部懒创建 `<project_root>/dbgatlas` 并分配 `artifacts/sessions/<session_id>/`。创建 reverse session 时同样传入 `project_root`，并分配 `artifacts/reverse_sessions/<session_id>/`。
 - 后续 eval/close/kill 等请求只携带 `session_id`，不重复传 `project_root`，也不暴露 workspace resource。
 - worker 可在 service 授权的 session/domain artifact 路径下写 transcript、events、raw output 或 memory dump；service 负责登记全局 `artifacts.jsonl`、`operations.jsonl`。
@@ -47,7 +47,7 @@ stateDiagram-v2
 
 ## Recording Worker
 
-MVP 3 增加 recording worker 概念，但仍不向外暴露 worker API。外部只看到 `recording.*` lifecycle 和 `recording_id`。
+Recording 使用 recording worker，但仍不向外暴露 worker API。外部只看到 `recording.*` lifecycle 和 `recording_id`。
 
 - `recording.start` 创建受控 worker，分配 `artifacts/recordings/<recording_id>/`，并启动 ETW API 采集。
 - recording worker 持有 ETW session、provider enable 状态、process tree filter 和 category event writers。

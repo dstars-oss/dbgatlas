@@ -2,7 +2,7 @@
 
 DbgAtlas 采用 Rust 主进程 + C++ native adapter DLL。每个 native adapter 维护自己的 C header 和对应 Rust `*-sys` crate，不通过中心化 protocol 层定义边界。
 
-MVP 1 起，DbgEng adapter 使用 `native/include/dbgatlas_dbgeng.h` 作为 adapter-specific C ABI，并由 `dbgatlas-dbgeng-sys` crate 局部绑定。早期 `native/include/dbgatlas_native.h` 只保留为 MVP 0/0.5 bootstrap 历史文件，不再作为 DbgEng DLL 的当前导出边界。
+DbgEng adapter 使用 `native/include/dbgatlas_dbgeng.h` 作为 adapter-specific C ABI，并由 `dbgatlas-dbgeng-sys` crate 局部绑定。早期 `native/include/dbgatlas_native.h` 只保留为 bootstrap 历史文件，不再作为 DbgEng DLL 的当前导出边界。
 
 ## C ABI 规则
 
@@ -17,7 +17,7 @@ MVP 1 起，DbgEng adapter 使用 `native/include/dbgatlas_dbgeng.h` 作为 adap
 
 ## View + Owner
 
-DbgEng MVP 1 的 `DA_DbgEngTextView` 形态：
+DbgEng `DA_DbgEngTextView` 形态：
 
 ```c
 typedef struct DA_DbgEngTextView {
@@ -65,7 +65,7 @@ IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。Rust saf
 - `da_ida_last_error(buffer, buffer_len, required_len)`
 - `da_ida_release_view(owner)`
 
-第一条 MVP 链路只做定位和记录，不写 IDA comment，不保存 IDB。
+早期 reverse 链路只做定位和记录，不写 IDA comment，不保存 IDB。
 
 `DA_DbgEngTextView` 也用于 read memory 的 byte view；Rust safe wrapper 按 `data/len` 复制为 `Vec<u8>` 后调用 `da_dbgeng_release_view(owner)`。
 
@@ -80,6 +80,6 @@ IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。Rust saf
 
 DbgEng session、callback、event polling、COM 初始化和线程归属必须封装在 C++ DLL 内部，Rust 只看到 session handle 或 safe wrapper。
 
-MVP 1 的真实 DbgEng session 由 per-session worker 持有。worker 主循环串行处理同一 session 的 start/eval/add_symbols/read_memory/close 请求，避免跨线程直接操作同一 DbgEng client。
+真实 DbgEng session 由 per-session worker 持有。worker 主循环串行处理同一 session 的 start/eval/add_symbols/read_memory/close 请求，避免跨线程直接操作同一 DbgEng client。
 
 DbgEng、ETW、DIA 后续必须各自维护 header、DLL adapter 和 `*-sys` crate。不要新增中心化 protocol crate，也不要把多个 native adapter 过早聚合到一个 DLL ABI。

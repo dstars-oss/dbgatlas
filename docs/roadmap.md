@@ -1,63 +1,45 @@
 # Roadmap
 
-## MVP 0: Engineering Skeleton
+## Current Baseline
 
-- Cargo workspace。
-- analysis workspace 初始化和信息读取。
-- artifact metadata 与 operation log。
-- 最小 adapter contract。
-- native CMake project。
-- C ABI hello/version。
-- Rust `dbgatlas-dbgeng-sys` raw binding。
-- Rust `dbgatlas-dbgeng` safe wrapper。
-- CLI 调用 workspace 与 native version。
+- Cargo workspace and native CMake project.
+- Visible analysis workspace initialization, inspection, artifact metadata, operation log, and command audit log.
+- Minimal adapter contract with Rust core orchestration.
+- Runtime config separated from workspace manifests.
+- Domain artifact layout helpers and artifact path validation.
+- Native C ABI boundaries for DbgEng, ETW, and IDA adapters with matching Rust `*-sys` crates and safe wrappers.
+- Installed Windows service lifecycle, development service mode, JSON-RPC `/rpc`, and HTTP MCP `/mcp`.
+- `--json` output for the main CLI workflows.
 
-## MVP 0.5: Architecture Hardening
+## Debug Workflow
 
-- `dbgatlas-debug` 定义 debug target/session/command skeleton。
-- `dbgatlas-runtime` 定义 runtime config、tool path、proxy 和 process policy。
-- workspace 增加 domain artifact layout helper 和 artifact path 校验。
-- core 增加长任务 operation 状态预留。
-- 文档明确 per-session worker、runtime/workspace 分离、IDA native adapter + user worker 路线。
+- Per-session worker supervision and serialized session requests.
+- Debug session create/close/cancel/kill.
+- Open DbgEng-supported debug files such as `.dmp` and `.run`.
+- Attach process.
+- Execute raw WinDbg command and capture output.
+- Record transcript, events, raw outputs, operations, and artifacts.
+- List modules, list threads, get stack, add session symbols, and read memory to artifact files.
 
-## MVP 1: Debug Session And Minimal DbgEng Loop
+## Recording Workflow
 
-- per-session worker skeleton。
-- debug session create/close/cancel/kill。
-- open DbgEng-supported debug files such as `.dmp` and `.run`。
-- attach process。
-- execute raw WinDbg command。
-- capture command output。
-- record transcript/events/artifacts。
-- list modules。
-- list threads。
-- get stack。
-- read memory to artifact file。
+- `recording.*` lifecycle for ETW-style process tree recording.
+- Launch and attach targets.
+- Built-in process/thread/image/file/registry/network presets.
+- Filtered ETL, recording metadata, and category event JSONL artifacts.
+- TTD one-shot recording under the shared recording namespace.
+- Low-level recording materials available as inputs for report, reverse, and future timeline views.
 
-## MVP 2: Recording And Agent Entry
+## Reverse Workflow
 
-- artifact registry 完善。
-- command audit log 完善。
-- `--json` 输出覆盖主要 CLI 命令。
-- MCP server 作为 core 的入口层。
+- IDA database target opening through native IDA adapter dynamic loading.
+- Reverse sessions in active interactive user workers.
+- Explicit runtime address / module base / IDA image base to IDA function mapping.
+- Core Functions exposed through service RPC and MCP tools with stable JSON result shape; inputs and artifacts are described in `docs/reverse-core-functions.md`.
+- Reverse workflow outputs, operation records, and artifact metadata are referenceable from `analysis/` notes.
 
-## MVP 3: ETW Recording And Timeline
+## Next Directions
 
-- ETW API 优先的 `recording.*` lifecycle。
-- launch/attach process tree recording。
-- 内置 process/thread/image/file/registry/network presets。
-- 过滤后 ETL、recording metadata 和按 category 拆分的事件 JSONL。
-- 低层事件材料作为后续 timeline/report/reverse workflow 输入。
-
-## MVP 4: IDA Core Functions
-
-- 已有基础链路：IDA database target、native IDA adapter dynamic loading、active interactive user worker 中的 reverse session、explicit runtime address / module base / IDA image base -> IDA function mapping。
-- 对标 `ida-pro-mcp` Core Functions：`lookup_funcs`、`int_convert`、`list_funcs`、`list_globals`、`list_imports`、`decompile`、`disasm`、`xrefs_to`、`xrefs_to_field`、`callees`。
-- Core Functions 通过 service RPC 和 MCP tools 暴露，保持稳定 JSON 返回结构；输入和 artifact 约定见 `docs/reverse-core-functions.md`。
-- reverse workflow 低层输出、operation records 和 artifact metadata 可被 `analysis/` 中的 reverse notes 引用。
-
-## MVP 5: Report And AI Workflow
-
-- Markdown report workflow。
-- AI agent 调用 core/MCP。
-- 报告引用 artifacts 和 operation records，不伪装成工具客观事实。
+- Markdown report workflow that cites artifact ids and operation ids.
+- Agent-oriented workflows over the service-hosted MCP endpoint.
+- Timeline/report views derived from low-level recording materials without storing high-level conclusions as tool facts.

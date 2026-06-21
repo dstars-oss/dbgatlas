@@ -4,7 +4,7 @@ DbgAtlas is a Windows investigation platform for debugging, reverse engineering,
 
 This repository contains the tool implementation. Real investigation data belongs in an explicit analysis workspace, not in hidden repository state.
 
-MVP 0 through MVP 1 contain:
+Current implementation includes:
 
 - A Rust workspace split into `model`, `workspace`, `adapter`, `core`, `cli`, and a minimal `dbgeng` native wrapper.
 - Debug session lifecycle, per-session worker supervision, named-pipe worker transport, and a minimal real DbgEng loop.

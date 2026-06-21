@@ -11,7 +11,7 @@ analysis-workspace/
     artifacts.jsonl
     operations.jsonl
     sessions/
-    recordings/            # MVP 3 目标布局
+    recordings/            # recording artifacts
     profiles/
     ttd_recordings/
     reverse_sessions/
@@ -27,19 +27,19 @@ analysis-workspace/
 
 ## Artifact Layout
 
-MVP 0.5 保留全局索引文件，并开始约束领域 artifact 目录：
+当前 workspace 保留全局索引文件，并约束领域 artifact 目录：
 
 - `artifacts/sessions/<session_id>/`：debug session 的 commands、events、transcript、raw output。
-- `artifacts/recordings/<recording_id>/`：MVP 3 目标 recording namespace，承载 ETW recording 和未来 TTD recording 的低层输出。
-- `artifacts/profiles/<profile_id>/`：早期 profiling / sampling 预留布局；MVP 3 实现阶段需要决定迁移、兼容或保留策略。
+- `artifacts/recordings/<recording_id>/`：统一 recording namespace，承载 ETW recording 和 TTD recording 的低层输出。
+- `artifacts/profiles/<profile_id>/`：早期 profiling / sampling 预留布局；后续需要时再决定迁移、兼容或保留策略。
 - `artifacts/ttd_recordings/<recording_id>/`：早期 TTD recording 预留布局；后续 TTD 应优先并入统一 `recordings` namespace。
 - `artifacts/reverse_sessions/<session_id>/`：IDA 或其他 reverse workflow 的低层工具输出。
 
 workspace API 只接受位于 `artifacts/` 下的相对路径，拒绝绝对路径和 `..` 穿越。dump、trace、transcript、memory output 都按敏感 artifact 处理。
 
-这些目录是可扩展布局，不代表 MVP 0.5 已实现对应工具能力。
+这些目录是可扩展布局；具体工具能力由 service/API 实现决定。
 
-MVP 3 的 ETW recording artifact 目录目标为：
+ETW recording artifact 目录为：
 
 ```text
 artifacts/recordings/<recording_id>/
@@ -66,7 +66,7 @@ artifacts/recordings/<recording_id>/
 - `tool.name`
 - `tool.version`
 
-MVP 0/0.5 不定义完整 Case/Evidence/Timeline schema。后续只有在具体能力需要稳定交换格式时再补 schema。
+当前不定义完整 Case/Evidence/Timeline schema。后续只有在具体能力需要稳定交换格式时再补 schema。
 
 runtime config 不属于 manifest。DbgEng/ETW/TTD/IDA 安装路径、symbol path、proxy、recording presets 和 worker process policy 由 `dbgatlas-runtime` 管理。
 
@@ -115,6 +115,6 @@ debug workflow 的 CLI 和 MCP 调用都返回同一组引用字段：
 - `raw_output_ref`：若存在，指向原始工具输出 artifact。
 - `memory_ref`：`debug.read_memory` 成功时指向 memory artifact。
 
-recording workflow 后续也应返回同一类引用字段，并增加 `recording_id`。报告或 agent 不应猜测 `events/` 内部文件名来确认一次 recording 是否完成，而应优先通过 operation/artifact refs 找到 `recording.json`、`trace.etl` 和 category event artifacts。
+recording workflow 返回同一类引用字段，并增加 `recording_id`。报告或 agent 不应猜测 `events/` 内部文件名来确认一次 recording 是否完成，而应优先通过 operation/artifact refs 找到 `recording.json`、`trace.etl` 和 category event artifacts。
 
 报告或分析笔记应在 `analysis/` 下用 Markdown 引用这些 id，例如 `operation_id=op-...`、`artifact_id=artifact-...`、`session_id=session-...`。解释、假设和结论只写入 Markdown，不写入 facts JSONL。

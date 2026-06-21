@@ -1,6 +1,6 @@
 # IDA Core Functions
 
-MVP 4 exposes IDA Core Functions through service RPC and HTTP MCP tools. `reverse.session.open`
+DbgAtlas exposes IDA Core Functions through service RPC and HTTP MCP tools. `reverse.session.open`
 creates a top-level reverse `session_id` backed by its own worker process. Every Core
 Function call requires that reverse `session_id`.
 

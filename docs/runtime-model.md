@@ -23,8 +23,8 @@ analysis-workspace/
 `dbgatlas-runtime` 第一版只定义类型、解析入口和校验。配置项包括：
 
 - `tools.symbol_path`
-- `tools.etw.adapter_dir` 或等价 native ETW adapter 位置（MVP 3 规划）
-- `tools.etw.default_presets`（MVP 3 规划）
+- `tools.etw.adapter_dir` 或等价 native ETW adapter 位置
+- `tools.etw.default_presets`
 - `tools.ida.install_dir`
 - `tools.ida.python_executable`
 - `tools.ida.vendor_src_dir`（历史兼容配置；IDA native adapter 现在使用仓库内固定的 IDA SDK header 快照构建，运行时打开 reverse session 不依赖该配置路径）
@@ -72,7 +72,7 @@ debug worker 会按解析顺序接收 DbgEng 候选目录，并在 `LoadLibrary`
 
 ## Recording Runtime
 
-MVP 3 的 recording runtime config 只保存本机工具和进程策略，不进入 analysis workspace manifest。ETW recording 默认通过受控 worker 调用 C++ ETW adapter，adapter 负责 ETW session、provider enable、实时消费、过滤和 flush。
+recording runtime config 只保存本机工具和进程策略，不进入 analysis workspace manifest。ETW recording 默认通过受控 worker 调用 C++ ETW adapter，adapter 负责 ETW session、provider enable、实时消费、过滤和 flush。
 
 recording policy 的文档目标：
 
