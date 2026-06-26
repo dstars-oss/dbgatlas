@@ -1,6 +1,7 @@
 use dbgatlas_debug::{
-    AddSymbolsRequest, CreateDebugSession, DebugCommandResult, DebugMemoryResult,
-    DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
+    AddSymbolsRequest, CreateDebugSession, DEFAULT_INLINE_TEXT_BYTE_LIMIT, DebugCommandResult,
+    DebugMemoryResult, DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
+    inline_text_preview,
 };
 use dbgatlas_model::{ArtifactRef, Id, OperationRef, RecordingRef, SessionRef, Timestamp};
 use dbgatlas_recording::{
@@ -39,6 +40,7 @@ pub const DEFAULT_SERVICE_PORT: u16 = 7331;
 pub const MAX_MEMORY_READ_LENGTH: u64 = 16 * 1024 * 1024;
 const MAX_INLINE_REVERSE_RESULT_BYTES: usize = 128 * 1024;
 const MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES: usize = 32 * 1024;
+const MAX_WORKER_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
 const DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS: u64 = 5_000;
 pub const WINDOWS_SERVICE_NAME: &str = "DbgAtlas";
 pub const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DbgAtlas Service";
@@ -241,6 +243,7 @@ impl ServiceHost {
             "debug.session.close" => self.debug_session_close(request.params),
             "debug.session.kill" => self.debug_session_kill(request.params),
             "debug.eval" => self.debug_eval(request.params),
+            "debug.eval_steps" => self.debug_eval_steps(request.params),
             "debug.modules" => self.debug_builtin_eval(request.params, "debug.modules", "lm"),
             "debug.threads" => self.debug_builtin_eval(request.params, "debug.threads", "~"),
             "debug.stack" => self.debug_builtin_eval(request.params, "debug.stack", "k"),
@@ -373,6 +376,7 @@ impl ServiceHost {
             | "debug.session.close"
             | "debug.session.kill"
             | "debug.eval"
+            | "debug.eval_steps"
             | "debug.modules"
             | "debug.threads"
             | "debug.stack"
@@ -1343,19 +1347,37 @@ impl ServiceHost {
         let operation_id = next_operation_ref();
         match mode {
             SessionFinishMode::Close => {
-                match self.supervisor.request_worker(
+                let close_response = self.supervisor.request_worker(
                     &session.worker,
                     WorkerRequest::CloseSession {
                         session_id: session.session_id.clone(),
                     },
-                )? {
-                    WorkerResponse::Ok { .. } => self.supervisor.close_worker(&session.worker)?,
-                    WorkerResponse::Failed { code, message, .. } => {
-                        return Err(ServiceError::Worker(format!("{code}: {message}")));
-                    }
-                    other => {
+                );
+                match close_response {
+                    Err(error) => {
+                        let cleanup = self.supervisor.kill_worker(&session.worker);
+                        self.mark_debug_session_error(&session.session_id)?;
+                        let cleanup_message = match cleanup {
+                            Ok(()) => "worker was killed after close failure".to_string(),
+                            Err(cleanup_error) => format!(
+                                "worker cleanup also failed: {cleanup_error}; use debug.session.kill"
+                            ),
+                        };
                         return Err(ServiceError::Worker(format!(
-                            "unexpected close response: {other:?}"
+                            "debug.session.close could not complete cooperatively: {error}; {cleanup_message}"
+                        )));
+                    }
+                    Ok(WorkerResponse::Ok { .. }) => {
+                        self.supervisor.close_worker(&session.worker)?
+                    }
+                    Ok(WorkerResponse::Failed { code, message, .. }) => {
+                        return Err(ServiceError::Worker(format!(
+                            "{code}: {message}; use debug.session.kill if the worker is stuck"
+                        )));
+                    }
+                    Ok(other) => {
+                        return Err(ServiceError::Worker(format!(
+                            "unexpected close response: {other:?}; use debug.session.kill if the worker is stuck"
                         )));
                     }
                 }
@@ -1553,6 +1575,254 @@ impl ServiceHost {
         self.eval_command(request, "debug.eval")
     }
 
+    fn debug_eval_steps(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        let params: DebugEvalStepsParams = parse_params(params)?;
+        validate_optional_timeout_ms(params.timeout_ms)?;
+        if params.commands.is_empty() {
+            return Err(ServiceError::Rpc(
+                "debug.eval_steps commands must not be empty".to_string(),
+            ));
+        }
+        for command in &params.commands {
+            EvalDebugCommand {
+                session_id: params.session_id.clone(),
+                command: command.clone(),
+                timeout_ms: params.timeout_ms,
+            }
+            .validate()?;
+        }
+
+        let session = self.reusable_debug_session(&params.session_id)?;
+        let request_lock = session.request_lock.clone();
+        let _request_guard = request_lock
+            .lock()
+            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+        let session = self.reusable_debug_session(&params.session_id)?;
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let batch_operation_id = next_operation_ref();
+        let now = Timestamp::now();
+        {
+            let mut state = self.lock_state()?;
+            state.operations.insert(
+                batch_operation_id.id.as_str().to_string(),
+                ServiceOperation::running(
+                    batch_operation_id.clone(),
+                    "debug.eval_steps",
+                    Some(session.session_id.clone()),
+                    "debug.eval_steps running",
+                ),
+            );
+        }
+
+        let mut steps = Vec::new();
+        let mut artifact_refs = Vec::new();
+        let mut raw_output_ref = None;
+        let mut failed_step_index = None;
+        let mut canceled_step_index = None;
+        for (index, command) in params.commands.iter().enumerate() {
+            let step_operation_id = next_operation_ref();
+            {
+                let mut state = self.lock_state()?;
+                state.operations.insert(
+                    step_operation_id.id.as_str().to_string(),
+                    ServiceOperation::running(
+                        step_operation_id.clone(),
+                        "debug.eval_steps.step",
+                        Some(session.session_id.clone()),
+                        "debug.eval_steps step running",
+                    ),
+                );
+            }
+
+            let worker_response = self.request_worker_with_optional_timeout(
+                &session,
+                WorkerRequest::EvalDebugCommand {
+                    session_id: session.session_id.clone(),
+                    operation_id: step_operation_id.clone(),
+                    command: command.clone(),
+                    artifact_dir: session.artifact_dir.clone(),
+                },
+                &step_operation_id,
+                params.timeout_ms,
+            );
+            let step_result = self.finish_command_worker_response(
+                &session,
+                &workspace,
+                step_operation_id.clone(),
+                "debug.eval_steps.step",
+                command.clone(),
+                worker_response,
+            );
+            match step_result {
+                Ok(mut value) => {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("step_index".to_string(), json!(index));
+                    }
+                    let state = self.lock_state()?;
+                    if let Some(operation) = state.operations.get(step_operation_id.id.as_str()) {
+                        if operation.status == ServiceOperationStatus::Canceled
+                            && canceled_step_index.is_none()
+                        {
+                            canceled_step_index = Some(index);
+                        }
+                        artifact_refs.extend(operation.artifacts.clone());
+                        raw_output_ref = operation.raw_output.clone().or(raw_output_ref);
+                    }
+                    steps.push(value);
+                }
+                Err(error) => {
+                    let state = self.lock_state()?;
+                    let (step_status, step_artifacts, step_raw_output) = state
+                        .operations
+                        .get(step_operation_id.id.as_str())
+                        .map(|operation| {
+                            (
+                                operation.status.clone(),
+                                operation.artifacts.clone(),
+                                operation.raw_output.clone(),
+                            )
+                        })
+                        .unwrap_or((ServiceOperationStatus::Running, Vec::new(), None));
+                    drop(state);
+                    if step_status == ServiceOperationStatus::Running {
+                        self.finish_operation_in_memory(
+                            &step_operation_id,
+                            ServiceOperationStatus::Failed,
+                            error.to_string(),
+                            Vec::new(),
+                            None,
+                        )?;
+                        self.finish_operation_in_memory(
+                            &batch_operation_id,
+                            ServiceOperationStatus::Failed,
+                            error.to_string(),
+                            artifact_refs.clone(),
+                            raw_output_ref.clone(),
+                        )?;
+                        return Err(error);
+                    }
+                    artifact_refs.extend(step_artifacts);
+                    raw_output_ref = step_raw_output.or(raw_output_ref);
+                    let operation_status = match step_status {
+                        ServiceOperationStatus::Canceled => {
+                            if canceled_step_index.is_none() {
+                                canceled_step_index = Some(index);
+                            }
+                            "canceled"
+                        }
+                        _ => {
+                            if failed_step_index.is_none() {
+                                failed_step_index = Some(index);
+                            }
+                            "failed"
+                        }
+                    };
+                    if operation_status == "canceled" && !params.continue_on_error {
+                        steps.push(json!({
+                            "step_index": index,
+                            "session_id": session.session_id,
+                            "operation_id": step_operation_id,
+                            "operation_status": operation_status,
+                            "command": command,
+                            "error": error.to_string(),
+                        }));
+                        break;
+                    }
+                    steps.push(json!({
+                        "step_index": index,
+                        "session_id": session.session_id,
+                        "operation_id": step_operation_id,
+                        "operation_status": operation_status,
+                        "command": command,
+                        "error": error.to_string(),
+                    }));
+                    if !params.continue_on_error {
+                        break;
+                    }
+                }
+            }
+
+            let current_session = self.reusable_debug_session(&session.session_id);
+            if current_session.is_err() {
+                if failed_step_index.is_none() {
+                    failed_step_index = Some(index);
+                }
+                break;
+            }
+        }
+
+        let batch_was_canceled =
+            self.operation_status(&batch_operation_id)? == Some(ServiceOperationStatus::Canceled);
+        let status = if batch_was_canceled || canceled_step_index.is_some() {
+            OperationStatus::Canceled
+        } else if failed_step_index.is_some() {
+            OperationStatus::Failed
+        } else {
+            OperationStatus::Success
+        };
+        let summary = match (canceled_step_index, failed_step_index) {
+            (Some(index), _) => format!("debug.eval_steps canceled at step {index}"),
+            (_, Some(index)) => format!("debug.eval_steps failed at step {index}"),
+            _ if batch_was_canceled => "debug.eval_steps canceled".to_string(),
+            _ => "debug.eval_steps completed".to_string(),
+        };
+        workspace.append_operation(&OperationRecord {
+            operation_id: batch_operation_id.clone(),
+            adapter_id: "service".to_string(),
+            capability: "debug.eval_steps".to_string(),
+            status: status.clone(),
+            created_at: now,
+            summary: summary.clone(),
+            artifacts: artifact_refs.clone(),
+            raw_output: raw_output_ref.clone(),
+        })?;
+        workspace.append_command_audit(&CommandAuditRecord {
+            operation_id: batch_operation_id.clone(),
+            session_id: Some(session.session_id.clone()),
+            capability: "debug.eval_steps".to_string(),
+            command: params.commands.join("\n"),
+            created_at: now,
+            status: status.clone(),
+            artifacts: artifact_refs.clone(),
+            raw_output: raw_output_ref.clone(),
+        })?;
+
+        let service_status = match status {
+            OperationStatus::Failed => ServiceOperationStatus::Failed,
+            OperationStatus::Canceled => ServiceOperationStatus::Canceled,
+            _ => ServiceOperationStatus::Success,
+        };
+        self.finish_operation_in_memory(
+            &batch_operation_id,
+            service_status,
+            summary,
+            artifact_refs.clone(),
+            raw_output_ref.clone(),
+        )?;
+        {
+            let mut state = self.lock_state()?;
+            if let Some(session_state) = state.sessions.get_mut(session.session_id.id.as_str()) {
+                session_state.last_operation = Some(batch_operation_id.clone());
+                session_state.updated_at = Timestamp::now();
+            }
+        }
+
+        Ok(json!({
+            "session_id": session.session_id,
+            "operation_id": batch_operation_id,
+            "operation_status": status,
+            "failed_step_index": failed_step_index,
+            "steps": steps,
+            "artifact_refs": artifact_refs,
+            "raw_output_ref": raw_output_ref,
+            "operation": {
+                "status": status,
+                "artifact_refs": artifact_refs,
+                "raw_output_ref": raw_output_ref,
+            },
+        }))
+    }
+
     fn debug_builtin_eval(
         &self,
         params: Option<Value>,
@@ -1622,7 +1892,7 @@ impl ServiceHost {
             Ok(WorkerResponse::ReverseSessionOpened { .. }) => {}
             Ok(WorkerResponse::Failed { code, message, .. }) => {
                 let _ = self.supervisor.kill_worker(&worker);
-                let error = worker_failed_message(code, message);
+                let error = diagnose_reverse_open_error(worker_failed_message(code, message));
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &session_id,
@@ -1652,7 +1922,9 @@ impl ServiceHost {
             }
             Ok(other) => {
                 let _ = self.supervisor.kill_worker(&worker);
-                let error = format!("unexpected reverse open response: {other:?}");
+                let error = diagnose_reverse_open_error(format!(
+                    "unexpected reverse open response: {other:?}"
+                ));
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &session_id,
@@ -1682,7 +1954,7 @@ impl ServiceHost {
             }
             Err(error) => {
                 let _ = self.supervisor.kill_worker(&worker);
-                let message = error.to_string();
+                let message = diagnose_reverse_open_error(error.to_string());
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &session_id,
@@ -2498,7 +2770,7 @@ impl ServiceHost {
                     registered.raw_output.as_ref(),
                     None,
                 );
-                result.raw_output = registered.raw_output.clone();
+                finalize_debug_command_result(&mut result, &registered);
                 let response = command_result_response(&result, workspace_status, &registered)?;
 
                 let mut state = self.lock_state()?;
@@ -5667,10 +5939,14 @@ fn write_mock_eval_response(
     if let Some(parent) = raw_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let output = format!(
-        "mock debug worker accepted eval command; real DbgEng execution is not wired yet\ncommand: {}\n",
-        command
-    );
+    let output = if command == ".mock_long_output" {
+        "x".repeat(DEFAULT_INLINE_TEXT_BYTE_LIMIT + 100)
+    } else {
+        format!(
+            "mock debug worker accepted eval command; real DbgEng execution is not wired yet\ncommand: {}\n",
+            command
+        )
+    };
     fs::write(&raw_path, &output)?;
     let transcript = format!("> {}\n{}\n", command, output);
     let mut transcript_file = OpenOptions::new()
@@ -5694,16 +5970,28 @@ fn write_mock_eval_response(
         }),
     )?;
     events_file.write_all(b"\n")?;
+    let preview = inline_text_preview(&output, DEFAULT_INLINE_TEXT_BYTE_LIMIT);
+    let mut warnings = vec!["mock worker: real DbgEng execution is not wired yet".to_string()];
+    if preview.truncated {
+        warnings.push(format!(
+            "output truncated to {} bytes inline; full output saved to raw output artifact",
+            preview.inline_byte_limit
+        ));
+    }
 
     Ok(WorkerResponse::DebugCommand {
         result: DebugCommandResult {
             session_id,
             operation_id: None,
             command,
-            output: output.clone(),
+            output: preview.text,
+            output_truncated: preview.truncated,
+            full_output_byte_len: Some(preview.full_byte_len),
+            inline_output_byte_limit: Some(preview.inline_byte_limit),
             final_state: Some(DebugSessionState::Ready),
             raw_output: None,
-            warnings: vec!["mock worker: real DbgEng execution is not wired yet".to_string()],
+            full_output_artifact_ref: None,
+            warnings,
             error: None,
         },
         writes: vec![
@@ -5774,7 +6062,43 @@ fn write_mock_memory_response(
 struct RegisteredWorkerWrites {
     artifacts: Vec<ArtifactRef>,
     raw_output: Option<ArtifactRef>,
+    raw_output_byte_len: Option<u64>,
     memory: Option<ArtifactRef>,
+}
+
+fn finalize_debug_command_result(result: &mut DebugCommandResult, writes: &RegisteredWorkerWrites) {
+    result.raw_output = writes.raw_output.clone();
+    if result.full_output_artifact_ref.is_none() {
+        result.full_output_artifact_ref = writes.raw_output.clone();
+    }
+    let full_output_byte_len = result
+        .full_output_byte_len
+        .or(writes.raw_output_byte_len)
+        .unwrap_or(result.output.len() as u64);
+    result.full_output_byte_len = Some(full_output_byte_len);
+    result
+        .inline_output_byte_limit
+        .get_or_insert(DEFAULT_INLINE_TEXT_BYTE_LIMIT as u64);
+
+    if result.output.len() > DEFAULT_INLINE_TEXT_BYTE_LIMIT {
+        let preview = inline_text_preview(&result.output, DEFAULT_INLINE_TEXT_BYTE_LIMIT);
+        result.output = preview.text;
+        result.output_truncated = true;
+    }
+    if full_output_byte_len > DEFAULT_INLINE_TEXT_BYTE_LIMIT as u64 {
+        result.output_truncated = true;
+    }
+    if result.output_truncated
+        && !result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("output truncated"))
+    {
+        result.warnings.push(format!(
+            "output truncated to {} bytes inline; full output saved to raw output artifact",
+            DEFAULT_INLINE_TEXT_BYTE_LIMIT
+        ));
+    }
 }
 
 fn command_result_response(
@@ -5839,11 +6163,13 @@ fn register_worker_writes(
 ) -> Result<RegisteredWorkerWrites, ServiceError> {
     let mut artifacts = Vec::new();
     let mut raw_output = None;
+    let mut raw_output_byte_len = None;
     let mut memory = None;
     for write in writes {
         let artifact_id = next_artifact_ref();
         if write.kind == "debug.raw_output" {
             raw_output = Some(artifact_id.clone());
+            raw_output_byte_len = Some(write.byte_len);
         }
         if write.kind == "debug.memory" {
             memory = Some(artifact_id.clone());
@@ -5862,6 +6188,7 @@ fn register_worker_writes(
     Ok(RegisteredWorkerWrites {
         artifacts,
         raw_output,
+        raw_output_byte_len,
         memory,
     })
 }
@@ -7663,13 +7990,24 @@ fn read_jsonl_line(reader: &mut impl Read) -> Result<String, ServiceError> {
         if byte[0] == b'\n' {
             break;
         }
-        if bytes.len() > 1024 * 1024 {
+        if bytes.len() > MAX_WORKER_RESPONSE_LINE_BYTES {
+            discard_jsonl_line_tail(reader)?;
             return Err(ServiceError::Worker(
                 "worker response line is too large".to_string(),
             ));
         }
     }
     String::from_utf8(bytes).map_err(|error| ServiceError::Worker(error.to_string()))
+}
+
+fn discard_jsonl_line_tail(reader: &mut impl Read) -> Result<(), ServiceError> {
+    let mut byte = [0u8; 1];
+    loop {
+        let read = reader.read(&mut byte)?;
+        if read == 0 || byte[0] == b'\n' {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -8369,6 +8707,30 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             }),
         ),
         mcp_tool(
+            "debug.eval_steps",
+            "Execute raw WinDbg commands one step at a time in an existing session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "object" },
+                    "commands": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional timeout per step in milliseconds. On timeout DbgAtlas kills the debug worker and the session must be recreated."
+                    },
+                    "continue_on_error": {
+                        "type": "boolean",
+                        "default": false
+                    }
+                },
+                "required": ["session_id", "commands"]
+            }),
+        ),
+        mcp_tool(
             "debug.modules",
             "List modules for a debug session. In TTD replay, modules that were loaded and unloaded outside the current position may require targeted TTD calls or memory evidence.",
             mcp_session_schema(),
@@ -8973,6 +9335,16 @@ struct DebugEvalParams {
     command: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DebugEvalStepsParams {
+    session_id: SessionRef,
+    commands: Vec<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    continue_on_error: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -9593,6 +9965,39 @@ fn worker_failed_message(code: String, message: String) -> String {
     format!("{code}: {message}")
 }
 
+fn diagnose_reverse_open_error(message: String) -> String {
+    if !message.contains("open_database failed with result")
+        || message.contains("ida_error_kind=open_database_failed")
+    {
+        return message;
+    }
+    let Some(result) = open_database_result_code(&message) else {
+        return format!(
+            "{message}; ida_error_kind=open_database_failed; possible_reason=ida_rejected_database; suggestion=verify the database path, IDA version compatibility, file permissions, and whether another process has the database open"
+        );
+    };
+    if result == 4 {
+        format!(
+            "{message}; ida_error_kind=open_database_failed; possible_reason=database_locked_or_unavailable; suggestion=close other IDA/IDALib sessions using this database, wait for file locks to release, or copy the IDB manually for review"
+        )
+    } else {
+        format!(
+            "{message}; ida_error_kind=open_database_failed; possible_reason=ida_rejected_database; suggestion=verify the database path, IDA version compatibility, file permissions, and whether another process has the database open"
+        )
+    }
+}
+
+fn open_database_result_code(message: &str) -> Option<i32> {
+    let marker = "open_database failed with result";
+    let tail = message.split(marker).nth(1)?;
+    let digits = tail
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect::<String>();
+    digits.parse().ok()
+}
+
 struct DebugStartFailure {
     code: String,
     message: String,
@@ -9634,8 +10039,7 @@ fn should_auto_retry_active_interactive_user(
 }
 
 fn debug_target_can_need_active_interactive_user(target: &DebugTarget) -> bool {
-    matches!(target, DebugTarget::File { path } if is_ttd_run_file(path))
-        || matches!(target, DebugTarget::Launch { .. })
+    matches!(target, DebugTarget::File { .. }) || matches!(target, DebugTarget::Launch { .. })
 }
 
 fn debug_worker_identity_label(identity: Option<&WorkerIdentity>) -> &'static str {
@@ -9650,7 +10054,7 @@ fn debug_worker_identity_label(identity: Option<&WorkerIdentity>) -> &'static st
 fn add_debug_access_denied_hint(message: String, worker_identity: DebugWorkerIdentity) -> String {
     if worker_identity == DebugWorkerIdentity::Default && is_access_denied_message(&message) {
         format!(
-            "{message}; if this is an installed service using the default LocalSystem debug worker, retry debug.session.create with worker_identity:\"active_interactive_user\" for user-session TTD replay or live launch"
+            "{message}; recommended_retry_worker_identity=active_interactive_user; if this is an installed service using the default LocalSystem debug worker, retry debug.session.create with worker_identity:\"active_interactive_user\" for user-session dump files, TTD replay, or live launch"
         )
     } else {
         message
@@ -10839,12 +11243,17 @@ allow_py_eval = true
         let response = create_debug_session(&host, temp.path());
 
         let error = response.error.unwrap();
+        assert!(
+            error
+                .message
+                .contains("recommended_retry_worker_identity=active_interactive_user")
+        );
         assert!(error.message.contains("worker_identity"));
         assert!(error.message.contains("active_interactive_user"));
     }
 
     #[test]
-    fn ttd_run_session_create_auto_retries_active_user_on_access_denied() {
+    fn file_session_create_auto_retries_active_user_on_access_denied() {
         let temp = tempfile::tempdir().unwrap();
         let supervisor = Arc::new(AccessDeniedThenActiveSupervisor {
             identities: Mutex::new(Vec::new()),
@@ -10859,7 +11268,7 @@ allow_py_eval = true
             method: "debug.session.create".to_string(),
             params: Some(json!({
                 "project_root": temp.path(),
-                "target": { "kind": "file", "path": "trace.run" }
+                "target": { "kind": "file", "path": "sample.dmp" }
             })),
         });
 
@@ -10911,6 +11320,152 @@ allow_py_eval = true
                 .unwrap()
                 .contains(".echo hello")
         );
+    }
+
+    #[test]
+    fn debug_eval_truncates_inline_output_and_keeps_raw_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let eval = eval_request(&host, session_id.clone(), ".mock_long_output");
+
+        assert!(eval.error.is_none(), "{:?}", eval.error);
+        let result = eval.result.unwrap();
+        assert_eq!(result["output_truncated"], true);
+        assert_eq!(
+            result["output"].as_str().unwrap().len(),
+            DEFAULT_INLINE_TEXT_BYTE_LIMIT
+        );
+        assert_eq!(
+            result["full_output_byte_len"],
+            json!(DEFAULT_INLINE_TEXT_BYTE_LIMIT + 100)
+        );
+        assert_eq!(result["full_output_artifact_ref"], result["raw_output_ref"]);
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let raw_ref: ArtifactRef =
+            serde_json::from_value(result["raw_output_ref"].clone()).unwrap();
+        let raw = workspace.get_artifact(&raw_ref).unwrap().unwrap();
+        let raw_path = workspace
+            .resolve_artifact_relative_path(raw.relative_path)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(raw_path).unwrap().len(),
+            DEFAULT_INLINE_TEXT_BYTE_LIMIT + 100
+        );
+
+        let close = close_request(&host, session_id);
+        assert!(close.error.is_none(), "{:?}", close.error);
+    }
+
+    #[test]
+    fn debug_eval_steps_runs_commands_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "debug.eval_steps".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "commands": [
+                    ".exepath D:\\Repos\\Sangfor\\EDR\\sf3\\dump",
+                    ".reload /f sf3.dll",
+                    "!chkimg -lo 100 -d sf3"
+                ]
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["operation_status"], "success");
+        assert_eq!(result["steps"].as_array().unwrap().len(), 3);
+        assert!(
+            result["steps"][0]["output"]
+                .as_str()
+                .unwrap()
+                .contains(".exepath")
+        );
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let operations = workspace.list_operations().unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.capability == "debug.eval_steps")
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| operation.capability == "debug.eval_steps.step")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn debug_eval_steps_reports_failed_step_without_running_later_steps() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::new(Arc::new(FailingEvalSupervisor));
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "debug.eval_steps".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "commands": [".echo first", ".echo second"]
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["operation_status"], "failed");
+        assert_eq!(result["failed_step_index"], 0);
+        assert_eq!(result["steps"].as_array().unwrap().len(), 1);
+        assert!(
+            result["steps"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("mock eval failed")
+        );
+    }
+
+    #[test]
+    fn debug_eval_steps_propagates_internal_step_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::new(Arc::new(BadEvalWriteSupervisor));
+        let session_id =
+            create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "debug.eval_steps".to_string(),
+            params: Some(json!({
+                "session_id": session_id,
+                "commands": [".echo first"]
+            })),
+        });
+
+        let error = response.error.unwrap();
+        assert!(error.message.contains("artifact path"));
+        let state = host.lock_state().unwrap();
+        assert!(state.operations.values().any(|operation| {
+            operation.capability == "debug.eval_steps.step"
+                && operation.status == ServiceOperationStatus::Failed
+        }));
+        assert!(state.operations.values().any(|operation| {
+            operation.capability == "debug.eval_steps"
+                && operation.status == ServiceOperationStatus::Failed
+        }));
     }
 
     #[test]
@@ -10993,6 +11548,14 @@ allow_py_eval = true
         assert_eq!(
             eval["inputSchema"]["properties"]["timeout_ms"]["type"],
             "integer"
+        );
+        let eval_steps = tools
+            .iter()
+            .find(|tool| tool["name"] == "debug.eval_steps")
+            .unwrap();
+        assert_eq!(
+            eval_steps["inputSchema"]["properties"]["commands"]["items"]["type"],
+            "string"
         );
 
         let recording = tools
@@ -11911,17 +12474,27 @@ allow_py_eval = true
 
         let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
         let artifacts = workspace.list_artifacts().unwrap();
-        assert!(
-            artifacts
-                .iter()
-                .any(|artifact| artifact.kind == "reverse.adapter_error")
-        );
+        let error_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "reverse.adapter_error")
+            .expect("reverse adapter error artifact is recorded");
+        let error_path = workspace
+            .resolve_artifact_relative_path(&error_artifact.relative_path)
+            .unwrap();
+        let error_text = fs::read_to_string(error_path).unwrap();
+        assert!(error_text.contains("ida_error_kind=open_database_failed"));
+        assert!(error_text.contains("possible_reason=database_locked_or_unavailable"));
         let operations = workspace.list_operations().unwrap();
         let failed = operations
             .iter()
             .find(|operation| operation.capability == "reverse.session.open")
             .unwrap();
         assert!(matches!(failed.status, OperationStatus::Failed));
+        assert!(
+            failed
+                .summary
+                .contains("ida_error_kind=open_database_failed")
+        );
     }
 
     #[test]
@@ -13454,6 +14027,8 @@ allow_py_eval = true
 
     struct FailingEvalSupervisor;
 
+    struct BadEvalWriteSupervisor;
+
     struct FailingReverseOpenSupervisor;
 
     struct FailingReverseCloseSupervisor;
@@ -13701,6 +14276,69 @@ allow_py_eval = true
         }
     }
 
+    impl WorkerSupervisor for BadEvalWriteSupervisor {
+        fn create_worker(
+            &self,
+            request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Ok(test_worker_handle(request.session_id))
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            match request {
+                WorkerRequest::EvalDebugCommand {
+                    session_id,
+                    operation_id: _,
+                    command,
+                    ..
+                } => Ok(WorkerResponse::DebugCommand {
+                    result: DebugCommandResult {
+                        session_id,
+                        operation_id: None,
+                        command,
+                        output: "bad write".to_string(),
+                        output_truncated: false,
+                        full_output_byte_len: Some(9),
+                        inline_output_byte_limit: Some(DEFAULT_INLINE_TEXT_BYTE_LIMIT as u64),
+                        final_state: Some(DebugSessionState::Ready),
+                        raw_output: None,
+                        full_output_artifact_ref: None,
+                        warnings: Vec::new(),
+                        error: None,
+                    },
+                    writes: vec![WorkerArtifactWrite {
+                        relative_path: PathBuf::from("outside.txt"),
+                        kind: "debug.raw_output".to_string(),
+                        byte_len: 9,
+                        description: Some("invalid test write".to_string()),
+                    }],
+                }),
+                other => mock_worker_response(other),
+            }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
     impl WorkerSupervisor for FailingReverseOpenSupervisor {
         fn create_worker(
             &self,
@@ -13717,7 +14355,7 @@ allow_py_eval = true
             match request {
                 WorkerRequest::OpenReverseSession { .. } => Ok(WorkerResponse::Failed {
                     code: "reverse_open_failed".to_string(),
-                    message: "mock IDA open failed".to_string(),
+                    message: "open_database failed with result 4".to_string(),
                     writes: Vec::new(),
                 }),
                 other => mock_worker_response(other),

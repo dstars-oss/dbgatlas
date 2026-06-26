@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub const DEFAULT_INLINE_TEXT_BYTE_LIMIT: usize = 64 * 1024;
+
 #[derive(Debug, Error)]
 pub enum DebugError {
     #[error("debug target path must not be empty")]
@@ -122,10 +124,49 @@ pub struct DebugCommandResult {
     pub operation_id: Option<OperationRef>,
     pub command: String,
     pub output: String,
+    #[serde(default)]
+    pub output_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_byte_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_output_byte_limit: Option<u64>,
     pub final_state: Option<DebugSessionState>,
     pub raw_output: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_artifact_ref: Option<ArtifactRef>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineTextPreview {
+    pub text: String,
+    pub truncated: bool,
+    pub full_byte_len: u64,
+    pub inline_byte_limit: u64,
+}
+
+pub fn inline_text_preview(text: &str, byte_limit: usize) -> InlineTextPreview {
+    let full_byte_len = text.len() as u64;
+    if text.len() <= byte_limit {
+        return InlineTextPreview {
+            text: text.to_string(),
+            truncated: false,
+            full_byte_len,
+            inline_byte_limit: byte_limit as u64,
+        };
+    }
+
+    let mut end = byte_limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    InlineTextPreview {
+        text: text[..end].to_string(),
+        truncated: true,
+        full_byte_len,
+        inline_byte_limit: byte_limit as u64,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

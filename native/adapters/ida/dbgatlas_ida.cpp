@@ -52,6 +52,20 @@ int32_t fail(int32_t status, std::string message) {
     return status;
 }
 
+std::string open_database_failure_message(int open_result) {
+    std::ostringstream out;
+    out << "open_database failed with result " << open_result
+        << "; ida_error_kind=open_database_failed";
+    if (open_result == 4) {
+        out << "; possible_reason=database_locked_or_unavailable"
+            << "; suggestion=close other IDA/IDALib sessions using this database, wait for file locks to release, or copy the IDB manually for review";
+    } else {
+        out << "; possible_reason=ida_rejected_database"
+            << "; suggestion=verify the database path, IDA version compatibility, file permissions, and whether another process has the database open";
+    }
+    return out.str();
+}
+
 std::wstring utf8_to_wide(const char* value, const char* field) {
     if (value == nullptr || value[0] == '\0') {
         throw std::invalid_argument(std::string(field) + " must not be empty");
@@ -1861,7 +1875,7 @@ DA_IDA_EXPORT int32_t da_ida_session_open(
         dbgatlas_validate_ida_runtime_version();
         int open_result = open_database(database_path_utf8_copy.c_str(), true, nullptr);
         if (open_result != 0) {
-            return fail(DA_IDA_ERR_IDA, "open_database failed with result " + std::to_string(open_result));
+            return fail(DA_IDA_ERR_IDA, open_database_failure_message(open_result));
         }
         if (!auto_wait()) {
             close_database(false);

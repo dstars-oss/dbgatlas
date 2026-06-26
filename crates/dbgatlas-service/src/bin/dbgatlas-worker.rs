@@ -1,7 +1,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use dbgatlas_dbgeng::DbgEngSession;
-use dbgatlas_debug::{DebugCommandResult, DebugMemoryResult, DebugSessionState, DebugTarget};
+use dbgatlas_debug::{
+    DEFAULT_INLINE_TEXT_BYTE_LIMIT, DebugCommandResult, DebugMemoryResult, DebugSessionState,
+    DebugTarget, inline_text_preview,
+};
 use dbgatlas_model::{OperationRef, SessionRef, Timestamp};
 use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
@@ -394,16 +397,28 @@ fn write_command_response(
             "byte_len": output.len(),
         }),
     )?;
+    let preview = inline_text_preview(&output, DEFAULT_INLINE_TEXT_BYTE_LIMIT);
+    let mut warnings = Vec::new();
+    if preview.truncated {
+        warnings.push(format!(
+            "output truncated to {} bytes inline; full output saved to raw output artifact",
+            preview.inline_byte_limit
+        ));
+    }
 
     Ok(WorkerResponse::DebugCommand {
         result: DebugCommandResult {
             session_id,
             operation_id: None,
             command,
-            output: output.clone(),
+            output: preview.text,
+            output_truncated: preview.truncated,
+            full_output_byte_len: Some(preview.full_byte_len),
+            inline_output_byte_limit: Some(preview.inline_byte_limit),
             final_state: Some(DebugSessionState::Ready),
             raw_output: None,
-            warnings: Vec::new(),
+            full_output_artifact_ref: None,
+            warnings,
             error: None,
         },
         writes: vec![
