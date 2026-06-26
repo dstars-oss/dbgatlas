@@ -8678,26 +8678,32 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "recording.ttd",
-            "Record a Time Travel Debugging trace with TTD.exe.",
+            "Record a Time Travel Debugging trace with TTD.exe and register the .run/.idx artifacts. To replay an existing .run trace, use debug.session.create with target kind=file.",
             json!({
                 "type": "object",
                 "properties": {
                     "project_root": { "type": "string" },
                     "target": ttd_recording_target_schema(),
-                    "timeout_ms": { "type": "integer" },
-                    "options": { "type": "object" }
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Maximum recording duration in milliseconds before DbgAtlas asks TTD.exe to stop and keeps any completed trace artifacts."
+                    },
+                    "options": ttd_recording_options_schema()
                 },
                 "required": ["project_root", "target", "timeout_ms"]
             }),
         ),
         mcp_tool(
             "debug.eval",
-            "Execute a raw WinDbg command in an existing session.",
+            "Execute one raw DbgEng IDebugControl::Execute command string in an existing session. This does not emulate WinDbg command-window multiline input; use debug.eval_steps for ordered multi-step commands.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "object" },
-                    "command": { "type": "string" },
+                    "command": {
+                        "type": "string",
+                        "description": "Raw DbgEng command string sent as a single IDebugControl::Execute call. Newlines are not treated as separate WinDbg command-window submissions; use debug.eval_steps when commands such as .exepath/.sympath must be isolated from following commands."
+                    },
                     "timeout_ms": {
                         "type": "integer",
                         "description": "Optional command timeout in milliseconds. On timeout DbgAtlas kills the debug worker and the session must be recreated."
@@ -8708,13 +8714,14 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "debug.eval_steps",
-            "Execute raw WinDbg commands one step at a time in an existing session.",
+            "Execute raw DbgEng commands one step at a time in an existing session, with each array item sent as a separate IDebugControl::Execute call.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "object" },
                     "commands": {
                         "type": "array",
+                        "description": "Ordered command steps. Each item is executed separately, so line-consuming commands such as .exepath/.sympath do not consume later steps.",
                         "items": { "type": "string" },
                         "minItems": 1
                     },
@@ -8747,13 +8754,20 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "debug.add_symbols",
-            "Add a symbol path to a debug session.",
+            "Append a symbol path to a debug session using .sympath+. Set reload=true to run .reload after updating the path.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "object" },
-                    "symbol_path": { "type": "string" },
-                    "reload": { "type": "boolean" }
+                    "symbol_path": {
+                        "type": "string",
+                        "description": "Symbol path segment to append with .sympath+; this does not replace the existing symbol path."
+                    },
+                    "reload": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, execute .reload after appending the symbol path."
+                    }
                 },
                 "required": ["session_id", "symbol_path"]
             }),
@@ -8773,13 +8787,19 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "reverse.session.open",
-            "Open an IDA reverse session.",
+            "Open an IDA reverse session for an IDB/database path. This is not a read-only clone; opening an IDB already held by another IDA instance can fail with lock/availability diagnostics.",
             json!({
                 "type": "object",
                 "properties": {
                     "project_root": { "type": "string" },
-                    "database_path": { "type": "string" },
-                    "ida_install_dir": { "type": "string" }
+                    "database_path": {
+                        "type": "string",
+                        "description": "Path to the IDA database or input file to open in the session."
+                    },
+                    "ida_install_dir": {
+                        "type": "string",
+                        "description": "Optional IDA installation directory override."
+                    }
                 },
                 "required": ["project_root", "database_path"]
             }),
@@ -8922,7 +8942,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "reverse.rename",
-            "Rename IDA functions or globals.",
+            "Rename IDA functions or globals in the current session. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
             mcp_reverse_core_schema_required(
                 json!({ "items": reverse_rename_items_schema() }),
                 &["items"],
@@ -8930,7 +8950,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "reverse.set_comments",
-            "Set IDA comments at addresses.",
+            "Set IDA comments in the current session. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
             mcp_reverse_core_schema_required(
                 json!({ "items": reverse_set_comments_items_schema() }),
                 &["items"],
@@ -8938,7 +8958,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "reverse.set_type",
-            "Apply C types to IDA functions, globals, or addresses.",
+            "Apply C types to IDA functions, globals, or addresses in the current session. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
             mcp_reverse_core_schema_required(
                 json!({ "items": reverse_set_type_items_schema() }),
                 &["items"],
@@ -8946,18 +8966,23 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "reverse.declare_type",
-            "Declare C types in the IDA local type library.",
+            "Declare C types in the IDA local type library. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
             mcp_reverse_core_schema_required(json!({ "decls": {} }), &["decls"]),
         ),
         mcp_tool(
             "reverse.force_recompile",
-            "Invalidate Hex-Rays cached decompilation for functions or all functions.",
+            "Invalidate Hex-Rays cached decompilation for functions or all functions in the current session.",
             mcp_reverse_core_schema(json!({ "addrs": {} })),
         ),
         mcp_tool(
             "reverse.idb_save",
-            "Save the current IDA database.",
-            mcp_reverse_core_schema(json!({ "path": { "type": "string" } })),
+            "Save the current IDA database. When path is omitted, save in place.",
+            mcp_reverse_core_schema(json!({
+                "path": {
+                    "type": "string",
+                    "description": "Optional output path. Omit to save the currently opened database in place."
+                }
+            })),
         ),
         mcp_tool(
             "reverse.find_bytes",
@@ -9046,12 +9071,12 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
         ),
         mcp_tool(
             "debug.session.close",
-            "Close a debug session.",
+            "Cooperatively close a debug session. If the worker is stuck or the pipe is broken, use debug.session.kill.",
             mcp_session_schema(),
         ),
         mcp_tool(
             "debug.session.kill",
-            "Kill a debug session worker.",
+            "Forcefully terminate a debug session worker and mark the session closed.",
             mcp_session_schema(),
         ),
         mcp_tool(
@@ -9180,15 +9205,84 @@ fn ttd_recording_target_schema() -> Value {
     })
 }
 
+fn ttd_recording_options_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "TTD.exe recording options. Defaults: no_ui=true, max_file_mb=2048, accept_eula=false, children=false, ring=false, modules=[], record_mode=automatic, replay_cpu_support=default.",
+        "properties": {
+            "children": {
+                "type": "boolean",
+                "default": false,
+                "description": "Pass -children so child processes are recorded too."
+            },
+            "no_ui": {
+                "type": "boolean",
+                "default": true,
+                "description": "Pass -noUI to suppress the TTD recorder UI."
+            },
+            "accept_eula": {
+                "type": "boolean",
+                "default": false,
+                "description": "Pass -accepteula to TTD.exe when the caller has already accepted the TTD license terms."
+            },
+            "ring": {
+                "type": "boolean",
+                "default": false,
+                "description": "Pass -ring to record in ring-buffer mode."
+            },
+            "max_file_mb": {
+                "type": "integer",
+                "default": 2048,
+                "minimum": 1,
+                "description": "Pass -maxFile. Ring mode is limited to 32768 MB; non-ring mode is limited to 1048576 MB."
+            },
+            "modules": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": [],
+                "description": "Module filters passed as repeated -module arguments. Non-monitor targets allow at most 64 modules."
+            },
+            "record_mode": {
+                "type": "string",
+                "enum": ["automatic", "manual"],
+                "default": "automatic",
+                "description": "TTD -recordmode value."
+            },
+            "replay_cpu_support": {
+                "type": "string",
+                "enum": [
+                    "default",
+                    "most_conservative",
+                    "most_aggressive",
+                    "intel_avx_required",
+                    "intel_avx2_required"
+                ],
+                "default": "default",
+                "description": "TTD -replayCpuSupport value."
+            }
+        }
+    })
+}
+
 fn reverse_rename_items_schema() -> Value {
     json!({
         "type": "array",
         "items": {
             "type": "object",
+            "description": "Each item must include addr or name to identify the target.",
             "properties": {
-                "kind": { "type": "string", "enum": ["function", "global"] },
-                "addr": {},
-                "name": { "type": "string" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["function", "global"],
+                    "description": "Use function to normalize addr/name to the containing function start; use global for the exact named/addressed item."
+                },
+                "addr": {
+                    "description": "IDA address to rename. Provide addr or name."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Existing IDA name to rename. Provide addr or name."
+                },
                 "new_name": { "type": "string" }
             },
             "required": ["kind", "new_name"]
@@ -9201,9 +9295,15 @@ fn reverse_set_comments_items_schema() -> Value {
         "type": "array",
         "items": {
             "type": "object",
+            "description": "Each item must include addr or name to identify the comment location.",
             "properties": {
-                "addr": {},
-                "name": { "type": "string" },
+                "addr": {
+                    "description": "IDA address to comment. Provide addr or name."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Existing IDA name whose address should receive the comment. Provide addr or name."
+                },
                 "text": { "type": "string" },
                 "repeatable": { "type": "boolean", "default": false }
             },
@@ -9217,10 +9317,20 @@ fn reverse_set_type_items_schema() -> Value {
         "type": "array",
         "items": {
             "type": "object",
+            "description": "Each item must include addr or name to identify where the type is applied.",
             "properties": {
-                "kind": { "type": "string", "enum": ["function", "global", "addr"] },
-                "addr": {},
-                "name": { "type": "string" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["function", "global", "addr"],
+                    "description": "Use function to apply a function declaration at the function start; global or addr applies at the resolved address."
+                },
+                "addr": {
+                    "description": "IDA address to type. Provide addr or name."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Existing IDA name to type. Provide addr or name."
+                },
                 "type": { "type": "string" }
             },
             "required": ["kind", "type"]
@@ -11545,6 +11655,24 @@ allow_py_eval = true
             .iter()
             .find(|tool| tool["name"] == "debug.eval")
             .unwrap();
+        assert!(
+            eval["description"]
+                .as_str()
+                .unwrap()
+                .contains("IDebugControl::Execute")
+        );
+        assert!(
+            eval["description"]
+                .as_str()
+                .unwrap()
+                .contains("does not emulate WinDbg command-window multiline input")
+        );
+        assert!(
+            eval["inputSchema"]["properties"]["command"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("single IDebugControl::Execute call")
+        );
         assert_eq!(
             eval["inputSchema"]["properties"]["timeout_ms"]["type"],
             "integer"
@@ -11553,6 +11681,18 @@ allow_py_eval = true
             .iter()
             .find(|tool| tool["name"] == "debug.eval_steps")
             .unwrap();
+        assert!(
+            eval_steps["description"]
+                .as_str()
+                .unwrap()
+                .contains("separate IDebugControl::Execute call")
+        );
+        assert!(
+            eval_steps["inputSchema"]["properties"]["commands"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Each item is executed separately")
+        );
         assert_eq!(
             eval_steps["inputSchema"]["properties"]["commands"]["items"]["type"],
             "string"
@@ -11562,6 +11702,12 @@ allow_py_eval = true
             .iter()
             .find(|tool| tool["name"] == "recording.ttd")
             .unwrap();
+        assert!(
+            recording["description"]
+                .as_str()
+                .unwrap()
+                .contains("register the .run/.idx artifacts")
+        );
         assert_eq!(
             recording["inputSchema"]["properties"]["target"]["oneOf"][0]["required"],
             json!(["kind", "executable"])
@@ -11575,14 +11721,104 @@ allow_py_eval = true
                 ["type"],
             "string"
         );
+        assert_eq!(
+            recording["inputSchema"]["properties"]["options"]["properties"]["record_mode"]["enum"],
+            json!(["automatic", "manual"])
+        );
+        assert_eq!(
+            recording["inputSchema"]["properties"]["options"]["properties"]["replay_cpu_support"]["default"],
+            "default"
+        );
+
+        let add_symbols = tools
+            .iter()
+            .find(|tool| tool["name"] == "debug.add_symbols")
+            .unwrap();
+        assert!(
+            add_symbols["description"]
+                .as_str()
+                .unwrap()
+                .contains(".sympath+")
+        );
+        assert!(
+            add_symbols["inputSchema"]["properties"]["symbol_path"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("does not replace")
+        );
+
+        let open = tools
+            .iter()
+            .find(|tool| tool["name"] == "reverse.session.open")
+            .unwrap();
+        assert!(
+            open["description"]
+                .as_str()
+                .unwrap()
+                .contains("not a read-only clone")
+        );
 
         let rename = tools
             .iter()
             .find(|tool| tool["name"] == "reverse.rename")
             .unwrap();
+        assert!(
+            rename["description"]
+                .as_str()
+                .unwrap()
+                .contains("call reverse.idb_save")
+        );
+        assert!(
+            rename["inputSchema"]["properties"]["items"]["items"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("addr or name")
+        );
         assert_eq!(
             rename["inputSchema"]["properties"]["items"]["items"]["properties"]["new_name"]["type"],
             "string"
+        );
+
+        let set_type = tools
+            .iter()
+            .find(|tool| tool["name"] == "reverse.set_type")
+            .unwrap();
+        assert!(set_type["inputSchema"]["properties"]["items"]["items"]["properties"]["kind"]
+            ["description"]
+            .as_str()
+            .unwrap()
+            .contains("function declaration"));
+
+        let idb_save = tools
+            .iter()
+            .find(|tool| tool["name"] == "reverse.idb_save")
+            .unwrap();
+        assert!(
+            idb_save["description"]
+                .as_str()
+                .unwrap()
+                .contains("save in place")
+        );
+
+        let close = tools
+            .iter()
+            .find(|tool| tool["name"] == "debug.session.close")
+            .unwrap();
+        assert!(
+            close["description"]
+                .as_str()
+                .unwrap()
+                .contains("Cooperatively close")
+        );
+        let kill = tools
+            .iter()
+            .find(|tool| tool["name"] == "debug.session.kill")
+            .unwrap();
+        assert!(
+            kill["description"]
+                .as_str()
+                .unwrap()
+                .contains("Forcefully terminate")
         );
     }
 
