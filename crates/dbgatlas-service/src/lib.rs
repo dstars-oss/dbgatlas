@@ -271,6 +271,7 @@ impl ServiceHost {
             "reverse.set_comments" => self.reverse_core_function("set_comments", request.params),
             "reverse.set_type" => self.reverse_core_function("set_type", request.params),
             "reverse.declare_type" => self.reverse_core_function("declare_type", request.params),
+            "reverse.inspect_item" => self.reverse_core_function("inspect_item", request.params),
             "reverse.force_recompile" => {
                 self.reverse_core_function("force_recompile", request.params)
             }
@@ -402,6 +403,7 @@ impl ServiceHost {
             | "reverse.set_comments"
             | "reverse.set_type"
             | "reverse.declare_type"
+            | "reverse.inspect_item"
             | "reverse.force_recompile"
             | "reverse.idb_save"
             | "reverse.find_bytes"
@@ -5326,10 +5328,11 @@ fn mock_reverse_core_response(
         "xrefs_to" => mock_xrefs_to(&arguments)?,
         "xrefs_to_field" => mock_xrefs_to_field(&arguments)?,
         "callees" => mock_callees(&arguments)?,
-        "rename" => mock_batch_write_result(&arguments, "items"),
+        "rename" => mock_batch_write_result_with_diagnostics(&arguments, "items"),
         "set_comments" => mock_batch_write_result(&arguments, "items"),
-        "set_type" => mock_batch_write_result(&arguments, "items"),
+        "set_type" => mock_set_type_result(&arguments),
         "declare_type" => mock_declare_type(&arguments),
+        "inspect_item" => mock_inspect_item(&arguments),
         "force_recompile" => mock_force_recompile(&arguments),
         "idb_save" => mock_idb_save(&arguments),
         "py_eval" => mock_py_eval(&arguments),
@@ -5648,13 +5651,153 @@ fn mock_batch_write_result(arguments: &Value, field: &'static str) -> Value {
     })
 }
 
+fn mock_batch_write_result_with_diagnostics(arguments: &Value, field: &'static str) -> Value {
+    let items = arguments
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            arguments
+                .get(field)
+                .map(|value| vec![value.clone()])
+                .unwrap_or_default()
+        });
+    let results: Vec<Value> = items
+        .into_iter()
+        .map(|item| {
+            let addr = mock_item_addr(&item);
+            json!({
+                "input": item,
+                "ea": addr,
+                "ok": true,
+                "item_state": mock_item_state(addr)
+            })
+        })
+        .collect();
+    let count = results.len();
+    json!({
+        "items": results,
+        "count": count,
+        "changed_count": count
+    })
+}
+
+fn mock_set_type_result(arguments: &Value) -> Value {
+    let items = arguments
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            arguments
+                .get("items")
+                .map(|value| vec![value.clone()])
+                .unwrap_or_default()
+        });
+    let results: Vec<Value> = items
+        .into_iter()
+        .map(|item| {
+            let addr = mock_item_addr(&item);
+            let type_text = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            json!({
+                "input": item,
+                "ea": addr,
+                "ok": true,
+                "generated_decl": mock_generated_decl(type_text),
+                "item_state": mock_item_state(addr)
+            })
+        })
+        .collect();
+    let count = results.len();
+    json!({
+        "items": results,
+        "count": count,
+        "changed_count": count
+    })
+}
+
+fn mock_item_addr(item: &Value) -> u64 {
+    item.get("addr")
+        .and_then(parse_u64_value)
+        .unwrap_or(0x140020000)
+}
+
+fn mock_item_state(addr: u64) -> Value {
+    json!({
+        "ea": addr,
+        "item_head": addr,
+        "item_end": addr + 8,
+        "item_size": 8,
+        "is_item_head": true,
+        "name": "mock_symbol",
+        "head_name": "mock_symbol",
+        "is_code": false,
+        "is_data": true
+    })
+}
+
+fn mock_generated_decl(type_text: &str) -> String {
+    let trimmed = type_text.trim();
+    if let Some(array_pos) = trimmed.find('[') {
+        let (before_array, array_suffix) = trimmed.split_at(array_pos);
+        format!("{} mock_symbol{};", before_array.trim(), array_suffix)
+    } else {
+        format!("{trimmed} mock_symbol;")
+    }
+}
+
 fn mock_declare_type(arguments: &Value) -> Value {
     let decls = normalize_core_list(arguments.get("decls").unwrap_or(&Value::Null));
+    let items: Vec<Value> = decls
+        .iter()
+        .enumerate()
+        .map(|(index, decl)| {
+            let ok = !decl.to_ascii_lowercase().contains("invalid");
+            let errors = if ok { 0 } else { 1 };
+            let mut item = json!({
+                "index": index,
+                "ok": ok,
+                "errors": errors,
+                "decl": decl
+            });
+            if !ok {
+                item["hint"] = json!(
+                    "IDA failed to parse this declaration; try declaring dependent typedefs separately or remove unsupported calling-convention syntax"
+                );
+            }
+            item
+        })
+        .collect();
+    let errors = items
+        .iter()
+        .filter(|item| !item["ok"].as_bool().unwrap_or(false))
+        .count();
+    let changed_count = items.len().saturating_sub(errors);
     json!({
-        "ok": true,
+        "ok": errors == 0,
         "count": decls.len(),
-        "changed_count": decls.len(),
-        "errors": 0
+        "changed_count": changed_count,
+        "errors": errors,
+        "items": items
+    })
+}
+
+fn mock_inspect_item(arguments: &Value) -> Value {
+    let queries = normalize_core_list(arguments.get("queries").unwrap_or(&Value::Null));
+    let items: Vec<Value> = queries
+        .into_iter()
+        .map(|query| {
+            let addr = parse_optional_u64_text(&query).unwrap_or(0x140020000);
+            json!({
+                "query": query,
+                "ea": addr,
+                "item_state": mock_item_state(addr)
+            })
+        })
+        .collect();
+    let count = items.len();
+    json!({
+        "items": items,
+        "count": count
     })
 }
 
@@ -8699,7 +8842,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "object" },
+                    "session_id": session_ref_schema(),
                     "command": {
                         "type": "string",
                         "description": "Raw DbgEng command string sent as a single IDebugControl::Execute call. Newlines are not treated as separate WinDbg command-window submissions; use debug.eval_steps when commands such as .exepath/.sympath must be isolated from following commands."
@@ -8718,7 +8861,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "object" },
+                    "session_id": session_ref_schema(),
                     "commands": {
                         "type": "array",
                         "description": "Ordered command steps. Each item is executed separately, so line-consuming commands such as .exepath/.sympath do not consume later steps.",
@@ -8758,7 +8901,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "object" },
+                    "session_id": session_ref_schema(),
                     "symbol_path": {
                         "type": "string",
                         "description": "Symbol path segment to append with .sympath+; this does not replace the existing symbol path."
@@ -8778,7 +8921,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "object" },
+                    "session_id": session_ref_schema(),
                     "address": {},
                     "length": { "type": "integer" }
                 },
@@ -8810,7 +8953,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "object" },
+                    "session_id": session_ref_schema(),
                     "runtime_address": {},
                     "runtime_module_base": {},
                     "ida_image_base": {}
@@ -8970,6 +9113,11 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             mcp_reverse_core_schema_required(json!({ "decls": {} }), &["decls"]),
         ),
         mcp_tool(
+            "reverse.inspect_item",
+            "Inspect IDA item boundaries, head address, current name, and data/code state without mutating the IDB.",
+            mcp_reverse_core_schema_required(json!({ "queries": {} }), &["queries"]),
+        ),
+        mcp_tool(
             "reverse.force_recompile",
             "Invalidate Hex-Rays cached decompilation for functions or all functions in the current session.",
             mcp_reverse_core_schema(json!({ "addrs": {} })),
@@ -9064,7 +9212,7 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "object" }
+                    "session_id": session_ref_schema()
                 },
                 "required": ["session_id"]
             }),
@@ -9338,11 +9486,42 @@ fn reverse_set_type_items_schema() -> Value {
     })
 }
 
+fn ref_id_schema(label: &str, example: &str) -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "string",
+                "description": format!("{label} id string, for example \"{example}\".")
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": true,
+                "description": format!("{label} ref object, for example {{\"id\":\"{example}\"}}.")
+            }
+        ],
+        "description": format!(
+            "Accepts either a raw {label} id string such as \"{example}\" or a ref object with an id field."
+        )
+    })
+}
+
+fn session_ref_schema() -> Value {
+    ref_id_schema("session", "session-123")
+}
+
+fn operation_ref_schema() -> Value {
+    ref_id_schema("operation", "op-123")
+}
+
 fn mcp_session_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "session_id": { "type": "object" }
+            "session_id": session_ref_schema()
         },
         "required": ["session_id"]
     })
@@ -9354,7 +9533,7 @@ fn mcp_reverse_core_schema(extra_properties: Value) -> Value {
 
 fn mcp_reverse_core_schema_required(extra_properties: Value, extra_required: &[&str]) -> Value {
     let mut properties = serde_json::Map::new();
-    properties.insert("session_id".to_string(), json!({ "type": "object" }));
+    properties.insert("session_id".to_string(), session_ref_schema());
     if let Value::Object(extra) = extra_properties {
         for (key, value) in extra {
             properties.insert(key, value);
@@ -9373,7 +9552,7 @@ fn mcp_operation_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "operation_id": { "type": "object" }
+            "operation_id": operation_ref_schema()
         },
         "required": ["operation_id"]
     })
@@ -11758,6 +11937,34 @@ allow_py_eval = true
                 .contains("not a read-only clone")
         );
 
+        let decompile = tools
+            .iter()
+            .find(|tool| tool["name"] == "reverse.decompile")
+            .unwrap();
+        let session_schema = &decompile["inputSchema"]["properties"]["session_id"];
+        assert_eq!(session_schema["oneOf"][0]["type"], "string");
+        assert_eq!(
+            session_schema["oneOf"][1]["properties"]["id"]["type"],
+            "string"
+        );
+        assert!(
+            session_schema["description"]
+                .as_str()
+                .unwrap()
+                .contains("\"session-")
+        );
+
+        let inspect_item = tools
+            .iter()
+            .find(|tool| tool["name"] == "reverse.inspect_item")
+            .unwrap();
+        assert!(
+            inspect_item["description"]
+                .as_str()
+                .unwrap()
+                .contains("without mutating")
+        );
+
         let rename = tools
             .iter()
             .find(|tool| tool["name"] == "reverse.rename")
@@ -12380,6 +12587,10 @@ allow_py_eval = true
                 json!({ "decls": "struct DbgAtlasContext { int state; };" }),
             ),
             (
+                "reverse.inspect_item",
+                json!({ "queries": ["0x140001000"] }),
+            ),
+            (
                 "reverse.force_recompile",
                 json!({ "addrs": ["0x140001000"] }),
             ),
@@ -12460,6 +12671,7 @@ allow_py_eval = true
             "reverse.set_comments",
             "reverse.set_type",
             "reverse.declare_type",
+            "reverse.inspect_item",
             "reverse.force_recompile",
             "reverse.idb_save",
             "reverse.find_bytes",
@@ -12496,6 +12708,80 @@ allow_py_eval = true
         assert_eq!(metadata["writes_idb"], false);
         assert_eq!(metadata["open_operation_writes_idb"], false);
         assert_eq!(metadata["session_write_capable"], true);
+    }
+
+    #[test]
+    fn reverse_core_accepts_string_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id = open_reverse_session(&host, temp.path());
+        let session_id_text = session_id["id"].as_str().unwrap().to_string();
+
+        let response = reverse_core_rpc(
+            &host,
+            "reverse.list_funcs",
+            json!(session_id_text),
+            json!({ "offset": 0, "count": 1 }),
+        );
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["function"], "list_funcs");
+    }
+
+    #[test]
+    fn reverse_write_results_include_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ServiceHost::with_mock_workers();
+        let session_id = open_reverse_session(&host, temp.path());
+
+        let set_type = reverse_core_rpc(
+            &host,
+            "reverse.set_type",
+            session_id.clone(),
+            json!({
+                "items": [{
+                    "kind": "global",
+                    "addr": "0x140020000",
+                    "type": "struct Descriptor *[18]"
+                }]
+            }),
+        );
+        assert!(set_type.error.is_none(), "{:?}", set_type.error);
+        let set_type = set_type.result.unwrap();
+        let set_item = &set_type["result"]["items"][0];
+        assert_eq!(set_item["ok"], true);
+        assert!(
+            set_item["generated_decl"]
+                .as_str()
+                .unwrap()
+                .contains("mock_symbol")
+        );
+        assert_eq!(set_item["item_state"]["item_head"], json!(0x140020000u64));
+
+        let declare = reverse_core_rpc(
+            &host,
+            "reverse.declare_type",
+            session_id,
+            json!({
+                "decls": [
+                    "struct GoodType { int x; };",
+                    "invalid declaration"
+                ]
+            }),
+        );
+        assert!(declare.error.is_none(), "{:?}", declare.error);
+        let declare = declare.result.unwrap();
+        assert_eq!(declare["result"]["ok"], false);
+        assert_eq!(declare["result"]["changed_count"], 1);
+        assert_eq!(declare["result"]["errors"], 1);
+        assert_eq!(declare["result"]["items"][0]["ok"], true);
+        assert_eq!(declare["result"]["items"][1]["ok"], false);
+        assert!(
+            declare["result"]["items"][1]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("failed to parse")
+        );
     }
 
     #[test]
@@ -13514,6 +13800,7 @@ allow_py_eval = true
             "reverse.set_comments",
             "reverse.set_type",
             "reverse.declare_type",
+            "reverse.inspect_item",
             "reverse.force_recompile",
             "reverse.idb_save",
             "reverse.find_bytes",

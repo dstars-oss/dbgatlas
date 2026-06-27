@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -88,7 +89,7 @@ impl WorkspaceRef {
 
 macro_rules! define_ref {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
         pub struct $name {
             pub id: Id,
         }
@@ -96,6 +97,61 @@ macro_rules! define_ref {
         impl $name {
             pub fn new(id: Id) -> Self {
                 Self { id }
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct RefVisitor;
+
+                impl<'de> Visitor<'de> for RefVisitor {
+                    type Value = $name;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a ref id string or an object with an id field")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Id::new(value).map($name::new).map_err(E::custom)
+                    }
+
+                    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Id::new(value).map($name::new).map_err(E::custom)
+                    }
+
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        let mut id = None;
+                        while let Some(key) = map.next_key::<String>()? {
+                            match key.as_str() {
+                                "id" => {
+                                    if id.is_some() {
+                                        return Err(de::Error::duplicate_field("id"));
+                                    }
+                                    id = Some(map.next_value::<Id>()?);
+                                }
+                                _ => {
+                                    let _: IgnoredAny = map.next_value()?;
+                                }
+                            }
+                        }
+                        let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
+                        Ok($name::new(id))
+                    }
+                }
+
+                deserializer.deserialize_any(RefVisitor)
             }
         }
 
@@ -143,5 +199,27 @@ mod tests {
     fn id_accepts_plain_values() {
         let id = Id::new("artifact-001").unwrap();
         assert_eq!(id.as_str(), "artifact-001");
+    }
+
+    #[test]
+    fn session_ref_deserializes_from_string() {
+        let session: SessionRef = serde_json::from_str(r#""session-001""#).unwrap();
+        assert_eq!(session.id.as_str(), "session-001");
+    }
+
+    #[test]
+    fn session_ref_deserializes_from_object_and_ignores_kind() {
+        let session: SessionRef =
+            serde_json::from_str(r#"{"kind":"reverse","id":"session-001"}"#).unwrap();
+        assert_eq!(session.id.as_str(), "session-001");
+    }
+
+    #[test]
+    fn session_ref_serializes_as_object_for_compatibility() {
+        let session = SessionRef::new(Id::new("session-001").unwrap());
+        assert_eq!(
+            serde_json::to_value(session).unwrap(),
+            serde_json::json!({"id":"session-001"})
+        );
     }
 }

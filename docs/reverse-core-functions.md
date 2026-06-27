@@ -30,6 +30,7 @@ resolving user-provided addresses or names to concrete IDA entities.
 - `reverse.set_comments`: `{ session_id, items: [{ addr? | name?, text, repeatable? }] }`
 - `reverse.set_type`: `{ session_id, items: [{ kind: "function" | "global" | "addr", addr? | name?, type }] }`
 - `reverse.declare_type`: `{ session_id, decls }`
+- `reverse.inspect_item`: `{ session_id, queries }`
 - `reverse.force_recompile`: `{ session_id, addrs? }`
 - `reverse.idb_save`: `{ session_id, path? }`
 - `reverse.py_eval`: `{ session_id, code }`
@@ -42,6 +43,9 @@ resolving user-provided addresses or names to concrete IDA entities.
 List inputs accept either a JSON array or a comma-separated string. Integer inputs accept
 JSON numbers, decimal strings, `0x` hex strings, and `0b` binary strings. `int_convert`
 also accepts `bytes:` / `bytes_le:` little-endian byte lists and `ascii:` strings.
+All reverse tools accept `session_id` either as the returned ref object
+(`{"id":"session-..."}`) or as the raw string (`"session-..."`). Results continue
+to serialize refs as objects for compatibility with existing callers.
 
 `reverse.list_strings`, `reverse.get_string`, `reverse.get_bytes`, and
 `reverse.get_int` are read-only IDB context helpers. They read bytes and string
@@ -55,6 +59,19 @@ the open IDA database by default. The first write-capable batch only supports
 function/global/address-level edits. Local variable rename, stack frame edits,
 append-comment mode, operand/struct-field typing, and regex text search are
 intentionally deferred.
+
+Write-capable tools may include per-item `item_state`, `generated_decl`, `hint`,
+and `warnings` fields. These fields are diagnostic additions; existing `ok`,
+`error`, `count`, and `changed_count` fields remain stable. For `reverse.set_type`
+with `kind:"global"`, callers may pass either a full C declaration including the
+symbol name or a naked type. Naked array types are expanded using the current IDA
+name, e.g. `struct T *[18]` becomes `struct T *symbol_name[18];`.
+
+`reverse.inspect_item` is read-only. It returns IDA item boundaries, head address,
+current name, and data/code state for addresses or names. When `reverse.rename`
+or `reverse.set_type` reports that an address is inside an existing item, call
+`reverse.inspect_item` before attempting any IDB state repair. DbgAtlas does not
+split or undefine existing data items implicitly.
 
 `reverse.session.open` itself does not modify the IDB. Session metadata keeps
 the legacy `writes_idb: false` field for compatibility and also records

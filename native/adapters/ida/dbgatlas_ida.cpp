@@ -397,6 +397,50 @@ std::string function_json(func_t* function) {
     }.dump();
 }
 
+Json item_state_json(ea_t ea) {
+    if (ea == BADADDR) {
+        return Json(nullptr);
+    }
+    ea_t head = get_item_head(ea);
+    ea_t end = get_item_end(ea);
+    flags64_t flags = get_full_flags(ea);
+    qstring name = get_name(ea);
+    qstring head_name = head == BADADDR ? qstring() : get_name(head);
+    return Json{
+        {"ea", static_cast<uint64_t>(ea)},
+        {"item_head", head == BADADDR ? Json(nullptr) : Json(static_cast<uint64_t>(head))},
+        {"item_end", end == BADADDR ? Json(nullptr) : Json(static_cast<uint64_t>(end))},
+        {"item_size", head != BADADDR && end != BADADDR && end >= head ? Json(static_cast<uint64_t>(end - head)) : Json(nullptr)},
+        {"is_item_head", head == ea},
+        {"name", qstring_to_string(name)},
+        {"head_name", qstring_to_string(head_name)},
+        {"is_code", is_code(flags)},
+        {"is_data", is_data(flags)}
+    };
+}
+
+std::string set_name_failure_hint(ea_t ea) {
+    if (ea == BADADDR) {
+        return "address did not resolve";
+    }
+    ea_t head = get_item_head(ea);
+    if (head != BADADDR && head != ea) {
+        return "address is inside an existing IDA item; inspect item boundaries before renaming or explicitly split/undefine the item";
+    }
+    return "IDA rejected the requested name; check for invalid characters, duplicate names, or unsupported address state";
+}
+
+std::string apply_cdecl_failure_hint(ea_t ea, const std::string& decl) {
+    if (decl.empty()) {
+        return "generated declaration is empty";
+    }
+    ea_t head = get_item_head(ea);
+    if (head != BADADDR && head != ea) {
+        return "address is inside an existing IDA item; applying a type may require explicit item boundary repair";
+    }
+    return "IDA could not parse or apply the generated C declaration";
+}
+
 std::string bytes_hex(const std::vector<uint8_t>& bytes) {
     static constexpr char hex[] = "0123456789abcdef";
     std::string out;
@@ -894,7 +938,25 @@ std::string core_decompile(const Json& args) {
             text << "\n";
         }
     }
-    return "{\"found\":true,\"function\":" + function_json(function) + ",\"language\":\"c\",\"pseudocode\":" + json_string(text.str()) + "}";
+    qstring function_name_q;
+    get_func_name(&function_name_q, function->start_ea);
+    std::string function_name = qstring_to_string(function_name_q);
+    std::string pseudocode_text = text.str();
+    Json result = {
+        {"found", true},
+        {"function", Json::parse(function_json(function))},
+        {"language", "c"},
+        {"pseudocode", pseudocode_text},
+        {"warnings", Json::array()}
+    };
+    size_t first_line_end = pseudocode_text.find('\n');
+    std::string first_line = pseudocode_text.substr(0, first_line_end);
+    if (!function_name.empty() && first_line.find(function_name) == std::string::npos) {
+        result["warnings"].push_back(
+            "metadata function name does not appear in pseudocode signature; decompiler cache or function type may still contain an older name"
+        );
+    }
+    return result.dump();
 }
 
 std::string core_disasm(const Json& args) {
@@ -1086,6 +1148,12 @@ std::string make_decl_for_ea(ea_t ea, const std::string& type_text) {
     if (trimmed.find(name) != std::string::npos) {
         return trimmed + ";";
     }
+    size_t array_pos = trimmed.find('[');
+    if (array_pos != std::string::npos) {
+        std::string before_array = trim_copy(trimmed.substr(0, array_pos));
+        std::string array_suffix = trimmed.substr(array_pos);
+        return before_array + " " + name + array_suffix + ";";
+    }
     return trimmed + " " + name + ";";
 }
 
@@ -1116,9 +1184,7 @@ std::string paged_result_json(const std::vector<std::string>& rows, uint64_t off
 
 std::string core_rename(const Json& args) {
     std::vector<Json> items = json_items_arg(args, "items");
-    std::ostringstream out;
-    out << "{\"items\":[";
-    bool first = true;
+    Json rows = Json::array();
     size_t changed = 0;
     for (const auto& item : items) {
         std::string kind = json_string_arg(item, "kind");
@@ -1147,21 +1213,31 @@ std::string core_rename(const Json& args) {
                 error = "set_name failed";
             } else {
                 ++changed;
+                if (func_t* function = get_func(ea)) {
+                    mark_cfunc_dirty(function->start_ea, false);
+                }
             }
         } catch (const std::exception& ex) {
             error = ex.what();
         }
-        if (!first) out << ",";
-        first = false;
-        out << "{\"kind\":" << json_string(kind)
-            << ",\"ea\":" << json_nullable_u64(ea)
-            << ",\"new_name\":" << json_string(new_name)
-            << ",\"ok\":" << (ok ? "true" : "false");
-        if (!error.empty()) out << ",\"error\":" << json_string(error);
-        out << "}";
+        Json result = {
+            {"kind", kind},
+            {"ea", nullable_ea(ea)},
+            {"new_name", new_name},
+            {"ok", ok},
+            {"item_state", item_state_json(ea)}
+        };
+        if (!error.empty()) {
+            result["error"] = error;
+            result["hint"] = error == "set_name failed" ? set_name_failure_hint(ea) : error;
+        }
+        rows.push_back(std::move(result));
     }
-    out << "],\"count\":" << items.size() << ",\"changed_count\":" << changed << "}";
-    return out.str();
+    return Json{
+        {"items", rows},
+        {"count", items.size()},
+        {"changed_count", changed}
+    }.dump();
 }
 
 std::string core_set_comments(const Json& args) {
@@ -1201,9 +1277,7 @@ std::string core_set_comments(const Json& args) {
 
 std::string core_set_type(const Json& args) {
     std::vector<Json> items = json_items_arg(args, "items");
-    std::ostringstream out;
-    out << "{\"items\":[";
-    bool first = true;
+    Json rows = Json::array();
     size_t changed = 0;
     for (const auto& item : items) {
         std::string kind = json_string_arg(item, "kind");
@@ -1211,6 +1285,7 @@ std::string core_set_type(const Json& args) {
         ea_t ea = BADADDR;
         bool ok = false;
         std::string error;
+        std::string decl;
         try {
             ea = resolve_addr_or_name(item);
             if (kind.empty()) kind = "addr";
@@ -1224,7 +1299,7 @@ std::string core_set_type(const Json& args) {
                 }
                 ea = function->start_ea;
             }
-            std::string decl = make_decl_for_ea(ea, type_text);
+            decl = make_decl_for_ea(ea, type_text);
             if (decl.empty()) {
                 throw std::invalid_argument("type is required");
             }
@@ -1240,16 +1315,24 @@ std::string core_set_type(const Json& args) {
         } catch (const std::exception& ex) {
             error = ex.what();
         }
-        if (!first) out << ",";
-        first = false;
-        out << "{\"kind\":" << json_string(kind)
-            << ",\"ea\":" << json_nullable_u64(ea)
-            << ",\"ok\":" << (ok ? "true" : "false");
-        if (!error.empty()) out << ",\"error\":" << json_string(error);
-        out << "}";
+        Json result = {
+            {"kind", kind},
+            {"ea", nullable_ea(ea)},
+            {"ok", ok},
+            {"generated_decl", decl},
+            {"item_state", item_state_json(ea)}
+        };
+        if (!error.empty()) {
+            result["error"] = error;
+            result["hint"] = error == "apply_cdecl failed" ? apply_cdecl_failure_hint(ea, decl) : error;
+        }
+        rows.push_back(std::move(result));
     }
-    out << "],\"count\":" << items.size() << ",\"changed_count\":" << changed << "}";
-    return out.str();
+    return Json{
+        {"items", rows},
+        {"count", items.size()},
+        {"changed_count", changed}
+    }.dump();
 }
 
 std::string core_declare_type(const Json& args) {
@@ -1258,20 +1341,58 @@ std::string core_declare_type(const Json& args) {
     if (raw_decls != nullptr) {
         decls = json_list_value(*raw_decls);
     }
-    std::ostringstream input;
-    for (const auto& decl : decls) {
-        input << decl;
-        if (!decl.empty() && decl.back() != ';') {
-            input << ';';
+    Json rows = Json::array();
+    size_t changed = 0;
+    int errors = 0;
+    for (size_t index = 0; index < decls.size(); ++index) {
+        std::string normalized = trim_copy(decls[index]);
+        if (!normalized.empty() && normalized.back() != ';') {
+            normalized.push_back(';');
         }
-        input << '\n';
+        normalized.push_back('\n');
+        int item_errors = parse_decls(get_idati(), normalized.c_str(), nullptr, HTI_DCL | HTI_NWR);
+        bool item_ok = item_errors == 0;
+        if (item_ok) {
+            ++changed;
+        } else {
+            errors += item_errors;
+        }
+        Json item = {
+            {"index", index},
+            {"ok", item_ok},
+            {"errors", item_errors},
+            {"decl", decls[index]}
+        };
+        if (!item_ok) {
+            item["hint"] = "IDA failed to parse this declaration; try declaring dependent typedefs separately or remove unsupported calling-convention syntax";
+        }
+        rows.push_back(std::move(item));
     }
-    int errors = parse_decls(get_idati(), input.str().c_str(), nullptr, HTI_DCL | HTI_NWR);
     bool ok = errors == 0;
-    return std::string("{\"ok\":") + (ok ? "true" : "false")
-        + ",\"count\":" + std::to_string(decls.size())
-        + ",\"changed_count\":" + (ok ? std::to_string(decls.size()) : "0")
-        + ",\"errors\":" + std::to_string(errors) + "}";
+    return Json{
+        {"ok", ok},
+        {"count", decls.size()},
+        {"changed_count", changed},
+        {"errors", errors},
+        {"items", rows}
+    }.dump();
+}
+
+std::string core_inspect_item(const Json& args) {
+    std::vector<std::string> queries = json_list_arg(args, "queries");
+    Json rows = Json::array();
+    for (const auto& query : queries) {
+        ea_t ea = resolve_query_addr_or_name(query);
+        rows.push_back(Json{
+            {"query", query},
+            {"ea", nullable_ea(ea)},
+            {"item_state", item_state_json(ea)}
+        });
+    }
+    return Json{
+        {"items", rows},
+        {"count", queries.size()}
+    }.dump();
 }
 
 std::string core_force_recompile(const Json& args) {
@@ -1766,6 +1887,7 @@ std::string execute_core_function(IdaSessionHandleImpl* handle, const std::strin
     if (function == "set_comments") return core_set_comments(parsed_args);
     if (function == "set_type") return core_set_type(parsed_args);
     if (function == "declare_type") return core_declare_type(parsed_args);
+    if (function == "inspect_item") return core_inspect_item(parsed_args);
     if (function == "force_recompile") return core_force_recompile(parsed_args);
     if (function == "idb_save") return core_idb_save(parsed_args);
     if (function == "py_eval") return core_py_eval(parsed_args);

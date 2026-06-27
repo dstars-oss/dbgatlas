@@ -4,5 +4,6 @@
 /temp/*
 !/temp/.gitkeep
 /.codex/
+/docs/superpowers/
 *.pdb
 *.ilk

@@ -102,7 +102,9 @@ using get_strlist_qty_fn = size_t(idaapi*)();
 using get_strlist_item_fn = bool(idaapi*)(string_info_t*, size_t);
 using get_strlit_contents_fn = ssize_t(idaapi*)(qstring*, ea_t, size_t, int32, size_t*, int);
 using get_bytes_fn = ssize_t(idaapi*)(void*, ssize_t, ea_t, int, void*);
+using prev_not_tail_fn = ea_t(idaapi*)(ea_t);
 using get_item_end_fn = ea_t(idaapi*)(ea_t);
+using get_flags_ex_fn = flags64_t(idaapi*)(ea_t, int);
 using get_str_type_fn = uint32(idaapi*)(ea_t);
 using generate_disasm_line_fn = bool(idaapi*)(qstring*, ea_t, int);
 using get_cmt_fn = ssize_t(idaapi*)(qstring*, ea_t, bool);
@@ -155,7 +157,9 @@ struct IdaApis {
     get_strlist_item_fn get_strlist_item = nullptr;
     get_strlit_contents_fn get_strlit_contents = nullptr;
     get_bytes_fn get_bytes = nullptr;
+    prev_not_tail_fn prev_not_tail = nullptr;
     get_item_end_fn get_item_end = nullptr;
+    get_flags_ex_fn get_flags_ex = nullptr;
     get_str_type_fn get_str_type = nullptr;
     generate_disasm_line_fn generate_disasm_line = nullptr;
     get_cmt_fn get_cmt = nullptr;
@@ -287,7 +291,9 @@ void dbgatlas_ida_runtime_load(const std::wstring& install_dir) {
     api.get_strlist_item = bind_proc<get_strlist_item_fn>(api.ida, "ida.dll", "get_strlist_item");
     api.get_strlit_contents = bind_proc<get_strlit_contents_fn>(api.ida, "ida.dll", "get_strlit_contents");
     api.get_bytes = bind_proc<get_bytes_fn>(api.ida, "ida.dll", "get_bytes");
+    api.prev_not_tail = bind_proc<prev_not_tail_fn>(api.ida, "ida.dll", "prev_not_tail");
     api.get_item_end = bind_proc<get_item_end_fn>(api.ida, "ida.dll", "get_item_end");
+    api.get_flags_ex = bind_proc<get_flags_ex_fn>(api.ida, "ida.dll", "get_flags_ex");
     api.get_str_type = bind_proc<get_str_type_fn>(api.ida, "ida.dll", "get_str_type");
     api.generate_disasm_line = bind_proc<generate_disasm_line_fn>(api.ida, "ida.dll", "generate_disasm_line");
     api.get_cmt = bind_proc<get_cmt_fn>(api.ida, "ida.dll", "get_cmt");
@@ -346,6 +352,16 @@ void dbgatlas_term_hexrays_plugin() {
 asize_t dbgatlas_get_item_size(ea_t ea) {
     ea_t end = get_item_end(ea);
     return end > ea ? end - ea : 0;
+}
+
+idaman ea_t ida_export prev_not_tail(ea_t ea) {
+    ensure_loaded();
+    return g_api.prev_not_tail(ea);
+}
+
+idaman flags64_t ida_export get_flags_ex(ea_t ea, int how) {
+    ensure_loaded();
+    return g_api.get_flags_ex(ea, how);
 }
 
 idaman THREAD_SAFE void* ida_export qalloc(size_t size) {
