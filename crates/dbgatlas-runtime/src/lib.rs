@@ -290,6 +290,7 @@ pub struct ToolLocation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPathSource {
+    DbgAtlasInstall,
     AppStore,
     WindowsSdk,
     System32,
@@ -319,9 +320,12 @@ fn resolve_dbgeng_dir_from_roots(roots: &ToolSearchRoots) -> Option<ToolLocation
 
 fn resolve_dbgeng_dirs_from_roots(roots: &ToolSearchRoots) -> Vec<ToolLocation> {
     // 自动发现只反映当前机器状态，不写进 workspace manifest。
-    // 优先级保持为 Store WinDbg -> Windows SDK/WDK -> System32，便于新版本优先，
-    // 同时在 Store 包不可用时仍能降级到更稳定的系统/SDK 调试器。
+    // 安装态优先使用 DbgAtlas 复制出的 WinDbg runtime，避免从 WindowsApps
+    // 直接运行或注入 TTD 组件；缺失时再按 Store -> SDK/WDK -> System32 降级。
     let mut locations = Vec::new();
+    if let Some(dir) = find_dbgatlas_windbg_runtime_dir(&roots.dbgatlas_windbg_runtime_dir) {
+        push_tool_location(&mut locations, dir, ToolPathSource::DbgAtlasInstall);
+    }
     if let Some(dir) = find_store_dbgeng_dir(&roots.program_files_windows_apps) {
         push_tool_location(&mut locations, dir, ToolPathSource::AppStore);
     }
@@ -373,14 +377,20 @@ fn find_ttd_in_dir(dir: &Path) -> Option<PathBuf> {
     dir.join("TTD.exe").is_file().then(|| dir.to_path_buf())
 }
 
+fn find_dbgatlas_windbg_runtime_dir(dir: &Path) -> Option<PathBuf> {
+    find_dbgeng_in_dir(dir).filter(|dbgeng_dir| find_ttd_in_dir(&dbgeng_dir.join("ttd")).is_some())
+}
+
 fn find_store_dbgeng_dir(root: &Path) -> Option<PathBuf> {
     let mut packages = store_packages(root, "Microsoft.WinDbg");
     packages.sort();
     packages.reverse();
-    packages
-        .into_iter()
-        .find_map(|package| find_file_limited(&package, "dbgeng.dll", 4))
-        .and_then(|path| path.parent().map(Path::to_path_buf))
+    packages.into_iter().find_map(|package| {
+        find_dbgeng_in_dir(&package.join(windbg_runtime_arch())).or_else(|| {
+            find_file_limited(&package, "dbgeng.dll", 4)
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+        })
+    })
 }
 
 fn find_store_ttd_dir(root: &Path) -> Option<PathBuf> {
@@ -390,6 +400,22 @@ fn find_store_ttd_dir(root: &Path) -> Option<PathBuf> {
     packages
         .into_iter()
         .find_map(|package| find_ttd_in_dir(&package))
+}
+
+pub fn default_dbgatlas_windbg_runtime_dir() -> PathBuf {
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    program_data
+        .join("DbgAtlas")
+        .join("rt")
+        .join("windbg")
+        .join(windbg_runtime_arch())
+}
+
+pub fn resolve_store_windbg_dbgeng_dir() -> Option<PathBuf> {
+    let roots = ToolSearchRoots::default();
+    find_store_dbgeng_dir(&roots.program_files_windows_apps)
 }
 
 fn store_packages(root: &Path, prefix: &str) -> Vec<PathBuf> {
@@ -448,8 +474,19 @@ fn debugger_arch() -> &'static str {
     }
 }
 
+fn windbg_runtime_arch() -> &'static str {
+    if cfg!(target_arch = "x86") {
+        "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    }
+}
+
 #[derive(Debug)]
 struct ToolSearchRoots {
+    dbgatlas_windbg_runtime_dir: PathBuf,
     program_files_windows_apps: PathBuf,
     windows_kits_roots: Vec<PathBuf>,
     system_root: PathBuf,
@@ -479,6 +516,7 @@ impl Default for ToolSearchRoots {
         windows_kits_roots.push(program_files_x86.join("Windows Kits").join("10"));
         windows_kits_roots.push(program_files.join("Windows Kits").join("10"));
         Self {
+            dbgatlas_windbg_runtime_dir: default_dbgatlas_windbg_runtime_dir(),
             program_files_windows_apps: program_files.join("WindowsApps"),
             windows_kits_roots,
             system_root,
@@ -615,10 +653,17 @@ BAD_PROXY = "http://127.0.0.1:7897"
     #[test]
     fn resolves_dbgeng_precedence_from_store_sdk_system32() {
         let root = unique_test_dir("runtime-dbgeng-resolver");
+        let dbgatlas = root
+            .join("DbgAtlas")
+            .join("rt")
+            .join("windbg")
+            .join("amd64");
         let apps = root.join("WindowsApps");
         let sdk = root.join("Windows Kits").join("10");
         let system_root = root.join("Windows");
 
+        touch(dbgatlas.join("dbgeng.dll"));
+        touch(dbgatlas.join("ttd").join("TTD.exe"));
         touch(
             apps.join("Microsoft.WinDbg_2.0.0.0_x64__8wekyb3d8bbwe")
                 .join("amd64")
@@ -632,12 +677,13 @@ BAD_PROXY = "http://127.0.0.1:7897"
         touch(system_root.join("System32").join("dbgeng.dll"));
 
         let roots = ToolSearchRoots {
+            dbgatlas_windbg_runtime_dir: dbgatlas.clone(),
             program_files_windows_apps: apps.clone(),
             windows_kits_roots: vec![sdk.clone()],
             system_root: system_root.clone(),
         };
-        let store_location = resolve_dbgeng_dir_from_roots(&roots).unwrap();
-        assert_eq!(store_location.source, ToolPathSource::AppStore);
+        let dbgatlas_location = resolve_dbgeng_dir_from_roots(&roots).unwrap();
+        assert_eq!(dbgatlas_location.source, ToolPathSource::DbgAtlasInstall);
 
         let candidates = resolve_dbgeng_dirs_from_roots(&roots);
         assert_eq!(
@@ -646,6 +692,7 @@ BAD_PROXY = "http://127.0.0.1:7897"
                 .map(|location| location.source)
                 .collect::<Vec<_>>(),
             vec![
+                ToolPathSource::DbgAtlasInstall,
                 ToolPathSource::AppStore,
                 ToolPathSource::WindowsSdk,
                 ToolPathSource::System32,
@@ -653,6 +700,7 @@ BAD_PROXY = "http://127.0.0.1:7897"
         );
 
         let roots_without_store = ToolSearchRoots {
+            dbgatlas_windbg_runtime_dir: root.join("missing-dbgatlas-runtime"),
             program_files_windows_apps: root.join("missing-apps"),
             windows_kits_roots: vec![sdk.clone()],
             system_root: system_root.clone(),
@@ -661,6 +709,7 @@ BAD_PROXY = "http://127.0.0.1:7897"
         assert_eq!(sdk_location.source, ToolPathSource::WindowsSdk);
 
         let system32_location = resolve_dbgeng_dir_from_roots(&ToolSearchRoots {
+            dbgatlas_windbg_runtime_dir: root.join("missing-dbgatlas-runtime"),
             program_files_windows_apps: root.join("missing-apps"),
             windows_kits_roots: vec![root.join("missing-sdk")],
             system_root,
@@ -686,6 +735,7 @@ BAD_PROXY = "http://127.0.0.1:7897"
         }];
 
         let roots = ToolSearchRoots {
+            dbgatlas_windbg_runtime_dir: root.join("missing-dbgatlas-runtime"),
             program_files_windows_apps: apps.clone(),
             windows_kits_roots: Vec::new(),
             system_root: root.join("Windows"),
@@ -697,6 +747,63 @@ BAD_PROXY = "http://127.0.0.1:7897"
 
         let store_location = resolve_ttd_dir_from_roots(&[], &roots).unwrap();
         assert_eq!(store_location.source, ToolPathSource::AppStore);
+    }
+
+    #[test]
+    fn resolves_dbgatlas_runtime_dbgeng_and_ttd_together() {
+        let root = unique_test_dir("runtime-dbgatlas-runtime-resolver");
+        let dbgatlas = root
+            .join("DbgAtlas")
+            .join("rt")
+            .join("windbg")
+            .join("amd64");
+        touch(dbgatlas.join("dbgeng.dll"));
+        touch(dbgatlas.join("ttd").join("TTD.exe"));
+
+        let tools = resolve_tool_paths_from_roots(&ToolSearchRoots {
+            dbgatlas_windbg_runtime_dir: dbgatlas.clone(),
+            program_files_windows_apps: root.join("missing-apps"),
+            windows_kits_roots: Vec::new(),
+            system_root: root.join("Windows"),
+        });
+
+        assert_eq!(
+            tools.dbgeng.unwrap().source,
+            ToolPathSource::DbgAtlasInstall
+        );
+        assert_eq!(
+            tools.ttd.unwrap(),
+            ToolLocation {
+                dir: dbgatlas.join("ttd"),
+                source: ToolPathSource::DbgEngSibling,
+            }
+        );
+    }
+
+    #[test]
+    fn skips_incomplete_dbgatlas_runtime_candidate() {
+        let root = unique_test_dir("runtime-dbgatlas-incomplete-resolver");
+        let dbgatlas = root
+            .join("DbgAtlas")
+            .join("rt")
+            .join("windbg")
+            .join("amd64");
+        let apps = root.join("WindowsApps");
+        touch(dbgatlas.join("dbgeng.dll"));
+        touch(
+            apps.join("Microsoft.WinDbg_2.0.0.0_x64__8wekyb3d8bbwe")
+                .join("amd64")
+                .join("dbgeng.dll"),
+        );
+
+        let tools = resolve_tool_paths_from_roots(&ToolSearchRoots {
+            dbgatlas_windbg_runtime_dir: dbgatlas,
+            program_files_windows_apps: apps,
+            windows_kits_roots: Vec::new(),
+            system_root: root.join("Windows"),
+        });
+
+        assert_eq!(tools.dbgeng.unwrap().source, ToolPathSource::AppStore);
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

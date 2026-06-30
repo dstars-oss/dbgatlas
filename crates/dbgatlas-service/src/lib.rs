@@ -8,7 +8,9 @@ use dbgatlas_recording::{
     RecordTtd, RecordingPreset, RecordingState, RecordingTarget, StartRecording,
     TtdRecordingOptions, TtdTarget, build_ttd_args, ttd_stop_target,
 };
-use dbgatlas_runtime::RuntimeConfig;
+use dbgatlas_runtime::{
+    RuntimeConfig, default_dbgatlas_windbg_runtime_dir, resolve_store_windbg_dbgeng_dir,
+};
 use dbgatlas_worker_protocol::{
     ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
     WorkerProtocolError, WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
@@ -48,6 +50,7 @@ pub const WINDOWS_SERVICE_DESCRIPTION: &str = "DbgAtlas local debugging service"
 pub const WINDOWS_SERVICE_DIR: &str = "DbgAtlas";
 pub const WINDOWS_SERVICE_BIN_DIR: &str = "bin";
 pub const WINDOWS_SERVICE_ETC_DIR: &str = "etc";
+pub const WINDOWS_SERVICE_RT_DIR: &str = "rt";
 pub const WINDOWS_SERVICE_VAR_DIR: &str = "var";
 pub const WINDOWS_SERVICE_LOG_DIR: &str = "log";
 pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
@@ -4843,12 +4846,7 @@ fn run_ttd_stop_process(
     timeout_stop: &TtdTimeoutStop,
     worker_identity: TtdRecorderIdentity,
 ) -> TtdStopExit {
-    let args = [
-        OsString::from("-stop"),
-        timeout_stop.stop_target.clone(),
-        OsString::from("-wait"),
-        OsString::from("10"),
-    ];
+    let args = ttd_stop_args(&timeout_stop.stop_target);
     match run_ttd_command(
         ttd_exe,
         &args,
@@ -4874,6 +4872,10 @@ fn run_ttd_stop_process(
             }
         }
     }
+}
+
+fn ttd_stop_args(stop_target: &OsStr) -> Vec<OsString> {
+    vec![OsString::from("-stop"), stop_target.to_os_string()]
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6800,6 +6802,167 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), ServiceEr
     Ok(())
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct StagedWindbgRuntime {
+    source_dir: PathBuf,
+    staging_dir: PathBuf,
+    destination_dir: PathBuf,
+}
+
+#[cfg(windows)]
+fn prepare_store_windbg_runtime_staging(
+    paths: &ServiceInstallPaths,
+    suffix: &str,
+) -> Result<Option<StagedWindbgRuntime>, ServiceError> {
+    let Some(source_dir) = resolve_store_windbg_dbgeng_dir() else {
+        append_service_diagnostic_log("windbg_runtime_source_not_found");
+        return Ok(None);
+    };
+    if let Err(error) = validate_windbg_runtime_dir(&source_dir) {
+        append_service_diagnostic_log(&format!(
+            "windbg_runtime_source_incomplete source={} error={}",
+            sanitize_log_value(&source_dir.display().to_string()),
+            sanitize_log_value(&error.to_string())
+        ));
+        return Ok(None);
+    }
+    let staging_dir = paths
+        .rt_dir
+        .join("windbg")
+        .join(format!("{}.next-{suffix}", windbg_runtime_arch()));
+    stage_windbg_runtime_from_source(&source_dir, &paths.windbg_runtime_dir, &staging_dir).map(Some)
+}
+
+#[cfg(windows)]
+fn stage_windbg_runtime_from_source(
+    source_dir: &Path,
+    destination_dir: &Path,
+    staging_dir: &Path,
+) -> Result<StagedWindbgRuntime, ServiceError> {
+    if staging_dir.exists() {
+        fs::remove_dir_all(staging_dir)?;
+    }
+    if let Some(parent) = staging_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    copy_dir_recursive(source_dir, staging_dir)?;
+    validate_windbg_runtime_dir(staging_dir)?;
+    fs::write(
+        staging_dir.join(".dbgatlas-runtime-source"),
+        source_dir.display().to_string(),
+    )?;
+    append_service_diagnostic_log(&format!(
+        "windbg_runtime_staged source={} staging={}",
+        sanitize_log_value(&source_dir.display().to_string()),
+        sanitize_log_value(&staging_dir.display().to_string())
+    ));
+    Ok(StagedWindbgRuntime {
+        source_dir: source_dir.to_path_buf(),
+        staging_dir: staging_dir.to_path_buf(),
+        destination_dir: destination_dir.to_path_buf(),
+    })
+}
+
+#[cfg(windows)]
+fn activate_staged_windbg_runtime(
+    staged: &StagedWindbgRuntime,
+    suffix: &str,
+) -> Result<(), ServiceError> {
+    validate_windbg_runtime_dir(&staged.staging_dir)?;
+    let parent = staged.destination_dir.parent().ok_or_else(|| {
+        ServiceError::ServiceControl(format!(
+            "WinDbg runtime destination has no parent: {}",
+            staged.destination_dir.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    let old_dir = parent.join(format!("{}.old-{suffix}", windbg_runtime_arch()));
+    if old_dir.exists() {
+        fs::remove_dir_all(&old_dir)?;
+    }
+    if staged.destination_dir.exists() {
+        fs::rename(&staged.destination_dir, &old_dir)?;
+    }
+    match fs::rename(&staged.staging_dir, &staged.destination_dir) {
+        Ok(()) => {
+            if old_dir.exists() {
+                fs::remove_dir_all(&old_dir)?;
+            }
+            append_service_diagnostic_log(&format!(
+                "windbg_runtime_activated source={} destination={}",
+                sanitize_log_value(&staged.source_dir.display().to_string()),
+                sanitize_log_value(&staged.destination_dir.display().to_string())
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            if old_dir.exists() && !staged.destination_dir.exists() {
+                let _ = fs::rename(&old_dir, &staged.destination_dir);
+            }
+            Err(error.into())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_windbg_runtime_dir(dir: &Path) -> Result<(), ServiceError> {
+    let required: &[&[&str]] = &[
+        &["dbgeng.dll"],
+        &["dbghelp.dll"],
+        &["dbgmodel.dll"],
+        &["ttd", "TTD.exe"],
+        &["ttd", "TTDInject.exe"],
+        &["ttd", "TTDLoader.dll"],
+        &["ttd", "TTDRecord.dll"],
+        &["ttd", "TTDRecordCPU.dll"],
+        &["ttd", "TTDReplay.dll"],
+        &["ttd", "TTDReplayCPU.dll"],
+    ];
+    let missing = required
+        .iter()
+        .map(|parts| {
+            parts
+                .iter()
+                .fold(dir.to_path_buf(), |path, part| path.join(part))
+        })
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(ServiceError::ServiceControl(format!(
+            "WinDbg runtime is incomplete under {}: missing {}",
+            dir.display(),
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_windbg_runtime_update_dirs(paths: &ServiceInstallPaths) -> Result<(), ServiceError> {
+    let windbg_dir = paths.rt_dir.join("windbg");
+    if !windbg_dir.is_dir() {
+        return Ok(());
+    }
+    let next_prefix = format!("{}.next-", windbg_runtime_arch());
+    let old_prefix = format!("{}.old-", windbg_runtime_arch());
+    for entry in fs::read_dir(&windbg_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if name.starts_with(&next_prefix) || name.starts_with(&old_prefix) {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
 fn spawn_worker_process(
     worker_exe: &Path,
     pipe_name: &str,
@@ -6884,6 +7047,8 @@ pub struct ServiceInstallPaths {
     pub bin_dir: PathBuf,
     pub staging_bin_dir: PathBuf,
     pub etc_dir: PathBuf,
+    pub rt_dir: PathBuf,
+    pub windbg_runtime_dir: PathBuf,
     pub var_dir: PathBuf,
     pub log_dir: PathBuf,
     pub config_path: PathBuf,
@@ -6895,6 +7060,7 @@ impl ServiceInstallPaths {
     pub fn for_root(root_dir: PathBuf) -> Self {
         let bin_dir = root_dir.join(WINDOWS_SERVICE_BIN_DIR);
         let etc_dir = root_dir.join(WINDOWS_SERVICE_ETC_DIR);
+        let rt_dir = root_dir.join(WINDOWS_SERVICE_RT_DIR);
         let var_dir = root_dir.join(WINDOWS_SERVICE_VAR_DIR);
         let log_dir = var_dir.join(WINDOWS_SERVICE_LOG_DIR);
         Self {
@@ -6902,8 +7068,10 @@ impl ServiceInstallPaths {
             config_path: etc_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
             token_file: etc_dir.join(WINDOWS_SERVICE_TOKEN_FILE),
             installed_exe: bin_dir.join("dbgatlas.exe"),
+            windbg_runtime_dir: rt_dir.join("windbg").join(windbg_runtime_arch()),
             bin_dir,
             etc_dir,
+            rt_dir,
             var_dir,
             log_dir,
             root_dir,
@@ -7004,7 +7172,22 @@ pub fn default_windows_service_paths() -> ServiceInstallPaths {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join(WINDOWS_SERVICE_DIR);
-    ServiceInstallPaths::for_root(root)
+    let paths = ServiceInstallPaths::for_root(root);
+    debug_assert_eq!(
+        paths.windbg_runtime_dir,
+        default_dbgatlas_windbg_runtime_dir()
+    );
+    paths
+}
+
+fn windbg_runtime_arch() -> &'static str {
+    if cfg!(target_arch = "x86") {
+        "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    }
 }
 
 pub fn discover_service_payload(
@@ -7573,7 +7756,12 @@ mod windows_service_control {
         prepare_install_layout(&paths)?;
         let runtime = create_runtime_config_if_missing(&paths, options.bind)?;
         ensure_token_file(&paths.token_file)?;
+        let suffix = update_dir_suffix();
+        let windbg_runtime = prepare_store_windbg_runtime_staging(&paths, &suffix)?;
         install_payload(&payload, &paths)?;
+        if let Some(windbg_runtime) = &windbg_runtime {
+            activate_staged_windbg_runtime(windbg_runtime, &suffix)?;
+        }
         create_or_update_service(&manager, &paths)?;
 
         Ok(result(
@@ -7719,6 +7907,7 @@ mod windows_service_control {
             prepared.config_payload.is_some()
         ));
         copy_update_payload_to_staging(&prepared.bin_payload, &staging_dir)?;
+        let windbg_runtime = prepare_store_windbg_runtime_staging(&paths, &suffix)?;
         let staged_config_payload = prepared
             .config_payload
             .as_ref()
@@ -7754,6 +7943,13 @@ mod windows_service_control {
             "service payload replaced; previous bin at {}",
             old_dir.display()
         ));
+        if let Some(windbg_runtime) = &windbg_runtime {
+            activate_staged_windbg_runtime(windbg_runtime, &suffix)?;
+            append_service_log(&format!(
+                "service WinDbg runtime refreshed at {}",
+                windbg_runtime.destination_dir.display()
+            ));
+        }
 
         if options.restart {
             start_service_with_timeout(&service, remaining_update_timeout(deadline)?)?;
@@ -7764,6 +7960,9 @@ mod windows_service_control {
 
         if let Err(error) = cleanup_update_dirs(&paths) {
             append_service_log(&format!("service update cleanup failed: {error}"));
+        }
+        if let Err(error) = cleanup_windbg_runtime_update_dirs(&paths) {
+            append_service_log(&format!("WinDbg runtime update cleanup failed: {error}"));
         }
 
         Ok(result(
@@ -8059,6 +8258,9 @@ mod windows_service_control {
         }
         if paths.staging_bin_dir.exists() {
             fs::remove_dir_all(&paths.staging_bin_dir)?;
+        }
+        if paths.rt_dir.exists() {
+            fs::remove_dir_all(&paths.rt_dir)?;
         }
         if purge && paths.root_dir.exists() {
             fs::remove_dir_all(&paths.root_dir)?;
@@ -10913,7 +11115,9 @@ mod windows_active_user_process {
     use std::path::Path;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_FAILED};
     use windows_sys::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary,
+        DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ALL_ACCESS,
+        TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeLimited,
+        TokenLinkedToken, TokenPrimary,
     };
     use windows_sys::Win32::System::Environment::{
         CreateEnvironmentBlock, DestroyEnvironmentBlock,
@@ -11110,24 +11314,7 @@ mod windows_active_user_process {
         }
         let impersonation_token = Handle::new(impersonation_token);
 
-        let mut primary_token = std::ptr::null_mut();
-        let ok = unsafe {
-            DuplicateTokenEx(
-                impersonation_token.raw(),
-                TOKEN_ALL_ACCESS,
-                std::ptr::null(),
-                SecurityImpersonation,
-                TokenPrimary,
-                &mut primary_token,
-            )
-        };
-        if ok == 0 {
-            return Err(ServiceError::Worker(format!(
-                "DuplicateTokenEx for active interactive session {session_id} failed: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        let primary_token = Handle::new(primary_token);
+        let primary_token = primary_token_for_active_session(&impersonation_token, session_id)?;
         let environment = EnvironmentBlock::create(primary_token.raw())?;
 
         let mut command_line = command_line(executable.as_os_str(), args);
@@ -11169,6 +11356,89 @@ mod windows_active_user_process {
             exit_code: None,
             waited: false,
         })
+    }
+
+    fn primary_token_for_active_session(
+        user_token: &Handle,
+        session_id: u32,
+    ) -> Result<Handle, ServiceError> {
+        if token_elevation_type(user_token.raw(), session_id)? == TokenElevationTypeLimited {
+            let linked_token = linked_elevated_token(user_token.raw(), session_id)?;
+            return duplicate_primary_token(
+                linked_token.raw(),
+                &format!("elevated linked token for active interactive session {session_id}"),
+            );
+        }
+        duplicate_primary_token(
+            user_token.raw(),
+            &format!("active interactive session {session_id}"),
+        )
+    }
+
+    fn token_elevation_type(
+        token: HANDLE,
+        session_id: u32,
+    ) -> Result<TOKEN_ELEVATION_TYPE, ServiceError> {
+        let mut elevation_type: TOKEN_ELEVATION_TYPE = 0;
+        let mut return_length = 0;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevationType,
+                &mut elevation_type as *mut _ as *mut c_void,
+                std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+                &mut return_length,
+            )
+        };
+        if ok == 0 {
+            return Err(ServiceError::Worker(format!(
+                "GetTokenInformation(TokenElevationType) for active interactive session {session_id} failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(elevation_type)
+    }
+
+    fn linked_elevated_token(token: HANDLE, session_id: u32) -> Result<Handle, ServiceError> {
+        let mut linked: TOKEN_LINKED_TOKEN = unsafe { std::mem::zeroed() };
+        let mut return_length = 0;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenLinkedToken,
+                &mut linked as *mut _ as *mut c_void,
+                std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut return_length,
+            )
+        };
+        if ok == 0 {
+            return Err(ServiceError::Worker(format!(
+                "GetTokenInformation(TokenLinkedToken) for active interactive session {session_id} failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(Handle::new(linked.LinkedToken))
+    }
+
+    fn duplicate_primary_token(token: HANDLE, context: &str) -> Result<Handle, ServiceError> {
+        let mut primary_token = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateTokenEx(
+                token,
+                TOKEN_ALL_ACCESS,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut primary_token,
+            )
+        };
+        if ok == 0 {
+            return Err(ServiceError::Worker(format!(
+                "DuplicateTokenEx for {context} failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(Handle::new(primary_token))
     }
 
     fn command_line<'a, I>(executable: &OsStr, args: I) -> Vec<u16>
@@ -11368,6 +11638,11 @@ mod tests {
         assert_eq!(paths.root_dir, root);
         assert_eq!(paths.bin_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\bin"));
         assert_eq!(paths.etc_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\etc"));
+        assert_eq!(paths.rt_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\rt"));
+        assert_eq!(
+            paths.windbg_runtime_dir,
+            PathBuf::from(r"C:\ProgramData\DbgAtlas\rt\windbg").join(windbg_runtime_arch())
+        );
         assert_eq!(paths.var_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\var"));
         assert_eq!(
             paths.log_dir,
@@ -12178,6 +12453,83 @@ allow_py_eval = true
         )
         .unwrap();
         assert_eq!(system[0], source);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windbg_runtime_staging_activates_dbgeng_and_ttd_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        let source = temp
+            .path()
+            .join("WindowsApps")
+            .join("Microsoft.WinDbg_1.0.0.0_x64__8wekyb3d8bbwe")
+            .join("amd64");
+        write_complete_windbg_runtime(&source);
+        let staging = paths
+            .rt_dir
+            .join("windbg")
+            .join(format!("{}.next-test", windbg_runtime_arch()));
+
+        let staged =
+            stage_windbg_runtime_from_source(&source, &paths.windbg_runtime_dir, &staging).unwrap();
+        assert!(staged.staging_dir.join("dbgeng.dll").is_file());
+        assert!(
+            staged
+                .staging_dir
+                .join("ttd")
+                .join("TTDRecordCPU.dll")
+                .is_file()
+        );
+
+        activate_staged_windbg_runtime(&staged, "test").unwrap();
+
+        assert!(paths.windbg_runtime_dir.join("dbgeng.dll").is_file());
+        assert!(
+            paths
+                .windbg_runtime_dir
+                .join("ttd")
+                .join("TTD.exe")
+                .is_file()
+        );
+        assert!(!staging.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windbg_runtime_validation_requires_ttd_recorder_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("amd64");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("dbgeng.dll"), b"dbgeng").unwrap();
+
+        let error = validate_windbg_runtime_dir(&source).unwrap_err();
+
+        assert!(error.to_string().contains("TTD.exe"));
+        assert!(error.to_string().contains("TTDRecordCPU.dll"));
+    }
+
+    #[cfg(windows)]
+    fn write_complete_windbg_runtime(root: &Path) {
+        fs::create_dir_all(root.join("ttd")).unwrap();
+        let required: &[&[&str]] = &[
+            &["dbgeng.dll"],
+            &["dbghelp.dll"],
+            &["dbgmodel.dll"],
+            &["ttd", "TTD.exe"],
+            &["ttd", "TTDInject.exe"],
+            &["ttd", "TTDLoader.dll"],
+            &["ttd", "TTDRecord.dll"],
+            &["ttd", "TTDRecordCPU.dll"],
+            &["ttd", "TTDReplay.dll"],
+            &["ttd", "TTDReplayCPU.dll"],
+        ];
+        for relative in required {
+            let path = relative
+                .iter()
+                .fold(root.to_path_buf(), |path, part| path.join(part));
+            fs::write(path, b"runtime").unwrap();
+        }
     }
 
     #[test]
@@ -13747,6 +14099,16 @@ allow_py_eval = true
             &text[separator + 1..],
             ["-out", r"C:\case\traces", "-attach", "4242"]
         );
+    }
+
+    #[test]
+    fn ttd_timeout_stop_args_do_not_mix_stop_and_wait() {
+        let args = ttd_stop_args(OsStr::new("4242"))
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, ["-stop", "4242"]);
     }
 
     #[test]
