@@ -35,38 +35,38 @@ analysis-workspace/
 - `proxy`
 - `server.bind`
 
-安装态 Windows service 使用 `%ProgramData%\DbgAtlas\` 作为机器级 install root：
+安装态 Windows service 默认使用当前用户 Local Programs 下的显式 install root；安装器或提权脚本应把该路径传给 `dbgatlas service install --install-root`，避免 LocalSystem / elevated 进程重新推导 `%LOCALAPPDATA%`：
 
 ```text
-%ProgramData%\DbgAtlas\
+%LOCALAPPDATA%\Programs\dbgatlas\
   bin\                  # installed runtime payload
     dbgatlas.exe
     dbgatlas-worker.exe
     dbgatlas_dbgeng.dll
     dbgatlas_etw.dll
     dbgatlas_ida.dll
+    rt\
+      windbg\
+        amd64\          # copied Store WinDbg runtime: dbgeng + ttd
   etc\
     runtime.toml        # runtime config
     token               # machine-local bearer token
-  rt\
-    windbg\
-      amd64\            # copied Store WinDbg runtime: dbgeng + ttd
   var\
     log\
       service-YYYY-MM-DD.log
 ```
 
-SCM 注册的 `DbgAtlas` service 指向 `%ProgramData%\DbgAtlas\bin\dbgatlas.exe`，不指向开发目录下的 `target\debug` 或 `target\release`。`dbgatlas service install` 从当前 executable 所在目录复制 runtime payload，并在发现完整 Store WinDbg runtime 时复制其 `amd64` 目录到 `rt\windbg\amd64`，使 TTD recorder/replay 从普通 Win32 路径加载匹配的 `dbgeng` 和 `ttd` 组件；若发现旧布局中的 `%ProgramData%\DbgAtlas\runtime.toml` 或 `%ProgramData%\DbgAtlas\token`，会迁移到 `etc\`。`dbgatlas service uninstall` 默认删除 `bin\`、`rt\` 和 SCM entry，保留 `etc\` 与 `var\log\`，`--purge` 才删除整个 install root。
+SCM 注册的 `DbgAtlas` service 指向 `<install-root>\bin\dbgatlas.exe`，不指向开发目录下的 `target\debug` 或 `target\release`。`dbgatlas service install` 支持 `--payload-mode copy` 和 `--payload-mode use-existing`：前者从 `--payload-dir` 复制 payload 到 `<install-root>\bin`，后者只验证 `<install-root>\bin` 中已有完整 payload，不覆盖文件。安装时发现完整 Store WinDbg runtime 会复制到 `bin\rt\windbg\<arch>`，使 TTD recorder/replay 从普通 Win32 路径加载匹配的 `dbgeng` 和 `ttd` 组件；若发现旧 `%ProgramData%\DbgAtlas\etc\` 或旧根目录下的 `runtime.toml` / `token`，新 `etc\` 缺失对应文件时会复制迁移。`dbgatlas service uninstall` 默认只移除 SCM entry 并保留 install root；`--purge` 才删除整个 install root。
 
-安装态 service 还暴露 `service.update` JSON-RPC/MCP 方法，接收一个已经构建好的 payload 目录。该方法只完成校验并启动独立 updater 进程，然后异步返回 accepted；updater 会先复制到 `bin.next-*`，并在停服务前把完整 Store WinDbg runtime 复制到 `rt\windbg\<arch>.next-*` staging，停止服务后使用 rename 将旧 `bin` 移到 `bin.old-*` 并把新 payload 放到 `bin`，同时将成功 staging 的 WinDbg runtime 切换到 `rt\windbg\<arch>`，最后按请求重启服务并 best-effort 清理旧目录。payload 根目录的 `runtime.toml` 或 `etc/runtime.toml` 会在校验通过后覆盖安装态 `etc/runtime.toml`；payload 中的 `token` 不会复制，安装态 token 始终保留。payload `runtime.toml` 本身也不得包含 `token` / `token_file` / `bearer_token` 等 token 字段。更新结果写入 service 日志。
+安装态 service 还暴露 `service.update` JSON-RPC/MCP 方法，接收一个已经构建好的 payload 目录。该方法只完成校验并启动独立 updater 进程，然后异步返回 accepted；updater 会先复制到 `bin.next-*`，并在停服务前把 Store 或现有 DbgAtlas WinDbg runtime 放入 `bin.next-*\rt\windbg\<arch>`，停止服务后使用 rename 将旧 `bin` 移到 `bin.old-*` 并把新 payload 放到 `bin`，最后按请求重启服务并 best-effort 清理旧目录。payload 根目录的 `runtime.toml` 或 `etc/runtime.toml` 会在校验通过后覆盖安装态 `etc/runtime.toml`；payload 中的 `token` 不会复制，安装态 token 始终保留。payload `runtime.toml` 本身也不得包含 `token` / `token_file` / `bearer_token` 等 token 字段。更新结果写入 service 日志。
 
-`service.update` 排障优先看 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`：`accepted service.update` 表示请求已通过校验并启动 updater；`starting service apply-update` 表示子进程开始 staged 替换；残留 `bin.next-*` 多半表示替换前中断，残留 `bin.old-*` 表示新 payload 已经接管但清理失败或被占用；残留 `rt\windbg\<arch>.next-*` / `<arch>.old-*` 表示 WinDbg runtime 切换或清理阶段中断。日志确认后再调用 `dbgatlas --json service health` 检查重启后的 HTTP/RPC/MCP endpoint。
+`service.update` 排障优先看 `<install-root>\var\log\service-YYYY-MM-DD.log`：`accepted service.update` 表示请求已通过校验并启动 updater；`starting service apply-update` 表示子进程开始 staged 替换；残留 `bin.next-*` 多半表示替换前中断，残留 `bin.old-*` 表示新 payload 已经接管但清理失败或被占用。日志确认后再调用 `dbgatlas --json service health` 检查重启后的 HTTP/RPC/MCP endpoint。
 
-安装态 service 日志写入 `%ProgramData%\DbgAtlas\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
+安装态 service 日志写入 `<install-root>\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 
-开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 `%ProgramData%`。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。开发态如需暴露高权限 IDAPython 执行能力，必须显式传入 `--allow-ida-py-eval`。
+开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 install root。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。开发态如需暴露高权限 IDAPython 执行能力，必须显式传入 `--allow-ida-py-eval`。
 
-DbgEng / TTD 路径解析不读取 runtime config 或环境变量中的本地安装路径。安装态 debug worker 默认使用 LocalSystem，由运行时按当前机器状态自动发现候选，避免把 Store WinDbg 的版本化 WindowsApps 路径写死到 `runtime.toml`。当安装/更新阶段成功复制 Store WinDbg runtime 后，运行时会优先使用 `%ProgramData%\DbgAtlas\rt\windbg\<arch>`，因此相关 DbgEng 候选和 TTD recorder 目录会一起切换到 DbgAtlas 受控目录。当 `.run` replay、用户目录 dump 或 live launch 需要交互用户权限时，调用方可在 `debug.session.create` 传入 `worker_identity: "active_interactive_user"`；如果当前交互用户是 UAC split admin，active interactive worker 会优先使用 linked elevated token。TTD `.run` replay 的 target 仍使用 `{ "kind": "file", "path": "trace.run" }`。
+DbgEng / TTD 路径解析不读取 runtime config 或环境变量中的本地安装路径。安装态 debug worker 默认使用 LocalSystem，由 service 启动参数中的 install root 显式解析 DbgAtlas 受控 runtime，并按当前机器状态自动发现候选，避免把 Store WinDbg 的版本化 WindowsApps 路径写死到 `runtime.toml`。当安装/更新阶段成功复制 Store WinDbg runtime 后，运行时会优先使用 `<install-root>\bin\rt\windbg\<arch>`，因此相关 DbgEng 候选和 TTD recorder 目录会一起切换到 DbgAtlas 受控目录。当 `.run` replay、用户目录 dump 或 live launch 需要交互用户权限时，调用方可在 `debug.session.create` 传入 `worker_identity: "active_interactive_user"`；如果当前交互用户是 UAC split admin，active interactive worker 会优先使用 linked elevated token。TTD `.run` replay 的 target 仍使用 `{ "kind": "file", "path": "trace.run" }`。
 
 - DbgEng：DbgAtlas copied WinDbg runtime -> Store WinDbg -> Windows Kits / WDK Debuggers -> System32。
 - TTD：按 DbgEng 候选顺序查找 `<dbgeng_dir>\ttd` -> Store TimeTravelDebugging。
@@ -92,7 +92,7 @@ recording policy 的文档目标：
 ## 校验原则
 
 - 本地服务默认只绑定 loopback。
-- 安装态服务配置和机器级 bearer token 默认属于 `%ProgramData%\DbgAtlas\etc\`。
+- 安装态服务配置和机器级 bearer token 默认属于 `<install-root>\etc\`。
 - 安装态 bearer token 不进入 `runtime.toml`，CLI 普通输出不显示 token 内容。
 - 对外 HTTP API（包括 `/rpc` 和 `/mcp`）需要 bearer token，并校验来自浏览器类客户端的 `Origin`。
 - path、symbol path、proxy value 拒绝控制字符。

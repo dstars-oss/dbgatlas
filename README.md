@@ -13,7 +13,7 @@ Current implementation includes:
 - Controlled artifact helpers for debug sessions and reserved recording/reverse artifact layouts.
 - A C++20 DbgEng native DLL with adapter-specific C ABI for opening DbgEng files (`.dmp`, `.run`), attach process, raw command execution, session symbol path append, and virtual memory reads.
 - CLI commands for workspace initialization, workspace inspection, service dev mode, and debug session workflows.
-- Windows Service lifecycle commands that install an isolated runtime payload under `%ProgramData%\DbgAtlas\bin\`, machine config under `etc\`, and service logs under `var\log\`.
+- Windows Service lifecycle commands that install or use an isolated runtime payload under `%LOCALAPPDATA%\Programs\dbgatlas\bin\`, machine config under `etc\`, and service logs under `var\log\`.
 
 Useful commands:
 
@@ -26,12 +26,13 @@ cargo run -p dbgatlas-cli -- native version
 cargo run -p dbgatlas-cli -- service run --bind 127.0.0.1:7331 --token dev-token
 .\script\build-release-install.ps1
 .\script\build-release-install.ps1 -BuildOnly
-dbgatlas service install
-dbgatlas service start
+$installRoot = "$env:LOCALAPPDATA\Programs\dbgatlas"
+dbgatlas service install --install-root $installRoot --payload-mode copy --payload-dir .\target\release
+dbgatlas service start --install-root $installRoot
 dbgatlas service health
-dbgatlas service status --json
-dbgatlas service stop
-dbgatlas service uninstall
+dbgatlas service status --install-root $installRoot --json
+dbgatlas service stop --install-root $installRoot
+dbgatlas service uninstall --install-root $installRoot
 cargo run -p dbgatlas-cli -- debug session create --project-root .\scratch-project --file .\sample.dmp
 cargo run -p dbgatlas-cli -- debug session create --project-root .\scratch-project --file .\trace.run
 cargo run -p dbgatlas-cli -- debug eval <session-id> ".echo hello"

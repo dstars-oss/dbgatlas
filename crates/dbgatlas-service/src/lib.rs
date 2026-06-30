@@ -8,9 +8,7 @@ use dbgatlas_recording::{
     RecordTtd, RecordingPreset, RecordingState, RecordingTarget, StartRecording,
     TtdRecordingOptions, TtdTarget, build_ttd_args, ttd_stop_target,
 };
-use dbgatlas_runtime::{
-    RuntimeConfig, default_dbgatlas_windbg_runtime_dir, resolve_store_windbg_dbgeng_dir,
-};
+use dbgatlas_runtime::{RuntimeConfig, resolve_store_windbg_dbgeng_dir};
 use dbgatlas_worker_protocol::{
     ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
     WorkerProtocolError, WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
@@ -33,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -47,7 +45,7 @@ const DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS: u64 = 5_000;
 pub const WINDOWS_SERVICE_NAME: &str = "DbgAtlas";
 pub const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DbgAtlas Service";
 pub const WINDOWS_SERVICE_DESCRIPTION: &str = "DbgAtlas local debugging service";
-pub const WINDOWS_SERVICE_DIR: &str = "DbgAtlas";
+pub const WINDOWS_SERVICE_DIR: &str = "dbgatlas";
 pub const WINDOWS_SERVICE_BIN_DIR: &str = "bin";
 pub const WINDOWS_SERVICE_ETC_DIR: &str = "etc";
 pub const WINDOWS_SERVICE_RT_DIR: &str = "rt";
@@ -55,6 +53,7 @@ pub const WINDOWS_SERVICE_VAR_DIR: &str = "var";
 pub const WINDOWS_SERVICE_LOG_DIR: &str = "log";
 pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
 pub const WINDOWS_SERVICE_TOKEN_FILE: &str = "token";
+pub const WINDOWS_SERVICE_INSTALL_MARKER_FILE: &str = ".dbgatlas-install-root";
 pub const WINDOWS_SERVICE_LOG_RETENTION_DAYS: i64 = 7;
 pub const DEFAULT_SERVICE_UPDATE_TIMEOUT_MS: u64 = 60_000;
 pub const SERVICE_UPDATE_DELAY_MS: u64 = 500;
@@ -78,6 +77,7 @@ static RECORDING_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(1);
 static WORKER_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SERVICE_INSTALL_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -3494,6 +3494,22 @@ impl ServiceHost {
 impl ServiceCapabilities {
     pub fn from_runtime_config(runtime: &RuntimeConfig) -> Self {
         let tools = runtime.resolve_tool_paths();
+        Self::from_runtime_config_and_resolved_tools(runtime, tools)
+    }
+
+    pub fn from_runtime_config_with_install_paths(
+        runtime: &RuntimeConfig,
+        paths: &ServiceInstallPaths,
+    ) -> Self {
+        let tools =
+            runtime.resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(&paths.windbg_runtime_dir);
+        Self::from_runtime_config_and_resolved_tools(runtime, tools)
+    }
+
+    fn from_runtime_config_and_resolved_tools(
+        runtime: &RuntimeConfig,
+        tools: dbgatlas_runtime::ResolvedToolPaths,
+    ) -> Self {
         Self {
             ida_py_eval: runtime.tools.ida.allow_py_eval,
             dbgeng_dirs: tools
@@ -6803,6 +6819,67 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), ServiceEr
 }
 
 #[cfg(windows)]
+fn windbg_runtime_source_candidates(paths: &ServiceInstallPaths) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    push_unique_path(&mut candidates, paths.windbg_runtime_dir.clone());
+    push_unique_path(&mut candidates, paths.legacy_windbg_runtime_dir());
+    candidates
+}
+
+#[cfg(windows)]
+fn append_windbg_runtime_source_candidates(
+    candidates: &mut Vec<PathBuf>,
+    paths: &ServiceInstallPaths,
+) {
+    for candidate in windbg_runtime_source_candidates(paths) {
+        push_unique_path(candidates, candidate);
+    }
+}
+
+#[cfg(windows)]
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(windows)]
+fn copy_existing_windbg_runtime_to_destination(
+    candidates: &[PathBuf],
+    destination_dir: &Path,
+) -> Result<Option<PathBuf>, ServiceError> {
+    for source_dir in candidates {
+        if source_dir == destination_dir || !source_dir.is_dir() {
+            continue;
+        }
+        if destination_dir.exists() {
+            fs::remove_dir_all(destination_dir)?;
+        }
+        copy_dir_recursive(source_dir, destination_dir)?;
+        match validate_windbg_runtime_dir(destination_dir) {
+            Ok(()) => {
+                append_service_diagnostic_log(&format!(
+                    "windbg_runtime_preserved source={} destination={}",
+                    sanitize_log_value(&source_dir.display().to_string()),
+                    sanitize_log_value(&destination_dir.display().to_string())
+                ));
+                return Ok(Some(source_dir.clone()));
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(destination_dir);
+                append_service_diagnostic_log(&format!(
+                    "windbg_runtime_preserve_incomplete source={} destination={} error={}",
+                    sanitize_log_value(&source_dir.display().to_string()),
+                    sanitize_log_value(&destination_dir.display().to_string()),
+                    sanitize_log_value(&error.to_string())
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
 #[derive(Debug)]
 struct StagedWindbgRuntime {
     source_dir: PathBuf,
@@ -6813,6 +6890,14 @@ struct StagedWindbgRuntime {
 #[cfg(windows)]
 fn prepare_store_windbg_runtime_staging(
     paths: &ServiceInstallPaths,
+    suffix: &str,
+) -> Result<Option<StagedWindbgRuntime>, ServiceError> {
+    prepare_store_windbg_runtime_staging_for_destination(&paths.windbg_runtime_dir, suffix)
+}
+
+#[cfg(windows)]
+fn prepare_store_windbg_runtime_staging_for_destination(
+    destination_dir: &Path,
     suffix: &str,
 ) -> Result<Option<StagedWindbgRuntime>, ServiceError> {
     let Some(source_dir) = resolve_store_windbg_dbgeng_dir() else {
@@ -6827,11 +6912,37 @@ fn prepare_store_windbg_runtime_staging(
         ));
         return Ok(None);
     }
-    let staging_dir = paths
-        .rt_dir
+    let parent = destination_dir.parent().ok_or_else(|| {
+        ServiceError::ServiceControl(format!(
+            "WinDbg runtime destination has no parent: {}",
+            destination_dir.display()
+        ))
+    })?;
+    let staging_dir = parent.join(format!("{}.next-{suffix}", windbg_runtime_arch()));
+    stage_windbg_runtime_from_source(&source_dir, destination_dir, &staging_dir).map(Some)
+}
+
+#[cfg(windows)]
+fn prepare_update_windbg_runtime_in_staging(
+    paths: &ServiceInstallPaths,
+    staging_bin_dir: &Path,
+    suffix: &str,
+) -> Result<Option<PathBuf>, ServiceError> {
+    let destination_dir = staging_bin_dir
+        .join(WINDOWS_SERVICE_RT_DIR)
         .join("windbg")
-        .join(format!("{}.next-{suffix}", windbg_runtime_arch()));
-    stage_windbg_runtime_from_source(&source_dir, &paths.windbg_runtime_dir, &staging_dir).map(Some)
+        .join(windbg_runtime_arch());
+    if let Some(staged) =
+        prepare_store_windbg_runtime_staging_for_destination(&destination_dir, suffix)?
+    {
+        activate_staged_windbg_runtime(&staged, suffix)?;
+        return Ok(Some(destination_dir));
+    }
+    let candidates = windbg_runtime_source_candidates(paths);
+    if copy_existing_windbg_runtime_to_destination(&candidates, &destination_dir)?.is_some() {
+        return Ok(Some(destination_dir));
+    }
+    Ok(None)
 }
 
 #[cfg(windows)]
@@ -7060,7 +7171,7 @@ impl ServiceInstallPaths {
     pub fn for_root(root_dir: PathBuf) -> Self {
         let bin_dir = root_dir.join(WINDOWS_SERVICE_BIN_DIR);
         let etc_dir = root_dir.join(WINDOWS_SERVICE_ETC_DIR);
-        let rt_dir = root_dir.join(WINDOWS_SERVICE_RT_DIR);
+        let rt_dir = bin_dir.join(WINDOWS_SERVICE_RT_DIR);
         let var_dir = root_dir.join(WINDOWS_SERVICE_VAR_DIR);
         let log_dir = var_dir.join(WINDOWS_SERVICE_LOG_DIR);
         Self {
@@ -7085,6 +7196,20 @@ impl ServiceInstallPaths {
     pub fn legacy_token_file(&self) -> PathBuf {
         self.root_dir.join(WINDOWS_SERVICE_TOKEN_FILE)
     }
+
+    pub fn legacy_rt_dir(&self) -> PathBuf {
+        self.root_dir.join(WINDOWS_SERVICE_RT_DIR)
+    }
+
+    pub fn legacy_windbg_runtime_dir(&self) -> PathBuf {
+        self.legacy_rt_dir()
+            .join("windbg")
+            .join(windbg_runtime_arch())
+    }
+
+    pub fn install_marker_path(&self) -> PathBuf {
+        self.root_dir.join(WINDOWS_SERVICE_INSTALL_MARKER_FILE)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7094,8 +7219,23 @@ pub struct ServicePayloadFile {
     pub destination: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsServicePayloadMode {
+    Copy,
+    UseExisting,
+}
+
+impl Default for WindowsServicePayloadMode {
+    fn default() -> Self {
+        Self::Copy
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowsServiceInstallOptions {
+    pub install_root: Option<PathBuf>,
+    pub payload_dir: Option<PathBuf>,
+    pub payload_mode: WindowsServicePayloadMode,
     pub bind: SocketAddr,
     pub force: bool,
 }
@@ -7103,6 +7243,9 @@ pub struct WindowsServiceInstallOptions {
 impl Default for WindowsServiceInstallOptions {
     fn default() -> Self {
         Self {
+            install_root: None,
+            payload_dir: None,
+            payload_mode: WindowsServicePayloadMode::Copy,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_SERVICE_PORT),
             force: false,
         }
@@ -7110,7 +7253,13 @@ impl Default for WindowsServiceInstallOptions {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct WindowsServiceControlOptions {
+    pub install_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct WindowsServiceUninstallOptions {
+    pub install_root: Option<PathBuf>,
     pub purge: bool,
 }
 
@@ -7123,6 +7272,7 @@ pub struct WindowsServiceUpdateOptions {
 
 #[derive(Clone, Debug)]
 pub struct WindowsServiceApplyUpdateOptions {
+    pub install_root: Option<PathBuf>,
     pub source_dir: PathBuf,
     pub restart: bool,
     pub timeout_ms: u64,
@@ -7130,6 +7280,7 @@ pub struct WindowsServiceApplyUpdateOptions {
 
 #[derive(Clone, Debug)]
 pub struct WindowsServiceRunOptions {
+    pub install_root: PathBuf,
     pub config_path: PathBuf,
     pub token_file: PathBuf,
 }
@@ -7168,16 +7319,218 @@ struct PreparedServiceUpdate {
 }
 
 pub fn default_windows_service_paths() -> ServiceInstallPaths {
+    let root = process_service_install_root().unwrap_or_else(default_windows_service_root);
+    ServiceInstallPaths::for_root(root)
+}
+
+pub fn default_windows_service_root() -> PathBuf {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|path| path.join("AppData").join("Local"))
+        })
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Local"));
+    local_app_data.join("Programs").join(WINDOWS_SERVICE_DIR)
+}
+
+fn process_service_install_root() -> Option<PathBuf> {
+    SERVICE_INSTALL_ROOT_OVERRIDE.get().cloned()
+}
+
+fn set_process_service_install_root(root: PathBuf) -> Result<(), ServiceError> {
+    if let Some(existing) = SERVICE_INSTALL_ROOT_OVERRIDE.get() {
+        if existing == &root {
+            return Ok(());
+        }
+        return Err(ServiceError::ServiceControl(format!(
+            "service install root was already set to {}; refusing to reset to {}",
+            existing.display(),
+            root.display()
+        )));
+    }
+    SERVICE_INSTALL_ROOT_OVERRIDE
+        .set(root)
+        .map_err(|_| ServiceError::ServiceControl("failed to set service install root".to_string()))
+}
+
+fn windows_service_paths_for_root(
+    install_root: Option<&Path>,
+) -> Result<ServiceInstallPaths, ServiceError> {
+    if let Some(root) = install_root {
+        return Ok(ServiceInstallPaths::for_root(normalize_install_root(root)?));
+    }
+    if let Some(root) = process_service_install_root() {
+        return Ok(ServiceInstallPaths::for_root(root));
+    }
+    if let Some(paths) = installed_service_paths_from_scm() {
+        return Ok(paths);
+    }
+    Ok(ServiceInstallPaths::for_root(default_windows_service_root()))
+}
+
+fn windows_service_paths_for_install(
+    install_root: Option<&Path>,
+) -> Result<ServiceInstallPaths, ServiceError> {
+    let root = match install_root {
+        Some(root) => normalize_install_root(root)?,
+        None => default_windows_service_paths().root_dir,
+    };
+    Ok(ServiceInstallPaths::for_root(root))
+}
+
+fn service_paths_from_executable_path(
+    executable_path: &Path,
+) -> Result<ServiceInstallPaths, ServiceError> {
+    let bin_dir = executable_path.parent().ok_or_else(|| {
+        ServiceError::ServiceControl(format!(
+            "installed service executable has no parent: {}",
+            executable_path.display()
+        ))
+    })?;
+    let root_dir = bin_dir.parent().ok_or_else(|| {
+        ServiceError::ServiceControl(format!(
+            "installed service bin directory has no parent: {}",
+            bin_dir.display()
+        ))
+    })?;
+    Ok(ServiceInstallPaths::for_root(root_dir.to_path_buf()))
+}
+
+fn service_paths_from_scm_binary_path(
+    binary_path: &Path,
+) -> Result<ServiceInstallPaths, ServiceError> {
+    let command_line = binary_path.as_os_str().to_string_lossy();
+    let args = split_windows_command_line(&command_line);
+    if let Some(root) = service_install_root_from_args(&args) {
+        return Ok(ServiceInstallPaths::for_root(normalize_install_root(
+            &root,
+        )?));
+    }
+    if let Some(executable) = args.first().filter(|arg| !arg.is_empty()) {
+        return service_paths_from_executable_path(Path::new(executable));
+    }
+    service_paths_from_executable_path(binary_path)
+}
+
+fn service_install_root_from_args(args: &[String]) -> Option<PathBuf> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--install-root" {
+            return args.get(index + 1).map(PathBuf::from);
+        }
+        if let Some(value) = arg.strip_prefix("--install-root=") {
+            return Some(PathBuf::from(value));
+        }
+    }
+    for (index, arg) in args.iter().enumerate() {
+        let config_path = if arg == "--config" {
+            args.get(index + 1).map(PathBuf::from)
+        } else {
+            arg.strip_prefix("--config=").map(PathBuf::from)
+        };
+        if let Some(config_path) = config_path {
+            if let Some(root) = install_root_from_config_path(&config_path) {
+                return Some(root);
+            }
+        }
+    }
+    None
+}
+
+fn install_root_from_config_path(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent()?.parent().map(PathBuf::from)
+}
+
+fn split_windows_command_line(command_line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut in_arg = false;
+    let mut backslashes = 0usize;
+
+    for ch in command_line.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+                in_arg = true;
+            }
+            '"' => {
+                current.extend(std::iter::repeat('\\').take(backslashes / 2));
+                if backslashes % 2 == 0 {
+                    in_quotes = !in_quotes;
+                    in_arg = true;
+                } else {
+                    current.push('"');
+                    in_arg = true;
+                }
+                backslashes = 0;
+            }
+            ch if ch.is_whitespace() && !in_quotes => {
+                current.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+            }
+            ch => {
+                current.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                current.push(ch);
+                in_arg = true;
+            }
+        }
+    }
+
+    current.extend(std::iter::repeat('\\').take(backslashes));
+    if in_arg {
+        args.push(current);
+    }
+    args
+}
+
+#[cfg(windows)]
+fn installed_service_paths_from_scm() -> Option<ServiceInstallPaths> {
+    let manager = windows_service::service_manager::ServiceManager::local_computer(
+        None::<&str>,
+        windows_service::service_manager::ServiceManagerAccess::CONNECT,
+    )
+    .ok()?;
+    let service = manager
+        .open_service(
+            WINDOWS_SERVICE_NAME,
+            windows_service::service::ServiceAccess::QUERY_CONFIG,
+        )
+        .ok()?;
+    let config = service.query_config().ok()?;
+    service_paths_from_scm_binary_path(&config.executable_path).ok()
+}
+
+#[cfg(not(windows))]
+fn installed_service_paths_from_scm() -> Option<ServiceInstallPaths> {
+    None
+}
+
+fn normalize_install_root(root: &Path) -> Result<PathBuf, ServiceError> {
+    if root.as_os_str().is_empty() {
+        return Err(ServiceError::ServiceControl(
+            "install root must not be empty".to_string(),
+        ));
+    }
+    if root.is_absolute() {
+        Ok(root.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(root))
+    }
+}
+
+fn legacy_program_data_service_paths() -> ServiceInstallPaths {
     let root = std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join(WINDOWS_SERVICE_DIR);
-    let paths = ServiceInstallPaths::for_root(root);
-    debug_assert_eq!(
-        paths.windbg_runtime_dir,
-        default_dbgatlas_windbg_runtime_dir()
-    );
-    paths
+        .join("DbgAtlas");
+    ServiceInstallPaths::for_root(root)
 }
 
 fn windbg_runtime_arch() -> &'static str {
@@ -7233,7 +7586,8 @@ pub fn discover_service_payload(
 }
 
 pub fn installed_client_config() -> Result<Option<ServiceConfig>, ServiceError> {
-    installed_client_config_from_paths(&default_windows_service_paths())
+    let paths = windows_service_paths_for_root(None)?;
+    installed_client_config_from_paths(&paths)
 }
 
 fn installed_client_config_from_paths(
@@ -7259,16 +7613,22 @@ pub fn install_windows_service(
     windows_service_control::install(options)
 }
 
-pub fn start_windows_service() -> Result<WindowsServiceCommandResult, ServiceError> {
-    windows_service_control::start()
+pub fn start_windows_service(
+    options: WindowsServiceControlOptions,
+) -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::start(options)
 }
 
-pub fn stop_windows_service() -> Result<WindowsServiceCommandResult, ServiceError> {
-    windows_service_control::stop()
+pub fn stop_windows_service(
+    options: WindowsServiceControlOptions,
+) -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::stop(options)
 }
 
-pub fn status_windows_service() -> Result<WindowsServiceCommandResult, ServiceError> {
-    windows_service_control::status()
+pub fn status_windows_service(
+    options: WindowsServiceControlOptions,
+) -> Result<WindowsServiceCommandResult, ServiceError> {
+    windows_service_control::status(options)
 }
 
 pub fn uninstall_windows_service(
@@ -7338,6 +7698,7 @@ fn prepare_install_layout(paths: &ServiceInstallPaths) -> Result<(), ServiceErro
     fs::create_dir_all(&paths.root_dir)?;
     fs::create_dir_all(&paths.etc_dir)?;
     fs::create_dir_all(&paths.log_dir)?;
+    fs::write(paths.install_marker_path(), "DbgAtlas install root\n")?;
     migrate_legacy_install_file(&paths.legacy_config_path(), &paths.config_path)?;
     migrate_legacy_install_file(&paths.legacy_token_file(), &paths.token_file)?;
     Ok(())
@@ -7370,6 +7731,108 @@ fn install_payload(
     }
     fs::rename(&paths.staging_bin_dir, &paths.bin_dir)?;
     Ok(())
+}
+
+fn validate_existing_payload(
+    paths: &ServiceInstallPaths,
+) -> Result<Vec<ServicePayloadFile>, ServiceError> {
+    discover_service_payload(&paths.bin_dir, &paths.bin_dir)
+}
+
+fn payload_dir_from_current_exe() -> Result<PathBuf, ServiceError> {
+    let current_exe = std::env::current_exe()?;
+    current_exe
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| ServiceError::ServiceControl("current executable has no parent".into()))
+}
+
+fn copy_missing_install_state_from_previous_root(
+    paths: &ServiceInstallPaths,
+) -> Result<(), ServiceError> {
+    let previous = legacy_program_data_service_paths();
+    copy_missing_install_state_from_paths(paths, &previous)
+}
+
+fn copy_missing_install_state_from_paths(
+    paths: &ServiceInstallPaths,
+    previous: &ServiceInstallPaths,
+) -> Result<(), ServiceError> {
+    if previous.root_dir == paths.root_dir {
+        return Ok(());
+    }
+    copy_missing_install_file(
+        &[previous.config_path.clone(), previous.legacy_config_path()],
+        &paths.config_path,
+    )?;
+    copy_missing_install_file(
+        &[previous.token_file.clone(), previous.legacy_token_file()],
+        &paths.token_file,
+    )?;
+    Ok(())
+}
+
+fn copy_missing_install_file(candidates: &[PathBuf], target: &Path) -> Result<(), ServiceError> {
+    if target.exists() {
+        return Ok(());
+    }
+    let Some(source) = candidates.iter().find(|path| path.is_file()) else {
+        return Ok(());
+    };
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, target)?;
+    Ok(())
+}
+
+fn cleanup_install_dirs(paths: &ServiceInstallPaths, purge: bool) -> Result<(), ServiceError> {
+    if !purge {
+        return Ok(());
+    }
+    validate_purge_install_root(paths)?;
+    if paths.root_dir.exists() {
+        fs::remove_dir_all(&paths.root_dir)?;
+    }
+    Ok(())
+}
+
+fn validate_purge_install_root(paths: &ServiceInstallPaths) -> Result<(), ServiceError> {
+    let root = normalize_install_root(&paths.root_dir)?;
+    let has_marker = paths.install_marker_path().is_file();
+    let known_unmarked_root = install_roots_match(&root, &default_windows_service_root())
+        || install_roots_match(&root, &legacy_program_data_service_paths().root_dir);
+    if !has_marker && !known_unmarked_root {
+        return Err(ServiceError::ServiceControl(format!(
+            "refusing to purge install root {}; expected a DbgAtlas install marker or a known default install root",
+            root.display()
+        )));
+    }
+    let canonical = fs::canonicalize(&root).unwrap_or(root.clone());
+    if canonical.parent().is_none()
+        || canonical
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Err(ServiceError::ServiceControl(format!(
+            "refusing to purge unsafe install root {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+fn install_roots_match(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
 }
 
 fn validate_update_timeout(timeout_ms: u64) -> Result<Duration, ServiceError> {
@@ -7667,15 +8130,21 @@ mod windows_service_control {
         Err(ServiceError::ServiceControlUnsupported)
     }
 
-    pub fn start() -> Result<WindowsServiceCommandResult, ServiceError> {
+    pub fn start(
+        _options: WindowsServiceControlOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
         Err(ServiceError::ServiceControlUnsupported)
     }
 
-    pub fn stop() -> Result<WindowsServiceCommandResult, ServiceError> {
+    pub fn stop(
+        _options: WindowsServiceControlOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
         Err(ServiceError::ServiceControlUnsupported)
     }
 
-    pub fn status() -> Result<WindowsServiceCommandResult, ServiceError> {
+    pub fn status(
+        _options: WindowsServiceControlOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
         Err(ServiceError::ServiceControlUnsupported)
     }
 
@@ -7724,27 +8193,48 @@ mod windows_service_control {
     pub fn install(
         options: WindowsServiceInstallOptions,
     ) -> Result<WindowsServiceCommandResult, ServiceError> {
-        let paths = default_windows_service_paths();
-        let current_exe = std::env::current_exe()?;
-        let source_dir = current_exe.parent().ok_or_else(|| {
-            ServiceError::ServiceControl("current executable has no parent".into())
-        })?;
-        if source_is_installed_bin(source_dir, &paths) {
+        let paths = windows_service_paths_for_install(options.install_root.as_deref())?;
+        set_process_service_install_root(paths.root_dir.clone())?;
+        if options.payload_mode == WindowsServicePayloadMode::UseExisting
+            && options.payload_dir.is_some()
+        {
             return Err(ServiceError::ServiceControl(
-                "cannot install from the installed bin directory; run install from a development or release payload directory".to_string(),
+                "--payload-dir is only valid with --payload-mode copy".to_string(),
             ));
         }
-        let payload = discover_service_payload(source_dir, &paths.bin_dir)?;
+        let payload = match options.payload_mode {
+            WindowsServicePayloadMode::Copy => {
+                let source_dir = options
+                    .payload_dir
+                    .clone()
+                    .unwrap_or(payload_dir_from_current_exe()?);
+                if source_is_installed_bin(&source_dir, &paths) {
+                    return Err(ServiceError::ServiceControl(
+                        "cannot copy service payload from the installed bin directory; pass a separate --payload-dir or use --payload-mode use-existing".to_string(),
+                    ));
+                }
+                discover_service_payload(&source_dir, &paths.bin_dir)?
+            }
+            WindowsServicePayloadMode::UseExisting => validate_existing_payload(&paths)?,
+        };
 
         let manager =
             manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+        let mut previous_paths = None;
         if let Some(service) = open_optional(
             &manager,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::QUERY_CONFIG
+                | ServiceAccess::CHANGE_CONFIG
+                | ServiceAccess::STOP,
         )? {
+            previous_paths = previous_install_paths_from_service(&service).ok();
             let status = service.query_status().map_err(map_windows_service_error)?;
             if status.current_state != ServiceState::Stopped {
-                return Err(ServiceError::ServiceIsRunning);
+                if !options.force {
+                    return Err(ServiceError::ServiceIsRunning);
+                }
+                stop_service(&service)?;
             }
             if !options.force {
                 return Err(ServiceError::ServiceControl(
@@ -7752,15 +8242,35 @@ mod windows_service_control {
                 ));
             }
         }
+        let legacy_program_data_paths = legacy_program_data_service_paths();
+        let mut windbg_runtime_candidates = windbg_runtime_source_candidates(&paths);
+        if let Some(previous_paths) = &previous_paths {
+            append_windbg_runtime_source_candidates(&mut windbg_runtime_candidates, previous_paths);
+        }
+        append_windbg_runtime_source_candidates(
+            &mut windbg_runtime_candidates,
+            &legacy_program_data_paths,
+        );
 
         prepare_install_layout(&paths)?;
+        if let Some(previous_paths) = &previous_paths {
+            copy_missing_install_state_from_paths(&paths, previous_paths)?;
+        }
+        copy_missing_install_state_from_previous_root(&paths)?;
         let runtime = create_runtime_config_if_missing(&paths, options.bind)?;
         ensure_token_file(&paths.token_file)?;
+        if options.payload_mode == WindowsServicePayloadMode::Copy {
+            install_payload(&payload, &paths)?;
+        }
         let suffix = update_dir_suffix();
         let windbg_runtime = prepare_store_windbg_runtime_staging(&paths, &suffix)?;
-        install_payload(&payload, &paths)?;
         if let Some(windbg_runtime) = &windbg_runtime {
             activate_staged_windbg_runtime(windbg_runtime, &suffix)?;
+        } else {
+            let _ = copy_existing_windbg_runtime_to_destination(
+                &windbg_runtime_candidates,
+                &paths.windbg_runtime_dir,
+            )?;
         }
         create_or_update_service(&manager, &paths)?;
 
@@ -7772,8 +8282,10 @@ mod windows_service_control {
         ))
     }
 
-    pub fn start() -> Result<WindowsServiceCommandResult, ServiceError> {
-        let paths = default_windows_service_paths();
+    pub fn start(
+        options: WindowsServiceControlOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = windows_service_paths_for_root(options.install_root.as_deref())?;
         let manager = manager(ServiceManagerAccess::CONNECT)?;
         let service = open_required(
             &manager,
@@ -7794,8 +8306,10 @@ mod windows_service_control {
         ))
     }
 
-    pub fn stop() -> Result<WindowsServiceCommandResult, ServiceError> {
-        let paths = default_windows_service_paths();
+    pub fn stop(
+        options: WindowsServiceControlOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = windows_service_paths_for_root(options.install_root.as_deref())?;
         let manager = manager(ServiceManagerAccess::CONNECT)?;
         let service = open_required(
             &manager,
@@ -7810,8 +8324,10 @@ mod windows_service_control {
         ))
     }
 
-    pub fn status() -> Result<WindowsServiceCommandResult, ServiceError> {
-        let paths = default_windows_service_paths();
+    pub fn status(
+        options: WindowsServiceControlOptions,
+    ) -> Result<WindowsServiceCommandResult, ServiceError> {
+        let paths = windows_service_paths_for_root(options.install_root.as_deref())?;
         let manager = manager(ServiceManagerAccess::CONNECT)?;
         let Some(service) = open_optional(
             &manager,
@@ -7837,14 +8353,16 @@ mod windows_service_control {
     pub fn uninstall(
         options: WindowsServiceUninstallOptions,
     ) -> Result<WindowsServiceCommandResult, ServiceError> {
-        let paths = default_windows_service_paths();
+        let paths = windows_service_paths_for_root(options.install_root.as_deref())?;
         let manager = manager(ServiceManagerAccess::CONNECT)?;
         let Some(service) = open_optional(
             &manager,
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
         )?
         else {
-            cleanup_install_dirs(&paths, options.purge)?;
+            if options.purge {
+                cleanup_install_dirs(&paths, true)?;
+            }
             return Ok(result("not_installed", None, paths, Vec::new()));
         };
         stop_service(&service)?;
@@ -7864,6 +8382,8 @@ mod windows_service_control {
         command
             .arg("service")
             .arg("apply-update")
+            .arg("--install-root")
+            .arg(&paths.root_dir)
             .arg("--source-dir")
             .arg(&prepared.source_dir)
             .arg("--timeout-ms")
@@ -7892,7 +8412,8 @@ mod windows_service_control {
     ) -> Result<WindowsServiceCommandResult, ServiceError> {
         let timeout = validate_update_timeout(options.timeout_ms)?;
         let deadline = Instant::now() + timeout;
-        let paths = default_windows_service_paths();
+        let paths = windows_service_paths_for_root(options.install_root.as_deref())?;
+        set_process_service_install_root(paths.root_dir.clone())?;
         prepare_install_layout(&paths)?;
         let prepared = prepare_service_update(&options.source_dir, &paths, options.restart)?;
         let suffix = update_dir_suffix();
@@ -7907,7 +8428,8 @@ mod windows_service_control {
             prepared.config_payload.is_some()
         ));
         copy_update_payload_to_staging(&prepared.bin_payload, &staging_dir)?;
-        let windbg_runtime = prepare_store_windbg_runtime_staging(&paths, &suffix)?;
+        let staged_windbg_runtime_dir =
+            prepare_update_windbg_runtime_in_staging(&paths, &staging_dir, &suffix)?;
         let staged_config_payload = prepared
             .config_payload
             .as_ref()
@@ -7943,11 +8465,10 @@ mod windows_service_control {
             "service payload replaced; previous bin at {}",
             old_dir.display()
         ));
-        if let Some(windbg_runtime) = &windbg_runtime {
-            activate_staged_windbg_runtime(windbg_runtime, &suffix)?;
+        if let Some(windbg_runtime_dir) = &staged_windbg_runtime_dir {
             append_service_log(&format!(
-                "service WinDbg runtime refreshed at {}",
-                windbg_runtime.destination_dir.display()
+                "service WinDbg runtime staged at {}",
+                windbg_runtime_dir.display()
             ));
         }
 
@@ -7978,6 +8499,7 @@ mod windows_service_control {
     }
 
     pub fn run_dispatcher(options: WindowsServiceRunOptions) -> Result<(), ServiceError> {
+        set_process_service_install_root(options.install_root.clone())?;
         append_service_log("starting Windows service dispatcher");
         RUN_OPTIONS.set(options).map_err(|_| {
             ServiceError::ServiceControl("service run options were already set".to_string())
@@ -8005,6 +8527,7 @@ mod windows_service_control {
         let options = RUN_OPTIONS.get().cloned().ok_or_else(|| {
             ServiceError::ServiceControl("missing service run options".to_string())
         })?;
+        let paths = ServiceInstallPaths::for_root(options.install_root.clone());
         let shutdown = ServiceShutdown::new();
         let stop_signal = shutdown.clone();
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
@@ -8034,8 +8557,9 @@ mod windows_service_control {
         append_service_log(&format!("reported running on {}", config.bind));
         let result = run_http_service_until(
             config,
-            ServiceHost::with_installed_process_workers()?
-                .with_capabilities(ServiceCapabilities::from_runtime_config(&runtime)),
+            ServiceHost::with_installed_process_workers()?.with_capabilities(
+                ServiceCapabilities::from_runtime_config_with_install_paths(&runtime, &paths),
+            ),
             shutdown,
         );
         set_status(&status_handle, ServiceState::Stopped)?;
@@ -8069,6 +8593,13 @@ mod windows_service_control {
         Ok(())
     }
 
+    fn previous_install_paths_from_service(
+        service: &windows_service::service::Service,
+    ) -> Result<ServiceInstallPaths, ServiceError> {
+        let config = service.query_config().map_err(map_windows_service_error)?;
+        service_paths_from_scm_binary_path(&config.executable_path)
+    }
+
     fn service_info(paths: &ServiceInstallPaths) -> ServiceInfo {
         ServiceInfo {
             name: OsString::from(WINDOWS_SERVICE_NAME),
@@ -8081,6 +8612,8 @@ mod windows_service_control {
                 OsString::from("service"),
                 OsString::from("run"),
                 OsString::from("--windows-service"),
+                OsString::from("--install-root"),
+                paths.root_dir.clone().into_os_string(),
                 OsString::from("--config"),
                 paths.config_path.clone().into_os_string(),
                 OsString::from("--token-file"),
@@ -8250,22 +8783,6 @@ mod windows_service_control {
             )));
         }
         Ok(hex_encode(&bytes))
-    }
-
-    fn cleanup_install_dirs(paths: &ServiceInstallPaths, purge: bool) -> Result<(), ServiceError> {
-        if paths.bin_dir.exists() {
-            fs::remove_dir_all(&paths.bin_dir)?;
-        }
-        if paths.staging_bin_dir.exists() {
-            fs::remove_dir_all(&paths.staging_bin_dir)?;
-        }
-        if paths.rt_dir.exists() {
-            fs::remove_dir_all(&paths.rt_dir)?;
-        }
-        if purge && paths.root_dir.exists() {
-            fs::remove_dir_all(&paths.root_dir)?;
-        }
-        Ok(())
     }
 
     fn installed_endpoint(paths: &ServiceInstallPaths) -> Result<Option<SocketAddr>, ServiceError> {
@@ -11632,33 +12149,114 @@ mod tests {
 
     #[test]
     fn service_paths_are_rooted_under_dbgatlas_install_dir() {
-        let root = PathBuf::from(r"C:\ProgramData\DbgAtlas");
+        let root = PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas");
         let paths = ServiceInstallPaths::for_root(root.clone());
 
         assert_eq!(paths.root_dir, root);
-        assert_eq!(paths.bin_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\bin"));
-        assert_eq!(paths.etc_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\etc"));
-        assert_eq!(paths.rt_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\rt"));
+        assert_eq!(
+            paths.bin_dir,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\bin")
+        );
+        assert_eq!(
+            paths.etc_dir,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\etc")
+        );
+        assert_eq!(
+            paths.rt_dir,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\bin\rt")
+        );
         assert_eq!(
             paths.windbg_runtime_dir,
-            PathBuf::from(r"C:\ProgramData\DbgAtlas\rt\windbg").join(windbg_runtime_arch())
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\bin\rt\windbg")
+                .join(windbg_runtime_arch())
         );
-        assert_eq!(paths.var_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas\var"));
+        assert_eq!(
+            paths.var_dir,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\var")
+        );
         assert_eq!(
             paths.log_dir,
-            PathBuf::from(r"C:\ProgramData\DbgAtlas\var\log")
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\var\log")
         );
+        assert_eq!(
+            paths.installed_exe,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\bin\dbgatlas.exe")
+        );
+        assert_eq!(
+            paths.config_path,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\etc\runtime.toml")
+        );
+        assert_eq!(
+            paths.token_file,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\etc\token")
+        );
+    }
+
+    #[test]
+    fn service_paths_can_be_inferred_from_installed_executable() {
+        let executable =
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\bin\dbgatlas.exe");
+        let paths = service_paths_from_executable_path(&executable).unwrap();
+
+        assert_eq!(
+            paths.root_dir,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas")
+        );
+        assert_eq!(paths.installed_exe, executable);
+        assert_eq!(
+            paths.config_path,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\etc\runtime.toml")
+        );
+    }
+
+    #[test]
+    fn service_paths_can_be_inferred_from_quoted_scm_command_line_with_install_root() {
+        let command_line = PathBuf::from(
+            r#""C:\Users\d stars\AppData\Local\Programs\dbgatlas\bin\dbgatlas.exe" service run --windows-service --install-root "C:\Users\d stars\AppData\Local\Programs\dbgatlas" --config "C:\ignored\etc\runtime.toml" --token-file "C:\ignored\etc\token""#,
+        );
+
+        let paths = service_paths_from_scm_binary_path(&command_line).unwrap();
+
+        assert_eq!(
+            paths.root_dir,
+            PathBuf::from(r"C:\Users\d stars\AppData\Local\Programs\dbgatlas")
+        );
+        assert_eq!(
+            paths.installed_exe,
+            PathBuf::from(r"C:\Users\d stars\AppData\Local\Programs\dbgatlas\bin\dbgatlas.exe")
+        );
+    }
+
+    #[test]
+    fn service_paths_can_be_inferred_from_legacy_scm_config_argument() {
+        let command_line = PathBuf::from(
+            r#""C:\ProgramData\DbgAtlas\bin\dbgatlas.exe" service run --windows-service --config "C:\ProgramData\DbgAtlas\etc\runtime.toml" --token-file "C:\ProgramData\DbgAtlas\etc\token""#,
+        );
+
+        let paths = service_paths_from_scm_binary_path(&command_line).unwrap();
+
+        assert_eq!(paths.root_dir, PathBuf::from(r"C:\ProgramData\DbgAtlas"));
         assert_eq!(
             paths.installed_exe,
             PathBuf::from(r"C:\ProgramData\DbgAtlas\bin\dbgatlas.exe")
         );
-        assert_eq!(
-            paths.config_path,
-            PathBuf::from(r"C:\ProgramData\DbgAtlas\etc\runtime.toml")
+    }
+
+    #[test]
+    fn service_command_line_split_preserves_quoted_arguments() {
+        let args = split_windows_command_line(
+            r#""C:\Program Files\dbgatlas\dbgatlas.exe" --install-root "C:\Users\d stars\AppData\Local\Programs\dbgatlas" --empty """#,
         );
+
         assert_eq!(
-            paths.token_file,
-            PathBuf::from(r"C:\ProgramData\DbgAtlas\etc\token")
+            args,
+            vec![
+                r"C:\Program Files\dbgatlas\dbgatlas.exe",
+                "--install-root",
+                r"C:\Users\d stars\AppData\Local\Programs\dbgatlas",
+                "--empty",
+                "",
+            ]
         );
     }
 
@@ -11722,6 +12320,49 @@ mod tests {
                 .iter()
                 .any(|file| file.file_name == "libstdc++-6.dll")
         );
+    }
+
+    #[test]
+    fn use_existing_payload_validates_installed_bin_without_overwriting_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(paths.bin_dir.join(file_name), file_name).unwrap();
+        }
+        fs::write(paths.bin_dir.join("dbgatlas.exe"), "existing-exe").unwrap();
+
+        let payload = validate_existing_payload(&paths).unwrap();
+
+        assert_eq!(payload.len(), WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len());
+        assert_eq!(
+            fs::read_to_string(paths.bin_dir.join("dbgatlas.exe")).unwrap(),
+            "existing-exe"
+        );
+        assert!(payload.iter().any(|file| {
+            file.source == paths.bin_dir.join("dbgatlas-worker.exe")
+                && file.destination == paths.bin_dir.join("dbgatlas-worker.exe")
+        }));
+    }
+
+    #[test]
+    fn copy_payload_installs_files_into_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("payload");
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&source).unwrap();
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(source.join(file_name), file_name).unwrap();
+        }
+        let payload = discover_service_payload(&source, &paths.bin_dir).unwrap();
+
+        install_payload(&payload, &paths).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(paths.bin_dir.join("dbgatlas.exe")).unwrap(),
+            "dbgatlas.exe"
+        );
+        assert!(paths.bin_dir.join("dbgatlas_ida.dll").is_file());
     }
 
     #[test]
@@ -12028,6 +12669,7 @@ allow_py_eval = true
 
         assert!(paths.etc_dir.is_dir());
         assert!(paths.log_dir.is_dir());
+        assert!(paths.install_marker_path().is_file());
         assert_eq!(
             fs::read_to_string(&paths.config_path).unwrap(),
             "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n"
@@ -12038,6 +12680,87 @@ allow_py_eval = true
         );
         assert!(!paths.legacy_config_path().exists());
         assert!(!paths.legacy_token_file().exists());
+    }
+
+    #[test]
+    fn install_state_copy_preserves_previous_token_when_new_etc_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = ServiceInstallPaths::for_root(temp.path().join("old"));
+        let paths = ServiceInstallPaths::for_root(temp.path().join("new"));
+        fs::create_dir_all(&previous.etc_dir).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(
+            &previous.config_path,
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7331\"\n",
+        )
+        .unwrap();
+        fs::write(&previous.token_file, "previous-token\n").unwrap();
+
+        copy_missing_install_state_from_paths(&paths, &previous).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&paths.config_path).unwrap(),
+            "version = 1\n\n[server]\nbind = \"127.0.0.1:7331\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.token_file).unwrap(),
+            "previous-token\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_install_dirs_only_removes_files_when_purging() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::write(paths.bin_dir.join("dbgatlas.exe"), "payload").unwrap();
+
+        cleanup_install_dirs(&paths, false).unwrap();
+
+        assert!(paths.bin_dir.join("dbgatlas.exe").is_file());
+
+        fs::write(paths.install_marker_path(), "DbgAtlas install root\n").unwrap();
+        cleanup_install_dirs(&paths, true).unwrap();
+
+        assert!(!paths.root_dir.exists());
+    }
+
+    #[test]
+    fn cleanup_install_dirs_rejects_unmarked_custom_root_when_purging() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("custom-root"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::write(paths.bin_dir.join("dbgatlas.exe"), "payload").unwrap();
+
+        let error = cleanup_install_dirs(&paths, true).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to purge install root"));
+        assert!(paths.root_dir.exists());
+    }
+
+    #[test]
+    fn cleanup_install_dirs_rejects_unmarked_dbgatlas_named_root_when_purging() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("dbgatlas"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::write(paths.bin_dir.join("dbgatlas.exe"), "payload").unwrap();
+
+        let error = cleanup_install_dirs(&paths, true).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to purge install root"));
+        assert!(paths.root_dir.exists());
+    }
+
+    #[test]
+    fn cleanup_install_dirs_allows_marked_custom_root_when_purging() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("custom-root"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::write(paths.install_marker_path(), "DbgAtlas install root\n").unwrap();
+
+        cleanup_install_dirs(&paths, true).unwrap();
+
+        assert!(!paths.root_dir.exists());
     }
 
     #[cfg(windows)]
@@ -12493,6 +13216,54 @@ allow_py_eval = true
                 .is_file()
         );
         assert!(!staging.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_update_stages_existing_windbg_runtime_inside_next_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        write_complete_windbg_runtime(&paths.windbg_runtime_dir);
+        let staging_bin = paths.root_dir.join("bin.next-test");
+        fs::create_dir_all(&staging_bin).unwrap();
+
+        let staged =
+            prepare_update_windbg_runtime_in_staging(&paths, &staging_bin, "test").unwrap();
+
+        let staged = staged.expect("existing runtime should be staged");
+        assert_eq!(
+            staged,
+            staging_bin
+                .join(WINDOWS_SERVICE_RT_DIR)
+                .join("windbg")
+                .join(windbg_runtime_arch())
+        );
+        assert!(staged.join("dbgeng.dll").is_file());
+        assert!(staged.join("ttd").join("TTD.exe").is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windbg_runtime_preserve_candidates_include_legacy_root_rt() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        write_complete_windbg_runtime(&paths.legacy_windbg_runtime_dir());
+        let destination = paths
+            .root_dir
+            .join("bin.next-test")
+            .join(WINDOWS_SERVICE_RT_DIR)
+            .join("windbg")
+            .join(windbg_runtime_arch());
+
+        let copied_from = copy_existing_windbg_runtime_to_destination(
+            &windbg_runtime_source_candidates(&paths),
+            &destination,
+        )
+        .unwrap();
+
+        assert_eq!(copied_from, Some(paths.legacy_windbg_runtime_dir()));
+        assert!(destination.join("dbgeng.dll").is_file());
+        assert!(destination.join("ttd").join("TTD.exe").is_file());
     }
 
     #[cfg(windows)]

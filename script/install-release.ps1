@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$RepoRoot,
+    [Parameter(Mandatory = $true)][string]$InstallRoot,
     [string]$Bind = "127.0.0.1:7331",
     [switch]$NoStart,
     [switch]$NoForce
@@ -37,9 +38,12 @@ function Invoke-Dbgatlas {
 }
 
 function Get-DbgatlasServiceStatus {
-    param([Parameter(Mandatory = $true)][string]$Exe)
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(Mandatory = $true)][string]$InstallRoot
+    )
 
-    $output = & $Exe @("--json", "service", "status") 2>&1
+    $output = & $Exe @("--json", "service", "status", "--install-root", $InstallRoot) 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Could not query existing service status; install will report the concrete error if this matters."
         if ($output) {
@@ -64,6 +68,8 @@ function Get-DbgatlasServiceStatus {
 function Wait-DbgatlasHealth {
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(Mandatory = $true)][string]$Endpoint,
+        [Parameter(Mandatory = $true)][string]$Token,
         [int]$Attempts = 20,
         [int]$DelayMilliseconds = 500
     )
@@ -71,7 +77,7 @@ function Wait-DbgatlasHealth {
     $lastOutput = $null
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         Write-Host "Health check attempt $attempt/$Attempts..."
-        $output = & $Exe @("--json", "service", "health") 2>&1
+        $output = & $Exe @("--json", "service", "health", "--endpoint", $Endpoint, "--token", $Token) 2>&1
         if ($LASTEXITCODE -eq 0) {
             $output
             return
@@ -87,7 +93,7 @@ function Wait-DbgatlasHealth {
         Write-Host "Last service health output:"
         $lastOutput | ForEach-Object { Write-Host $_ }
     }
-    $logDir = Join-Path $env:ProgramData "DbgAtlas\var\log"
+    $logDir = Join-Path $InstallRoot "var\log"
     throw "DbgAtlas service did not become healthy after $Attempts attempts. Check service logs under $logDir."
 }
 
@@ -124,24 +130,36 @@ $dbgatlasExe = Join-Path $releaseDir "dbgatlas.exe"
 Write-Host "DbgAtlas release install context:"
 Write-Host "  repo root: $repoRootPath"
 Write-Host "  release dir: $releaseDir"
+Write-Host "  install root: $InstallRoot"
 Write-Host "  bind: $Bind"
 Write-Host "  NoStart=$NoStart NoForce=$NoForce"
 Assert-ReleasePayload -ReleaseDir $releaseDir
 
-$existingStatus = Get-DbgatlasServiceStatus -Exe $dbgatlasExe
+$existingStatus = Get-DbgatlasServiceStatus -Exe $dbgatlasExe -InstallRoot $InstallRoot
 if ($NoForce -and $existingStatus -and $existingStatus -ne "not_installed") {
     throw "DbgAtlas service is already installed. Re-run without -NoForce to perform an overwrite install."
 }
 
 if ($existingStatus -and $existingStatus -ne "not_installed" -and $existingStatus -ne "stopped") {
     Write-Host "Stopping existing DbgAtlas service..."
-    Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("service", "stop")
+    Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("service", "stop", "--install-root", $InstallRoot)
 }
 else {
     Write-Host "No running DbgAtlas service needs to be stopped."
 }
 
-$installArgs = @("service", "install", "--bind", $Bind)
+$installArgs = @(
+    "service",
+    "install",
+    "--install-root",
+    $InstallRoot,
+    "--payload-mode",
+    "copy",
+    "--payload-dir",
+    $releaseDir,
+    "--bind",
+    $Bind
+)
 if (-not $NoForce) {
     $installArgs += "--force"
 }
@@ -151,15 +169,17 @@ Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments $installArgs
 
 if ($NoStart) {
     Write-Host "NoStart was set; leaving service installed but stopped."
-    Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("--json", "service", "status")
+    Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("--json", "service", "status", "--install-root", $InstallRoot)
     exit 0
 }
 
 Write-Host "Starting DbgAtlas service..."
-Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("service", "start")
+Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("service", "start", "--install-root", $InstallRoot)
 
 Write-Host "Service status:"
-Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("--json", "service", "status")
+Invoke-Dbgatlas -Exe $dbgatlasExe -Arguments @("--json", "service", "status", "--install-root", $InstallRoot)
 
 Write-Host "Service health:"
-Wait-DbgatlasHealth -Exe $dbgatlasExe
+$tokenPath = Join-Path $InstallRoot "etc\token"
+$token = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
+Wait-DbgatlasHealth -Exe $dbgatlasExe -Endpoint $Bind -Token $token

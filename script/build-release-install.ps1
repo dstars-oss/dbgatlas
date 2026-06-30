@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$Bind = "127.0.0.1:7331",
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "Programs\dbgatlas"),
     [switch]$BuildOnly,
     [switch]$NoStart,
     [switch]$NoForce
@@ -106,6 +107,7 @@ if (-not (Test-Path -LiteralPath $installScript -PathType Leaf)) {
 Write-Host "DbgAtlas release build context:"
 Write-Host "  repo root: $repoRoot"
 Write-Host "  release dir: $releaseDir"
+Write-Host "  install root: $InstallRoot"
 Write-Host "  bind: $Bind"
 Write-Host "  BuildOnly=$BuildOnly NoStart=$NoStart NoForce=$NoForce"
 Write-Host "Building DbgAtlas release payload..."
@@ -135,6 +137,8 @@ $installArgs = @(
     (Quote-ProcessArgument $installScript),
     "-RepoRoot",
     (Quote-ProcessArgument $repoRoot),
+    "-InstallRoot",
+    (Quote-ProcessArgument $InstallRoot),
     "-Bind",
     $Bind
 )

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dbgatlas_debug::DebugTarget;
 use dbgatlas_recording::{
     RecordingTarget, TtdRecordMode, TtdRecordingOptions, TtdReplayCpuSupport, TtdTarget,
@@ -7,10 +7,11 @@ use dbgatlas_recording::{
 use dbgatlas_service::{
     DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     ServiceConfig, ServiceHost, TtdCommandHelperOptions, WindowsServiceApplyUpdateOptions,
-    WindowsServiceInstallOptions, WindowsServiceRunOptions, WindowsServiceUninstallOptions,
-    apply_windows_service_update, install_windows_service, installed_client_config,
-    invoke_http_json_rpc, run_http_service, run_ttd_command_helper, run_windows_service_dispatcher,
-    start_windows_service, status_windows_service, stop_windows_service, uninstall_windows_service,
+    WindowsServiceControlOptions, WindowsServiceInstallOptions, WindowsServicePayloadMode,
+    WindowsServiceRunOptions, WindowsServiceUninstallOptions, apply_windows_service_update,
+    install_windows_service, installed_client_config, invoke_http_json_rpc, run_http_service,
+    run_ttd_command_helper, run_windows_service_dispatcher, start_windows_service,
+    status_windows_service, stop_windows_service, uninstall_windows_service,
 };
 use dbgatlas_workspace::{Workspace, WorkspaceInitOptions};
 use serde_json::{Value, json};
@@ -74,6 +75,21 @@ enum WorkspaceCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ServicePayloadModeArg {
+    Copy,
+    UseExisting,
+}
+
+impl From<ServicePayloadModeArg> for WindowsServicePayloadMode {
+    fn from(value: ServicePayloadModeArg) -> Self {
+        match value {
+            ServicePayloadModeArg::Copy => WindowsServicePayloadMode::Copy,
+            ServicePayloadModeArg::UseExisting => WindowsServicePayloadMode::UseExisting,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ServiceCommand {
     Run {
@@ -83,6 +99,8 @@ enum ServiceCommand {
         token: String,
         #[arg(long, hide = true)]
         windows_service: bool,
+        #[arg(long, hide = true)]
+        install_root: Option<PathBuf>,
         #[arg(long, hide = true)]
         config: Option<PathBuf>,
         #[arg(long, hide = true)]
@@ -103,20 +121,39 @@ enum ServiceCommand {
         token: Option<String>,
     },
     Install {
+        #[arg(long)]
+        install_root: Option<PathBuf>,
+        #[arg(long)]
+        payload_dir: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "copy")]
+        payload_mode: ServicePayloadModeArg,
         #[arg(long, default_value = "127.0.0.1:7331")]
         bind: SocketAddr,
         #[arg(long)]
         force: bool,
     },
-    Start,
-    Stop,
-    Status,
+    Start {
+        #[arg(long)]
+        install_root: Option<PathBuf>,
+    },
+    Stop {
+        #[arg(long)]
+        install_root: Option<PathBuf>,
+    },
+    Status {
+        #[arg(long)]
+        install_root: Option<PathBuf>,
+    },
     Uninstall {
+        #[arg(long)]
+        install_root: Option<PathBuf>,
         #[arg(long)]
         purge: bool,
     },
     #[command(hide = true)]
     ApplyUpdate {
+        #[arg(long)]
+        install_root: Option<PathBuf>,
         #[arg(long)]
         source_dir: PathBuf,
         #[arg(long, default_value_t = DEFAULT_SERVICE_UPDATE_TIMEOUT_MS)]
@@ -455,6 +492,7 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
             bind,
             token,
             windows_service,
+            install_root,
             config,
             token_file,
             allow_ida_py_eval,
@@ -466,7 +504,15 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
                 let token_file = token_file.ok_or_else(|| {
                     anyhow::anyhow!("--token-file is required with --windows-service")
                 })?;
+                let install_root = install_root
+                    .or_else(|| install_root_from_config_path(&config_path))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--install-root is required with --windows-service when --config is not under <install-root>\\etc"
+                        )
+                    })?;
                 return Ok(run_windows_service_dispatcher(WindowsServiceRunOptions {
+                    install_root,
                     config_path,
                     token_file,
                 })?);
@@ -495,32 +541,52 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
             let response = call_service(endpoint, token, "service.info", json!({}))?;
             print_rpc_response(response, as_json)?;
         }
-        ServiceCommand::Install { bind, force } => {
-            let result = install_windows_service(WindowsServiceInstallOptions { bind, force })?;
+        ServiceCommand::Install {
+            install_root,
+            payload_dir,
+            payload_mode,
+            bind,
+            force,
+        } => {
+            let result = install_windows_service(WindowsServiceInstallOptions {
+                install_root,
+                payload_dir,
+                payload_mode: payload_mode.into(),
+                bind,
+                force,
+            })?;
             print_service_command_result(result, as_json)?;
         }
-        ServiceCommand::Start => {
-            let result = start_windows_service()?;
+        ServiceCommand::Start { install_root } => {
+            let result = start_windows_service(WindowsServiceControlOptions { install_root })?;
             print_service_command_result(result, as_json)?;
         }
-        ServiceCommand::Stop => {
-            let result = stop_windows_service()?;
+        ServiceCommand::Stop { install_root } => {
+            let result = stop_windows_service(WindowsServiceControlOptions { install_root })?;
             print_service_command_result(result, as_json)?;
         }
-        ServiceCommand::Status => {
-            let result = status_windows_service()?;
+        ServiceCommand::Status { install_root } => {
+            let result = status_windows_service(WindowsServiceControlOptions { install_root })?;
             print_service_command_result(result, as_json)?;
         }
-        ServiceCommand::Uninstall { purge } => {
-            let result = uninstall_windows_service(WindowsServiceUninstallOptions { purge })?;
+        ServiceCommand::Uninstall {
+            install_root,
+            purge,
+        } => {
+            let result = uninstall_windows_service(WindowsServiceUninstallOptions {
+                install_root,
+                purge,
+            })?;
             print_service_command_result(result, as_json)?;
         }
         ServiceCommand::ApplyUpdate {
+            install_root,
             source_dir,
             timeout_ms,
             no_restart,
         } => {
             let result = apply_windows_service_update(WindowsServiceApplyUpdateOptions {
+                install_root,
                 source_dir,
                 restart: !no_restart,
                 timeout_ms,
@@ -543,6 +609,10 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn install_root_from_config_path(config_path: &std::path::Path) -> Option<PathBuf> {
+    config_path.parent()?.parent().map(PathBuf::from)
 }
 
 fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {

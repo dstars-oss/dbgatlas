@@ -64,7 +64,7 @@ flowchart LR
 ## Service 边界
 
 - 同一个 `dbgatlas.exe` 提供 `service run` 开发模式、安装态 Windows service 入口和普通 CLI client 命令。
-- Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。安装时复制 `dbgatlas.exe`、`dbgatlas-worker.exe`、`dbgatlas_dbgeng.dll`、`dbgatlas_etw.dll` 和 `dbgatlas_ida.dll` 到 `%ProgramData%\DbgAtlas\bin\`，配置/token 放在 `%ProgramData%\DbgAtlas\etc\`，服务日志放在 `%ProgramData%\DbgAtlas\var\log\`，SCM 只指向安装目录下的 binary，避免锁住开发构建产物。
+- Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。默认安装根是 `%LOCALAPPDATA%\Programs\dbgatlas`，安装器和提权脚本应显式传入 `--install-root`。`install` 支持复制 payload 到 `<install-root>\bin`，也支持 `--payload-mode use-existing` 直接使用安装器已放置的 `bin`；配置/token 放在 `<install-root>\etc\`，服务日志放在 `<install-root>\var\log\`，DbgAtlas 受控 WinDbg runtime 放在 `<install-root>\bin\rt\`。SCM 只指向安装目录下的 binary，避免锁住开发构建产物。
 - 安装态 service 可通过 `service.update` JSON-RPC/MCP 方法从构建好的 payload 目录异步更新自身；更新由独立 updater 进程完成 stop、rename swap、restart 和 best-effort cleanup。
 - `debug.session.create` 接收 `project_root` 和 target，返回 `session_id`；后续 `debug.eval`、`debug.modules`、`debug.threads`、`debug.stack`、`debug.session.close` 和 `debug.session.kill` 只需要 `session_id`。
 - `reverse.session.open` 接收 `project_root`、IDA database path 和可选 IDA install dir，返回独立的 reverse `session_id`；后续 `reverse.*` 和 `reverse.session.close` 只需要这个 `session_id`。

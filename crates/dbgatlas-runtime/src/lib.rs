@@ -75,6 +75,16 @@ impl RuntimeConfig {
     pub fn resolve_tool_paths(&self) -> ResolvedToolPaths {
         resolve_tool_paths(&self.tools)
     }
+
+    pub fn resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(
+        &self,
+        dbgatlas_windbg_runtime_dir: impl AsRef<Path>,
+    ) -> ResolvedToolPaths {
+        resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(
+            &self.tools,
+            dbgatlas_windbg_runtime_dir.as_ref(),
+        )
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -302,6 +312,15 @@ pub fn resolve_tool_paths(_tools: &ToolRuntimeConfig) -> ResolvedToolPaths {
     resolve_tool_paths_from_roots(&roots)
 }
 
+pub fn resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(
+    _tools: &ToolRuntimeConfig,
+    dbgatlas_windbg_runtime_dir: &Path,
+) -> ResolvedToolPaths {
+    let mut roots = ToolSearchRoots::default();
+    roots.dbgatlas_windbg_runtime_dir = dbgatlas_windbg_runtime_dir.to_path_buf();
+    resolve_tool_paths_from_roots(&roots)
+}
+
 fn resolve_tool_paths_from_roots(roots: &ToolSearchRoots) -> ResolvedToolPaths {
     let dbgeng_candidates = resolve_dbgeng_dirs_from_roots(roots);
     let dbgeng = dbgeng_candidates.first().cloned();
@@ -403,14 +422,23 @@ fn find_store_ttd_dir(root: &Path) -> Option<PathBuf> {
 }
 
 pub fn default_dbgatlas_windbg_runtime_dir() -> PathBuf {
-    let program_data = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    program_data
-        .join("DbgAtlas")
+    default_dbgatlas_install_root()
+        .join("bin")
         .join("rt")
         .join("windbg")
         .join(windbg_runtime_arch())
+}
+
+fn default_dbgatlas_install_root() -> PathBuf {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|path| path.join("AppData").join("Local"))
+        })
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Local"));
+    local_app_data.join("Programs").join("dbgatlas")
 }
 
 pub fn resolve_store_windbg_dbgeng_dir() -> Option<PathBuf> {
