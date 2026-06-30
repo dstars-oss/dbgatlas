@@ -42,6 +42,7 @@ cargo run -p dbgatlas-cli -- debug add-symbols <session-id> "srv*C:\symbols*http
 cargo run -p dbgatlas-cli -- debug read-memory <session-id> --address 0x1000 --length 64
 cargo run -p dbgatlas-cli -- debug session close <session-id>
 cargo run -p dbgatlas-cli -- recording ttd --project-root .\scratch-project --launch C:\Windows\System32\cmd.exe --timeout-ms 30000 --accept-eula -- /C exit 0
+cargo run -p dbgatlas-cli -- recording ttd --project-root .\scratch-project --attach <pid> --timeout-ms 30000 --accept-eula --worker-identity active_interactive_user
 ```
 
 The installed service can update its own runtime payload through JSON-RPC or

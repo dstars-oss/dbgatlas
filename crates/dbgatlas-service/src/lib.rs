@@ -28,7 +28,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -68,6 +68,7 @@ pub const WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES: &[&str] = &[
     "libwinpthread-1.dll",
 ];
 pub const DEFAULT_IDA_INSTALL_DIR: &str = r"C:\Program Files\IDA Professional 9.3";
+const TTD_COMMAND_HELPER_ERROR_PREFIX: &str = "dbgatlas TTD command helper error:";
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static RECORDING_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -88,6 +89,59 @@ impl ServiceConfig {
             bearer_token: "dev-token".to_string(),
         }
     }
+}
+
+#[derive(Debug)]
+pub struct TtdCommandHelperOptions {
+    pub executable: PathBuf,
+    pub args: Vec<OsString>,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+}
+
+pub fn run_ttd_command_helper(options: TtdCommandHelperOptions) -> i32 {
+    match run_ttd_command_helper_inner(&options) {
+        Ok(code) => code.unwrap_or(1),
+        Err(error) => {
+            let _ = append_ttd_helper_error(&options.stderr_path, &error);
+            1
+        }
+    }
+}
+
+fn run_ttd_command_helper_inner(
+    options: &TtdCommandHelperOptions,
+) -> Result<Option<i32>, ServiceError> {
+    if let Some(parent) = options.stdout_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = options.stderr_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stdout = fs::File::create(&options.stdout_path)?;
+    let stderr = fs::File::create(&options.stderr_path)?;
+    let job = job::ManagedJob::create_result("DbgAtlasTtdCommandHelper")?;
+    let mut child = Command::new(&options.executable)
+        .args(&options.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    if let Err(error) = job.assign_child_process(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ServiceError::Io(error));
+    }
+    Ok(child.wait()?.code())
+}
+
+fn append_ttd_helper_error(path: &Path, error: &ServiceError) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{TTD_COMMAND_HELPER_ERROR_PREFIX} {error:#}")?;
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -715,6 +769,7 @@ impl ServiceHost {
 
     fn recording_ttd(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         let params: RecordingTtdParams = parse_params(params)?;
+        let worker_identity = params.worker_identity;
         let request = RecordTtd {
             target: params.target,
             timeout_ms: params.timeout_ms,
@@ -746,6 +801,7 @@ impl ServiceHost {
             json!({
                 "target": request.target,
                 "timeout_ms": request.timeout_ms,
+                "worker_identity": worker_identity,
                 "ttd_exe": ttd_exe,
             }),
             None,
@@ -771,6 +827,7 @@ impl ServiceHost {
             timeout: Duration::from_millis(request.timeout_ms),
             stdout_path: stdout_path.clone(),
             stderr_path: stderr_path.clone(),
+            worker_identity,
             timeout_stop: timeout_stop_target
                 .clone()
                 .map(|stop_target| TtdTimeoutStop {
@@ -931,6 +988,7 @@ impl ServiceHost {
             stopped_at,
             duration_ms,
             ttd_exe: &ttd_exe,
+            worker_identity,
             discovered: &discovered,
             warnings: &warnings,
             error: error.as_deref(),
@@ -993,6 +1051,7 @@ impl ServiceHost {
             "state": status,
             "target": request.target,
             "mode": request.target.mode(),
+            "worker_identity": worker_identity,
             "operation_id": operation_id,
             "operation_status": operation_status,
             "target_pid": target_pid,
@@ -3534,6 +3593,7 @@ struct TtdRecorderInvocation {
     timeout: Duration,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    worker_identity: TtdRecorderIdentity,
     timeout_stop: Option<TtdTimeoutStop>,
 }
 
@@ -3561,6 +3621,14 @@ struct TtdStopExit {
     exit_code: Option<i32>,
     timed_out: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TtdRecorderIdentity {
+    #[default]
+    Default,
+    ActiveInteractiveUser,
 }
 
 trait TtdRecorderRunner: Send + Sync {
@@ -4498,25 +4566,128 @@ fn prepare_recording_target(
     }
 }
 
+enum TtdRecorderProcess {
+    Std(Child),
+    #[cfg(windows)]
+    RawWindows(windows_active_user_process::RawProcess),
+}
+
+impl TtdRecorderProcess {
+    fn try_wait(&mut self) -> Result<Option<Option<i32>>, std::io::Error> {
+        match self {
+            Self::Std(child) => child
+                .try_wait()
+                .map(|status| status.map(|status| status.code())),
+            #[cfg(windows)]
+            Self::RawWindows(process) => process.try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> Result<Option<i32>, std::io::Error> {
+        match self {
+            Self::Std(child) => child.wait().map(|status| status.code()),
+            #[cfg(windows)]
+            Self::RawWindows(process) => process.wait_code(),
+        }
+    }
+
+    fn kill(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Std(child) => child.kill(),
+            #[cfg(windows)]
+            Self::RawWindows(process) => process.kill(),
+        }
+    }
+}
+
+fn spawn_ttd_process(
+    ttd_exe: &Path,
+    args: &[OsString],
+    worker_identity: TtdRecorderIdentity,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<TtdRecorderProcess, ServiceError> {
+    if let Some(parent) = stdout_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = stderr_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match worker_identity {
+        TtdRecorderIdentity::Default => {
+            let stdout = fs::File::create(stdout_path)?;
+            let stderr = fs::File::create(stderr_path)?;
+            Ok(TtdRecorderProcess::Std(
+                Command::new(ttd_exe)
+                    .args(args)
+                    .stdout(Stdio::from(stdout))
+                    .stderr(Stdio::from(stderr))
+                    .spawn()?,
+            ))
+        }
+        TtdRecorderIdentity::ActiveInteractiveUser => {
+            spawn_active_interactive_ttd_process(ttd_exe, args, stdout_path, stderr_path)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_active_interactive_ttd_process(
+    ttd_exe: &Path,
+    args: &[OsString],
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<TtdRecorderProcess, ServiceError> {
+    let helper_exe = std::env::current_exe()?;
+    let helper_args = ttd_command_helper_args(ttd_exe, args, stdout_path, stderr_path);
+    windows_active_user_process::spawn_os(&helper_exe, &helper_args)
+        .map(TtdRecorderProcess::RawWindows)
+}
+
+fn ttd_command_helper_args(
+    ttd_exe: &Path,
+    args: &[OsString],
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Vec<OsString> {
+    let mut helper_args = vec![
+        OsString::from("service"),
+        OsString::from("run-ttd-command"),
+        OsString::from("--executable"),
+        ttd_exe.as_os_str().to_os_string(),
+        OsString::from("--stdout-path"),
+        stdout_path.as_os_str().to_os_string(),
+        OsString::from("--stderr-path"),
+        stderr_path.as_os_str().to_os_string(),
+        OsString::from("--"),
+    ];
+    helper_args.extend(args.iter().cloned());
+    helper_args
+}
+
+#[cfg(not(windows))]
+fn spawn_active_interactive_ttd_process(
+    _ttd_exe: &Path,
+    _args: &[OsString],
+    _stdout_path: &Path,
+    _stderr_path: &Path,
+) -> Result<TtdRecorderProcess, ServiceError> {
+    Err(ServiceError::WorkerTransportUnsupported)
+}
+
 fn run_ttd_process(invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, ServiceError> {
-    if let Some(parent) = invocation.stdout_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = invocation.stderr_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let stdout = fs::File::create(&invocation.stdout_path)?;
-    let stderr = fs::File::create(&invocation.stderr_path)?;
-    let mut child = Command::new(&invocation.ttd_exe)
-        .args(&invocation.args)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()?;
+    let mut child = spawn_ttd_process(
+        &invocation.ttd_exe,
+        &invocation.args,
+        invocation.worker_identity,
+        &invocation.stdout_path,
+        &invocation.stderr_path,
+    )?;
     let deadline = Instant::now() + invocation.timeout;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(exit_code) = child.try_wait()? {
             return Ok(TtdProcessExit {
-                exit_code: status.code(),
+                exit_code,
                 timed_out: false,
                 stop: None,
                 killed_after_timeout: false,
@@ -4535,11 +4706,15 @@ fn run_ttd_process(invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, 
                         timeout_stop.stop_target = OsString::from(pid.to_string());
                     }
                 }
-                stop = Some(run_ttd_stop_process(&invocation.ttd_exe, &timeout_stop));
+                stop = Some(run_ttd_stop_process(
+                    &invocation.ttd_exe,
+                    &timeout_stop,
+                    invocation.worker_identity,
+                ));
                 while Instant::now() < recorder_exit_deadline {
-                    if let Some(status) = child.try_wait()? {
+                    if let Some(exit_code) = child.try_wait()? {
                         return Ok(TtdProcessExit {
-                            exit_code: status.code(),
+                            exit_code,
                             timed_out: true,
                             stop,
                             killed_after_timeout: false,
@@ -4548,13 +4723,14 @@ fn run_ttd_process(invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, 
                     std::thread::sleep(Duration::from_millis(25));
                 }
             }
-            let killed_after_timeout = child.try_wait()?.is_none();
-            if killed_after_timeout {
+            let (exit_code, killed_after_timeout) = if let Some(exit_code) = child.try_wait()? {
+                (exit_code, false)
+            } else {
                 let _ = child.kill();
-            }
-            let status = child.wait().ok();
+                (child.wait().ok().flatten(), true)
+            };
             return Ok(TtdProcessExit {
-                exit_code: status.as_ref().and_then(ExitStatus::code),
+                exit_code,
                 timed_out: true,
                 stop,
                 killed_after_timeout,
@@ -4564,7 +4740,11 @@ fn run_ttd_process(invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, 
     }
 }
 
-fn run_ttd_stop_process(ttd_exe: &Path, timeout_stop: &TtdTimeoutStop) -> TtdStopExit {
+fn run_ttd_stop_process(
+    ttd_exe: &Path,
+    timeout_stop: &TtdTimeoutStop,
+    worker_identity: TtdRecorderIdentity,
+) -> TtdStopExit {
     let args = [
         OsString::from("-stop"),
         timeout_stop.stop_target.clone(),
@@ -4574,6 +4754,7 @@ fn run_ttd_stop_process(ttd_exe: &Path, timeout_stop: &TtdTimeoutStop) -> TtdSto
     match run_ttd_command(
         ttd_exe,
         &args,
+        worker_identity,
         timeout_stop.timeout,
         &timeout_stop.stdout_path,
         &timeout_stop.stderr_path,
@@ -4606,36 +4787,25 @@ struct TtdCommandExit {
 fn run_ttd_command(
     ttd_exe: &Path,
     args: &[OsString],
+    worker_identity: TtdRecorderIdentity,
     timeout: Duration,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<TtdCommandExit, ServiceError> {
-    if let Some(parent) = stdout_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = stderr_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let stdout = fs::File::create(stdout_path)?;
-    let stderr = fs::File::create(stderr_path)?;
-    let mut child = Command::new(ttd_exe)
-        .args(args)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()?;
+    let mut child = spawn_ttd_process(ttd_exe, args, worker_identity, stdout_path, stderr_path)?;
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(exit_code) = child.try_wait()? {
             return Ok(TtdCommandExit {
-                exit_code: status.code(),
+                exit_code,
                 timed_out: false,
             });
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let status = child.wait().ok();
+            let exit_code = child.wait().ok().flatten();
             return Ok(TtdCommandExit {
-                exit_code: status.as_ref().and_then(ExitStatus::code),
+                exit_code,
                 timed_out: true,
             });
         }
@@ -4663,6 +4833,7 @@ struct TtdRecordingMetadata<'a> {
     stopped_at: Timestamp,
     duration_ms: u64,
     ttd_exe: &'a Path,
+    worker_identity: TtdRecorderIdentity,
     discovered: &'a DiscoveredTtdArtifacts,
     warnings: &'a [String],
     error: Option<&'a str>,
@@ -4725,6 +4896,7 @@ fn ttd_recording_metadata_json(input: TtdRecordingMetadata<'_>) -> Value {
         "operation_id": input.operation_id,
         "target": input.request.target,
         "mode": input.request.target.mode(),
+        "worker_identity": input.worker_identity,
         "timeout_ms": input.request.timeout_ms,
         "options": input.request.options,
         "target_pid": input.target_pid,
@@ -4739,6 +4911,7 @@ fn ttd_recording_metadata_json(input: TtdRecordingMetadata<'_>) -> Value {
             "kind": "ttd",
             "tool": "TTD.exe",
             "ttd_exe": input.ttd_exe,
+            "worker_identity": input.worker_identity,
         },
         "traces": input.discovered.traces,
         "trace_indexes": input.discovered.trace_indexes,
@@ -8831,6 +9004,12 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
                         "type": "integer",
                         "description": "Maximum recording duration in milliseconds before DbgAtlas asks TTD.exe to stop and keeps any completed trace artifacts."
                     },
+                    "worker_identity": {
+                        "type": "string",
+                        "enum": ["default", "active_interactive_user"],
+                        "default": "default",
+                        "description": "Run TTD.exe as the service process by default. Use active_interactive_user when an installed service must attach to a process in the current interactive user session."
+                    },
                     "options": ttd_recording_options_schema()
                 },
                 "required": ["project_root", "target", "timeout_ms"]
@@ -9611,6 +9790,8 @@ struct RecordingTtdParams {
     timeout_ms: u64,
     #[serde(default)]
     options: TtdRecordingOptions,
+    #[serde(default)]
+    worker_identity: TtdRecorderIdentity,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -10566,6 +10747,23 @@ mod job {
             }
             Ok(())
         }
+
+        pub fn assign_child_process(
+            &self,
+            process: &std::process::Child,
+        ) -> Result<(), std::io::Error> {
+            use std::os::windows::io::AsRawHandle;
+
+            if self.handle.is_null() {
+                return Ok(());
+            }
+            let ok =
+                unsafe { AssignProcessToJobObject(self.handle, process.as_raw_handle() as HANDLE) };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
     }
 
     #[cfg(windows)]
@@ -10598,13 +10796,20 @@ mod job {
         ) -> Result<(), std::io::Error> {
             Ok(())
         }
+
+        pub fn assign_child_process(
+            &self,
+            _process: &std::process::Child,
+        ) -> Result<(), std::io::Error> {
+            Ok(())
+        }
     }
 }
 
 #[cfg(windows)]
 mod windows_active_user_process {
     use super::{ServiceError, WINDOWS_SERVICE_NAME};
-    use std::ffi::{OsStr, c_void};
+    use std::ffi::{OsStr, OsString, c_void};
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
@@ -10626,6 +10831,7 @@ mod windows_active_user_process {
     pub struct RawProcess {
         process_handle: HANDLE,
         thread_handle: HANDLE,
+        exit_code: Option<i32>,
         waited: bool,
     }
 
@@ -10637,12 +10843,13 @@ mod windows_active_user_process {
         }
 
         pub fn kill(&mut self) -> Result<(), io::Error> {
-            if self.process_handle.is_null() || self.waited {
+            if self.process_handle.is_null() || self.exit_code.is_some() {
                 return Ok(());
             }
             let mut exit_code = 0;
             let ok = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
             if ok != 0 && exit_code != STILL_ACTIVE as u32 {
+                self.exit_code = Some(exit_code as i32);
                 return Ok(());
             }
             let ok = unsafe { TerminateProcess(self.process_handle, 1) };
@@ -10652,16 +10859,53 @@ mod windows_active_user_process {
             Ok(())
         }
 
-        pub fn wait(&mut self) -> Result<(), io::Error> {
-            if self.process_handle.is_null() || self.waited {
-                return Ok(());
+        pub fn try_wait(&mut self) -> Result<Option<Option<i32>>, io::Error> {
+            if let Some(exit_code) = self.exit_code {
+                return Ok(Some(Some(exit_code)));
             }
-            let status = unsafe { WaitForSingleObject(self.process_handle, INFINITE) };
-            if status == WAIT_FAILED {
+            if self.process_handle.is_null() {
+                return Ok(Some(None));
+            }
+            let mut exit_code = 0;
+            let ok = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
+            if ok == 0 {
                 return Err(io::Error::last_os_error());
             }
+            if exit_code == STILL_ACTIVE as u32 {
+                return Ok(None);
+            }
+            let exit_code = exit_code as i32;
+            self.exit_code = Some(exit_code);
             self.waited = true;
-            Ok(())
+            Ok(Some(Some(exit_code)))
+        }
+
+        pub fn wait_code(&mut self) -> Result<Option<i32>, io::Error> {
+            if let Some(exit_code) = self.exit_code {
+                return Ok(Some(exit_code));
+            }
+            if self.process_handle.is_null() {
+                return Ok(None);
+            }
+            if !self.waited {
+                let status = unsafe { WaitForSingleObject(self.process_handle, INFINITE) };
+                if status == WAIT_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                self.waited = true;
+            }
+            let mut exit_code = 0;
+            let ok = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let exit_code = exit_code as i32;
+            self.exit_code = Some(exit_code);
+            Ok(Some(exit_code))
+        }
+
+        pub fn wait(&mut self) -> Result<(), io::Error> {
+            self.wait_code().map(|_| ())
         }
     }
 
@@ -10731,10 +10975,29 @@ mod windows_active_user_process {
     }
 
     pub fn spawn(worker_exe: &Path, args: &[String]) -> Result<RawProcess, ServiceError> {
+        spawn_impl(worker_exe, args.iter().map(|arg| OsStr::new(arg)), "worker")
+    }
+
+    pub fn spawn_os(executable: &Path, args: &[OsString]) -> Result<RawProcess, ServiceError> {
+        spawn_impl(
+            executable,
+            args.iter().map(|arg| arg.as_os_str()),
+            "process",
+        )
+    }
+
+    fn spawn_impl<'a, I>(
+        executable: &Path,
+        args: I,
+        process_label: &str,
+    ) -> Result<RawProcess, ServiceError>
+    where
+        I: IntoIterator<Item = &'a OsStr>,
+    {
         let session_id = unsafe { WTSGetActiveConsoleSessionId() };
         if session_id == u32::MAX {
             return Err(ServiceError::Worker(
-                "no active interactive session is available for active interactive worker"
+                "no active interactive session is available for active interactive process"
                     .to_string(),
             ));
         }
@@ -10769,9 +11032,9 @@ mod windows_active_user_process {
         let primary_token = Handle::new(primary_token);
         let environment = EnvironmentBlock::create(primary_token.raw())?;
 
-        let mut command_line = command_line(worker_exe.as_os_str(), args);
+        let mut command_line = command_line(executable.as_os_str(), args);
         let mut desktop = wide_null("winsta0\\default");
-        let current_directory = worker_exe
+        let current_directory = executable
             .parent()
             .map(|path| path.as_os_str())
             .unwrap_or_else(|| OsStr::new("."));
@@ -10797,7 +11060,7 @@ mod windows_active_user_process {
         };
         if ok == 0 {
             return Err(ServiceError::Worker(format!(
-                "CreateProcessAsUserW failed to launch {WINDOWS_SERVICE_NAME} worker in active interactive session {session_id}: {}",
+                "CreateProcessAsUserW failed to launch {WINDOWS_SERVICE_NAME} {process_label} in active interactive session {session_id}: {}",
                 io::Error::last_os_error()
             )));
         }
@@ -10805,14 +11068,20 @@ mod windows_active_user_process {
         Ok(RawProcess {
             process_handle: process_info.hProcess,
             thread_handle: process_info.hThread,
+            exit_code: None,
             waited: false,
         })
     }
 
-    fn command_line(executable: &OsStr, args: &[String]) -> Vec<u16> {
-        let mut parts = Vec::with_capacity(args.len() + 1);
+    fn command_line<'a, I>(executable: &OsStr, args: I) -> Vec<u16>
+    where
+        I: IntoIterator<Item = &'a OsStr>,
+    {
+        let args = args.into_iter();
+        let (lower_bound, _) = args.size_hint();
+        let mut parts = Vec::with_capacity(lower_bound + 1);
         parts.push(quote_arg(&executable.to_string_lossy()));
-        parts.extend(args.iter().map(|arg| quote_arg(arg)));
+        parts.extend(args.map(|arg| quote_arg(&arg.to_string_lossy())));
         wide_null(&parts.join(" "))
     }
 
@@ -11899,6 +12168,10 @@ allow_py_eval = true
             recording["inputSchema"]["properties"]["target"]["oneOf"][2]["properties"]["cmd_line_filter"]
                 ["type"],
             "string"
+        );
+        assert_eq!(
+            recording["inputSchema"]["properties"]["worker_identity"]["enum"][1],
+            "active_interactive_user"
         );
         assert_eq!(
             recording["inputSchema"]["properties"]["options"]["properties"]["record_mode"]["enum"],
@@ -13253,6 +13526,93 @@ allow_py_eval = true
     }
 
     #[test]
+    fn recording_ttd_attach_uses_attach_args_and_requested_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, invocations) =
+            ttd_test_host_and_invocations(MockTtdRunnerMode::CompletedWithTrace);
+        let response = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "recording.ttd".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "target": { "kind": "attach", "pid": 4242 },
+                "timeout_ms": 1000,
+                "worker_identity": "active_interactive_user"
+            })),
+        });
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["mode"], "attach");
+        assert_eq!(result["worker_identity"], "active_interactive_user");
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].worker_identity,
+            TtdRecorderIdentity::ActiveInteractiveUser
+        );
+        let args = invocations[0]
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.contains(&"-attach".to_string()));
+        assert!(args.contains(&"4242".to_string()));
+        assert!(!args.contains(&"-launch".to_string()));
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let recording_id = result["recording_id"]["id"].as_str().unwrap();
+        let metadata: Value = serde_json::from_str(
+            &fs::read_to_string(
+                workspace
+                    .root()
+                    .join("artifacts")
+                    .join("recordings")
+                    .join(recording_id)
+                    .join("recording.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["target"]["kind"], "attach");
+        assert_eq!(metadata["target"]["pid"], 4242);
+        assert_eq!(metadata["worker_identity"], "active_interactive_user");
+        assert_eq!(
+            metadata["adapter"]["worker_identity"],
+            "active_interactive_user"
+        );
+    }
+
+    #[test]
+    fn ttd_active_user_helper_args_preserve_recorder_args_after_separator() {
+        let args = vec![
+            OsString::from("-out"),
+            OsString::from(r"C:\case\traces"),
+            OsString::from("-attach"),
+            OsString::from("4242"),
+        ];
+        let helper_args = ttd_command_helper_args(
+            Path::new(r"C:\ttd\TTD.exe"),
+            &args,
+            Path::new(r"C:\case\recorder.stdout.txt"),
+            Path::new(r"C:\case\recorder.stderr.txt"),
+        );
+        let text = helper_args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(text[0], "service");
+        assert_eq!(text[1], "run-ttd-command");
+        let separator = text.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            &text[separator + 1..],
+            ["-out", r"C:\case\traces", "-attach", "4242"]
+        );
+    }
+
+    #[test]
     fn recording_ttd_timeout_invokes_stop_and_keeps_trace() {
         let temp = tempfile::tempdir().unwrap();
         let host = ttd_test_host(MockTtdRunnerMode::TimedOutWithTrace);
@@ -14462,11 +14822,13 @@ allow_py_eval = true
 
     struct MockTtdRunner {
         mode: MockTtdRunnerMode,
+        invocations: Arc<Mutex<Vec<TtdRecorderInvocation>>>,
         _temp: tempfile::TempDir,
     }
 
     impl TtdRecorderRunner for MockTtdRunner {
         fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, ServiceError> {
+            self.invocations.lock().unwrap().push(invocation.clone());
             fs::write(
                 &invocation.stdout_path,
                 "Recording process sample.exe (42)\n",
@@ -14509,16 +14871,28 @@ allow_py_eval = true
     }
 
     fn ttd_test_host(mode: MockTtdRunnerMode) -> ServiceHost {
+        ttd_test_host_and_invocations(mode).0
+    }
+
+    fn ttd_test_host_and_invocations(
+        mode: MockTtdRunnerMode,
+    ) -> (ServiceHost, Arc<Mutex<Vec<TtdRecorderInvocation>>>) {
         let temp = tempfile::tempdir().unwrap();
         let ttd_dir = temp.path().join("ttd");
         fs::create_dir_all(&ttd_dir).unwrap();
         fs::write(ttd_dir.join("TTD.exe"), b"fake").unwrap();
-        ServiceHost::with_mock_workers()
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let host = ServiceHost::with_mock_workers()
             .with_capabilities(ServiceCapabilities {
                 ttd_dir: Some(ttd_dir),
                 ..Default::default()
             })
-            .with_ttd_runner(Arc::new(MockTtdRunner { mode, _temp: temp }))
+            .with_ttd_runner(Arc::new(MockTtdRunner {
+                mode,
+                invocations: invocations.clone(),
+                _temp: temp,
+            }));
+        (host, invocations)
     }
 
     fn ttd_out_dir(args: &[OsString]) -> PathBuf {

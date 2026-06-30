@@ -566,6 +566,27 @@ mod tests {
     }
 
     #[test]
+    fn builds_ttd_attach_args() {
+        let target = TtdTarget::Attach { pid: 4242 };
+        let options = TtdRecordingOptions {
+            accept_eula: true,
+            ..Default::default()
+        };
+
+        let args = build_ttd_args(&target, &options, Path::new(r"C:\case\traces"));
+        let text = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(text.contains(&"-out".to_string()));
+        assert!(text.contains(&"-accepteula".to_string()));
+        assert!(text.contains(&"-attach".to_string()));
+        assert!(text.contains(&"4242".to_string()));
+        assert!(!text.contains(&"-launch".to_string()));
+    }
+
+    #[test]
     fn ttd_monitor_rejects_relative_path_with_separator() {
         let request = RecordTtd {
             target: TtdTarget::Monitor {

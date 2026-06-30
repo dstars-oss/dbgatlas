@@ -84,7 +84,7 @@ recording policy 的文档目标：
 - attach 不回填历史，只记录 `recording.start` 之后的事件。
 - WPR/WPAExport 不作为主采集链路，只作为未来诊断、比对或 fallback 方向。
 
-安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。安装态 debug worker 默认使用 LocalSystem，并支持请求级 active interactive user override；IDA reverse worker 使用 active interactive session 用户，不使用 LocalSystem fallback。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
+安装态 service 可以为 ETW recording 使用 LocalSystem 或 runtime config 指定的受控 identity。安装态 debug worker 默认使用 LocalSystem，并支持请求级 active interactive user override；`recording.ttd` 默认在 service 进程身份下启动 `TTD.exe`，但请求可用 `worker_identity: "active_interactive_user"` 将 TTD recorder 和 timeout stop 命令切到当前交互用户会话，用于用户级 attach 到已运行 PID。IDA reverse worker 使用 active interactive session 用户，不使用 LocalSystem fallback。开发态 `service run` 使用当前用户；权限不足时返回结构化错误，不自动提权。
 
 ## 校验原则
 

@@ -6,15 +6,16 @@ use dbgatlas_recording::{
 };
 use dbgatlas_service::{
     DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
-    ServiceConfig, ServiceHost, WindowsServiceApplyUpdateOptions, WindowsServiceInstallOptions,
-    WindowsServiceRunOptions, WindowsServiceUninstallOptions, apply_windows_service_update,
-    install_windows_service, installed_client_config, invoke_http_json_rpc, run_http_service,
-    run_windows_service_dispatcher, start_windows_service, status_windows_service,
-    stop_windows_service, uninstall_windows_service,
+    ServiceConfig, ServiceHost, TtdCommandHelperOptions, WindowsServiceApplyUpdateOptions,
+    WindowsServiceInstallOptions, WindowsServiceRunOptions, WindowsServiceUninstallOptions,
+    apply_windows_service_update, install_windows_service, installed_client_config,
+    invoke_http_json_rpc, run_http_service, run_ttd_command_helper, run_windows_service_dispatcher,
+    start_windows_service, status_windows_service, stop_windows_service, uninstall_windows_service,
 };
 use dbgatlas_workspace::{Workspace, WorkspaceInitOptions};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -122,6 +123,17 @@ enum ServiceCommand {
         timeout_ms: u64,
         #[arg(long)]
         no_restart: bool,
+    },
+    #[command(hide = true)]
+    RunTtdCommand {
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        stdout_path: PathBuf,
+        #[arg(long)]
+        stderr_path: PathBuf,
+        #[arg(last = true)]
+        args: Vec<OsString>,
     },
 }
 
@@ -266,6 +278,8 @@ enum RecordingCommand {
         record_mode: String,
         #[arg(long, default_value = "default")]
         replay_cpu_support: String,
+        #[arg(long, default_value = "default")]
+        worker_identity: String,
         #[arg(long)]
         show_ui: bool,
         #[arg(last = true)]
@@ -513,6 +527,20 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
             })?;
             print_service_command_result(result, as_json)?;
         }
+        ServiceCommand::RunTtdCommand {
+            executable,
+            stdout_path,
+            stderr_path,
+            args,
+        } => {
+            let exit_code = run_ttd_command_helper(TtdCommandHelperOptions {
+                executable,
+                args,
+                stdout_path,
+                stderr_path,
+            });
+            std::process::exit(exit_code);
+        }
     }
     Ok(())
 }
@@ -683,6 +711,7 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
             modules,
             record_mode,
             replay_cpu_support,
+            worker_identity,
             show_ui,
             args,
             endpoint,
@@ -729,6 +758,7 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
                     "project_root": project_root,
                     "target": target,
                     "timeout_ms": timeout_ms,
+                    "worker_identity": parse_ttd_worker_identity(&worker_identity)?,
                     "options": options,
                 }),
             )?;
@@ -870,6 +900,14 @@ fn parse_ttd_replay_cpu_support(value: &str) -> Result<TtdReplayCpuSupport> {
         "intel_avx_required" => Ok(TtdReplayCpuSupport::IntelAvxRequired),
         "intel_avx2_required" => Ok(TtdReplayCpuSupport::IntelAvx2Required),
         other => anyhow::bail!("unsupported --replay-cpu-support `{other}`"),
+    }
+}
+
+fn parse_ttd_worker_identity(value: &str) -> Result<&'static str> {
+    match value {
+        "default" => Ok("default"),
+        "active_interactive_user" => Ok("active_interactive_user"),
+        other => anyhow::bail!("unsupported --worker-identity `{other}`"),
     }
 }
 
