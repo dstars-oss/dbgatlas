@@ -1931,7 +1931,7 @@ impl ServiceHost {
             .ida_install_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_IDA_INSTALL_DIR));
-        let worker = self.supervisor.create_worker(WorkerCreateRequest {
+        let worker = match self.supervisor.create_worker(WorkerCreateRequest {
             session_id: session_id.clone(),
             project_root: params.project_root.clone(),
             internal_workspace_root: workspace.root().to_path_buf(),
@@ -1939,7 +1939,40 @@ impl ServiceHost {
             startup_timeout_ms: 5_000,
             dbgeng_dirs: self.capabilities.dbgeng_dirs.clone(),
             identity: Some(WorkerIdentity::ActiveInteractiveUser),
-        })?;
+        }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let message = diagnose_reverse_open_error(format!(
+                    "failed to create reverse worker: {error}"
+                ));
+                let artifacts = record_failed_reverse_operation(
+                    &workspace,
+                    &session_id,
+                    &artifact_dir,
+                    &operation_id,
+                    "reverse.session.open",
+                    &message,
+                )?;
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: "reverse.session.open".to_string(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.finish_operation_in_memory(
+                    &operation_id,
+                    ServiceOperationStatus::Failed,
+                    message.clone(),
+                    artifacts,
+                    None,
+                )?;
+                return Err(ServiceError::Worker(message));
+            }
+        };
 
         let open = self.supervisor.request_worker(
             &worker,
@@ -3802,33 +3835,79 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             request.startup_timeout_ms,
             dbgeng_dir_count,
         ));
-        let transport = WorkerTransport::create_server(&pipe_name)?;
+        let transport = WorkerTransport::create_server(&pipe_name).map_err(|error| {
+            append_worker_create_failed_log(
+                &worker_id,
+                &request.session_id,
+                &identity,
+                started,
+                "pipe_server",
+                &error.to_string(),
+            );
+            ServiceError::Worker(format!("failed to create worker pipe server: {error}"))
+        })?;
         let worker_exe = self
             .worker_exe
             .clone()
             .map(Ok)
-            .unwrap_or_else(worker_executable_path)?;
+            .unwrap_or_else(worker_executable_path)
+            .map_err(|error| {
+                append_worker_create_failed_log(
+                    &worker_id,
+                    &request.session_id,
+                    &identity,
+                    started,
+                    "worker_executable",
+                    &error.to_string(),
+                );
+                ServiceError::Worker(format!("failed to resolve worker executable path: {error}"))
+            })?;
         let mut child = spawn_worker_process(
             &worker_exe,
             &pipe_name,
             request.session_id.id.as_str(),
             &identity,
             &dbgeng_dirs,
-        )?;
-        self.job.assign_process(&child)?;
+        )
+        .map_err(|error| {
+            append_worker_create_failed_log(
+                &worker_id,
+                &request.session_id,
+                &identity,
+                started,
+                "spawn",
+                &error.to_string(),
+            );
+            error
+        })?;
+        if let Err(error) = self.job.assign_process(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            append_worker_create_failed_log(
+                &worker_id,
+                &request.session_id,
+                &identity,
+                started,
+                "assign_job",
+                &error.to_string(),
+            );
+            return Err(ServiceError::Worker(format!(
+                "failed to assign worker process to cleanup job: {error}"
+            )));
+        }
         let connected = match transport.connect(request.startup_timeout_ms) {
             Ok(connected) => connected,
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                append_service_diagnostic_log(&format!(
-                    "worker_create_failed worker_id={} session_id={} identity={} duration_ms={} error={}",
-                    sanitize_log_value(worker_id.as_str()),
-                    sanitize_log_value(request.session_id.id.as_str()),
-                    sanitize_log_value(&format!("{:?}", identity)),
-                    started.elapsed().as_millis(),
-                    sanitize_log_value(&error.to_string())
-                ));
+                append_worker_create_failed_log(
+                    &worker_id,
+                    &request.session_id,
+                    &identity,
+                    started,
+                    "connect",
+                    &error.to_string(),
+                );
                 return Err(error);
             }
         };
@@ -3969,6 +4048,25 @@ impl Drop for ProcessWorkerSupervisor {
             }
         }
     }
+}
+
+fn append_worker_create_failed_log(
+    worker_id: &Id,
+    session_id: &SessionRef,
+    identity: &WorkerIdentity,
+    started: Instant,
+    stage: &str,
+    error: &str,
+) {
+    append_service_diagnostic_log(&format!(
+        "worker_create_failed worker_id={} session_id={} identity={} stage={} duration_ms={} error={}",
+        sanitize_log_value(worker_id.as_str()),
+        sanitize_log_value(session_id.id.as_str()),
+        sanitize_log_value(&format!("{:?}", identity)),
+        sanitize_log_value(stage),
+        started.elapsed().as_millis(),
+        sanitize_log_value(error)
+    ));
 }
 
 fn write_recording_start_artifacts(
@@ -13293,6 +13391,45 @@ allow_py_eval = true
     }
 
     #[test]
+    fn failed_reverse_open_records_worker_create_error_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let host = ServiceHost::new(Arc::new(FailingCreateWorkerSupervisor));
+
+        let open = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "reverse.session.open".to_string(),
+            params: Some(json!({
+                "project_root": temp.path(),
+                "database_path": database
+            })),
+        });
+        assert!(open.error.is_some());
+
+        let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+        let artifacts = workspace.list_artifacts().unwrap();
+        let error_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "reverse.adapter_error")
+            .expect("reverse worker create error artifact is recorded");
+        let error_path = workspace
+            .resolve_artifact_relative_path(&error_artifact.relative_path)
+            .unwrap();
+        let error_text = fs::read_to_string(error_path).unwrap();
+        assert!(error_text.contains("failed to create reverse worker"));
+        assert!(error_text.contains("os error 5"));
+        let operations = workspace.list_operations().unwrap();
+        let failed = operations
+            .iter()
+            .find(|operation| operation.capability == "reverse.session.open")
+            .unwrap();
+        assert!(matches!(failed.status, OperationStatus::Failed));
+        assert!(failed.summary.contains("failed to create reverse worker"));
+    }
+
+    #[test]
     fn failed_reverse_close_keeps_session_reusable_and_records_failure() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("sample.exe");
@@ -14920,6 +15057,8 @@ allow_py_eval = true
         operation_id: Mutex<Option<OperationRef>>,
     }
 
+    struct FailingCreateWorkerSupervisor;
+
     struct FailingStartSupervisor;
 
     struct FailingEvalSupervisor;
@@ -15059,6 +15198,40 @@ allow_py_eval = true
                 }
                 other => mock_worker_response(other),
             }
+        }
+
+        fn cancel_worker_operation(
+            &self,
+            _worker: &WorkerHandle,
+            _session_id: &SessionRef,
+            _operation_id: &OperationRef,
+        ) -> Result<WorkerCancelOutcome, ServiceError> {
+            Ok(WorkerCancelOutcome::Notified)
+        }
+
+        fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for FailingCreateWorkerSupervisor {
+        fn create_worker(
+            &self,
+            _request: WorkerCreateRequest,
+        ) -> Result<WorkerHandle, ServiceError> {
+            Err(ServiceError::Io(std::io::Error::from_raw_os_error(5)))
+        }
+
+        fn request_worker(
+            &self,
+            _worker: &WorkerHandle,
+            _request: WorkerRequest,
+        ) -> Result<WorkerResponse, ServiceError> {
+            unreachable!("create_worker fails before worker requests")
         }
 
         fn cancel_worker_operation(
