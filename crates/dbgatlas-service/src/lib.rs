@@ -64,11 +64,6 @@ pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
     "dbgatlas_etw.dll",
     "dbgatlas_ida.dll",
 ];
-pub const WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES: &[&str] = &[
-    "libgcc_s_seh-1.dll",
-    "libstdc++-6.dll",
-    "libwinpthread-1.dll",
-];
 pub const DEFAULT_IDA_INSTALL_DIR: &str = r"C:\Program Files\IDA Professional 9.3";
 const TTD_COMMAND_HELPER_ERROR_PREFIX: &str = "dbgatlas TTD command helper error:";
 
@@ -7561,17 +7556,6 @@ pub fn discover_service_payload(
             source,
         });
     }
-    for file_name in WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES {
-        let source = source_dir.join(file_name);
-        if !source.is_file() {
-            continue;
-        }
-        payload.push(ServicePayloadFile {
-            file_name: (*file_name).to_string(),
-            destination: destination_dir.join(file_name),
-            source,
-        });
-    }
     if !missing.is_empty() {
         let files = missing
             .iter()
@@ -12279,17 +12263,10 @@ mod tests {
         for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
             fs::write(temp.path().join(file_name), "").unwrap();
         }
-        for file_name in WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES {
-            fs::write(temp.path().join(file_name), "").unwrap();
-        }
 
         let payload = discover_service_payload(temp.path(), &destination).unwrap();
 
-        assert_eq!(
-            payload.len(),
-            WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len()
-                + WINDOWS_SERVICE_OPTIONAL_PAYLOAD_FILES.len()
-        );
+        assert_eq!(payload.len(), WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len());
         assert!(payload.iter().any(|file| {
             file.file_name == "dbgatlas-worker.exe"
                 && file.destination == destination.join("dbgatlas-worker.exe")
@@ -12298,28 +12275,33 @@ mod tests {
             file.file_name == "dbgatlas_dbgeng.dll"
                 && file.destination == destination.join("dbgatlas_dbgeng.dll")
         }));
-        assert!(payload.iter().any(|file| {
-            file.file_name == "libstdc++-6.dll"
-                && file.destination == destination.join("libstdc++-6.dll")
-        }));
     }
 
     #[test]
-    fn payload_discovery_accepts_payload_without_optional_runtime_files() {
+    fn payload_discovery_ignores_legacy_mingw_runtime_files() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("install-bin");
         for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(temp.path().join(file_name), "").unwrap();
+        }
+        for file_name in [
+            "libgcc_s_seh-1.dll",
+            "libstdc++-6.dll",
+            "libwinpthread-1.dll",
+        ] {
             fs::write(temp.path().join(file_name), "").unwrap();
         }
 
         let payload = discover_service_payload(temp.path(), &destination).unwrap();
 
         assert_eq!(payload.len(), WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.len());
-        assert!(
-            !payload
-                .iter()
-                .any(|file| file.file_name == "libstdc++-6.dll")
-        );
+        for file_name in [
+            "libgcc_s_seh-1.dll",
+            "libstdc++-6.dll",
+            "libwinpthread-1.dll",
+        ] {
+            assert!(!payload.iter().any(|file| file.file_name == file_name));
+        }
     }
 
     #[test]

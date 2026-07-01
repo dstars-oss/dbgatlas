@@ -7,17 +7,15 @@
     Scope="perMachine">
     <!--
       The package registers a machine-level Windows service, so service custom
-      actions run elevated. INSTALLROOT must resolve to the intended user's
-      Local Programs path; managed installs should pass INSTALLROOT explicitly.
+      actions run elevated. INSTALLROOT defaults to a machine-wide Program
+      Files path; managed installs may pass INSTALLROOT explicitly.
     -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of DbgAtlas is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <StandardDirectory Id="LocalAppDataFolder">
-      <Directory Id="ProgramsFolder" Name="Programs">
-        <Directory Id="INSTALLROOT" Name="dbgatlas">
-          <Directory Id="INSTALLBINDIR" Name="bin" />
-        </Directory>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLROOT" Name="DbgAtlas">
+        <Directory Id="INSTALLBINDIR" Name="bin" />
       </Directory>
     </StandardDirectory>
 
@@ -25,42 +23,40 @@
       <ComponentRef Id="DbgAtlasPayload" />
     </Feature>
 
-    <Component Id="DbgAtlasPayload" Directory="INSTALLBINDIR" Guid="{A72D2958-F040-4C01-8012-D20DB9051FF5}">
+    <Component Id="DbgAtlasPayload" Directory="INSTALLBINDIR" Guid="{A72D2958-F040-4C01-8012-D20DB9051FF5}" Bitness="always64">
       <File Id="DbgatlasExe" Source="$(var.ReleaseDir)\dbgatlas.exe" KeyPath="yes" />
       <File Source="$(var.ReleaseDir)\dbgatlas-worker.exe" />
       <File Source="$(var.ReleaseDir)\dbgatlas_dbgeng.dll" />
       <File Source="$(var.ReleaseDir)\dbgatlas_etw.dll" />
       <File Source="$(var.ReleaseDir)\dbgatlas_ida.dll" />
-      <File Source="$(var.ReleaseDir)\libgcc_s_seh-1.dll" />
-      <File Source="$(var.ReleaseDir)\libstdc++-6.dll" />
-      <File Source="$(var.ReleaseDir)\libwinpthread-1.dll" />
     </Component>
 
+    <!-- MSI directory properties end with '\'; appending '.' keeps the closing quote from being escaped. -->
     <CustomAction
       Id="InstallDbgAtlasService"
       FileRef="DbgatlasExe"
-      ExeCommand="service install --install-root &quot;[INSTALLROOT]&quot; --payload-mode use-existing --force --bind 127.0.0.1:7331"
+      ExeCommand="service install --install-root &quot;[INSTALLROOT].&quot; --payload-mode use-existing --force --bind 127.0.0.1:7331"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
     <CustomAction
       Id="StartDbgAtlasService"
       FileRef="DbgatlasExe"
-      ExeCommand="service start --install-root &quot;[INSTALLROOT]&quot;"
+      ExeCommand="service start --install-root &quot;[INSTALLROOT].&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
     <CustomAction
       Id="StopDbgAtlasService"
       FileRef="DbgatlasExe"
-      ExeCommand="service stop --install-root &quot;[INSTALLROOT]&quot;"
+      ExeCommand="service stop --install-root &quot;[INSTALLROOT].&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
     <CustomAction
       Id="UninstallDbgAtlasService"
       FileRef="DbgatlasExe"
-      ExeCommand="service uninstall --install-root &quot;[INSTALLROOT]&quot;"
+      ExeCommand="service uninstall --install-root &quot;[INSTALLROOT].&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />

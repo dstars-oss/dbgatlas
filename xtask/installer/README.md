@@ -7,16 +7,23 @@ Expected variables:
 - `ReleaseDir`: directory containing the complete release payload.
 - `ProductVersion`: MSI product version.
 
-The MSI installs payload files into the target user's Local Programs layout:
+Build this package as x64 so the Program Files directory and payload component
+bitness are consistent:
+
+```powershell
+wix build -arch x64 DbgAtlas.wxs -d ReleaseDir=<release-payload> -d ProductVersion=<version> -o DbgAtlas-<version>-x64.msi
+```
+
+The MSI installs payload files into a machine-wide Program Files layout:
 
 ```text
-[LocalAppDataFolder]Programs\dbgatlas\bin
+[ProgramFiles64Folder]DbgAtlas\bin
 ```
 
 This `.wxs` is intentionally scoped as a machine-level service bootstrap because
-`dbgatlas service install` registers the `DbgAtlas` Windows service. For managed
-or elevated installs, pass `INSTALLROOT` explicitly so repair/uninstall uses the
-same user profile path that owns the payload.
+`dbgatlas service install` registers the `DbgAtlas` Windows service. Managed
+installs may pass `INSTALLROOT` explicitly to use another machine-wide install
+root.
 
 Service initialization is delegated to:
 
