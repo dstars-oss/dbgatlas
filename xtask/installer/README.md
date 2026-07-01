@@ -8,10 +8,12 @@ Expected variables:
 - `ProductVersion`: MSI product version.
 
 Build this package as x64 so the Program Files directory and payload component
-bitness are consistent:
+bitness are consistent. The installer uses the WiX UI extension for the final
+diagnostic warning page:
 
 ```powershell
-wix build -arch x64 DbgAtlas.wxs -d ReleaseDir=<release-payload> -d ProductVersion=<version> -o DbgAtlas-<version>-x64.msi
+wix extension add WixToolset.UI.wixext/7.0.0 --acceptEula wix7
+wix build -acceptEula wix7 -ext WixToolset.UI.wixext -arch x64 DbgAtlas.wxs -d ReleaseDir=<release-payload> -d ProductVersion=<version> -o DbgAtlas-<version>-x64.msi
 ```
 
 The MSI installs payload files into a machine-wide Program Files layout:
@@ -33,3 +35,13 @@ dbgatlas.exe service install --payload-mode use-existing --install-root [INSTALL
 
 The Rust service installer owns `etc\runtime.toml`, `etc\token`, `var\log`, and
 `bin\rt`. The MSI owns the files it places directly under `bin`.
+
+After service startup, the MSI runs:
+
+```text
+dbgatlas.exe service doctor --install-root [INSTALLROOT] --report-path [INSTALLROOT]var\log\postinstall-report.txt --msi-summary-path [INSTALLROOT]var\log\postinstall-summary.txt
+```
+
+The doctor command writes a full `var\log\postinstall-report.txt` and a short
+`var\log\postinstall-summary.txt`. Interactive installs display the short
+summary on the final WiX exit dialog through `WIXUI_EXITDIALOGOPTIONALTEXT`.

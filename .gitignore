@@ -3,6 +3,7 @@
 /scratch-workspace/
 /temp/*
 !/temp/.gitkeep
+/.wix/
 /.codex/
 /docs/superpowers/
 *.pdb

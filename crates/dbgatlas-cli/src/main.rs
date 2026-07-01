@@ -7,10 +7,11 @@ use dbgatlas_recording::{
 use dbgatlas_service::{
     DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     ServiceConfig, ServiceHost, TtdCommandHelperOptions, WindowsServiceApplyUpdateOptions,
-    WindowsServiceControlOptions, WindowsServiceInstallOptions, WindowsServicePayloadMode,
-    WindowsServiceRunOptions, WindowsServiceUninstallOptions, apply_windows_service_update,
-    install_windows_service, installed_client_config, invoke_http_json_rpc, run_http_service,
-    run_ttd_command_helper, run_windows_service_dispatcher, start_windows_service,
+    WindowsServiceControlOptions, WindowsServiceDoctorOptions, WindowsServiceInstallOptions,
+    WindowsServicePayloadMode, WindowsServiceRunOptions, WindowsServiceUninstallOptions,
+    apply_windows_service_update, format_doctor_report, install_windows_service,
+    installed_client_config, invoke_http_json_rpc, run_http_service, run_ttd_command_helper,
+    run_windows_service_dispatcher, run_windows_service_doctor, start_windows_service,
     status_windows_service, stop_windows_service, uninstall_windows_service,
 };
 use dbgatlas_workspace::{Workspace, WorkspaceInitOptions};
@@ -143,6 +144,14 @@ enum ServiceCommand {
     Status {
         #[arg(long)]
         install_root: Option<PathBuf>,
+    },
+    Doctor {
+        #[arg(long)]
+        install_root: Option<PathBuf>,
+        #[arg(long)]
+        report_path: Option<PathBuf>,
+        #[arg(long)]
+        msi_summary_path: Option<PathBuf>,
     },
     Uninstall {
         #[arg(long)]
@@ -568,6 +577,18 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
         ServiceCommand::Status { install_root } => {
             let result = status_windows_service(WindowsServiceControlOptions { install_root })?;
             print_service_command_result(result, as_json)?;
+        }
+        ServiceCommand::Doctor {
+            install_root,
+            report_path,
+            msi_summary_path,
+        } => {
+            let report = run_windows_service_doctor(WindowsServiceDoctorOptions {
+                install_root,
+                report_path,
+                msi_summary_path,
+            })?;
+            print_doctor_command_result(report, as_json)?;
         }
         ServiceCommand::Uninstall {
             install_root,
@@ -998,6 +1019,17 @@ fn print_service_command_result(
     println!("config: {}", result.config_path.display());
     println!("token file: {}", result.token_file.display());
     println!("log dir: {}", result.log_dir.display());
+    Ok(())
+}
+
+fn print_doctor_command_result(
+    report: dbgatlas_service::WindowsServiceDoctorReport,
+    as_json: bool,
+) -> Result<()> {
+    if as_json {
+        return print_json(serde_json::to_value(report)?);
+    }
+    print!("{}", format_doctor_report(&report));
     Ok(())
 }
 

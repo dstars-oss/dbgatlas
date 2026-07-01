@@ -55,6 +55,8 @@ pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
 pub const WINDOWS_SERVICE_TOKEN_FILE: &str = "token";
 pub const WINDOWS_SERVICE_INSTALL_MARKER_FILE: &str = ".dbgatlas-install-root";
 pub const WINDOWS_SERVICE_LOG_RETENTION_DAYS: i64 = 7;
+pub const WINDOWS_SERVICE_POSTINSTALL_REPORT_FILE: &str = "postinstall-report.txt";
+pub const WINDOWS_SERVICE_POSTINSTALL_SUMMARY_FILE: &str = "postinstall-summary.txt";
 pub const DEFAULT_SERVICE_UPDATE_TIMEOUT_MS: u64 = 60_000;
 pub const SERVICE_UPDATE_DELAY_MS: u64 = 500;
 pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
@@ -6831,7 +6833,6 @@ fn append_windbg_runtime_source_candidates(
     }
 }
 
-#[cfg(windows)]
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
@@ -7294,6 +7295,53 @@ pub struct WindowsServiceCommandResult {
     pub payload: Vec<ServicePayloadFile>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WindowsServiceDoctorOptions {
+    pub install_root: Option<PathBuf>,
+    pub report_path: Option<PathBuf>,
+    pub msi_summary_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorCheckStatus {
+    Ok,
+    Warning,
+}
+
+impl DoctorCheckStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DoctorCheck {
+    pub id: String,
+    pub label: String,
+    pub status: DoctorCheckStatus,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WindowsServiceDoctorReport {
+    pub status: DoctorCheckStatus,
+    pub install_root: PathBuf,
+    pub checks: Vec<DoctorCheck>,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msi_summary_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindowsServiceUpdateAccepted {
     pub status: String,
@@ -7589,6 +7637,490 @@ fn installed_client_config_from_paths(
     };
     validate_config(&config)?;
     Ok(Some(config))
+}
+
+pub fn run_windows_service_doctor(
+    options: WindowsServiceDoctorOptions,
+) -> Result<WindowsServiceDoctorReport, ServiceError> {
+    let paths = windows_service_paths_for_root(options.install_root.as_deref())?;
+    let (runtime, config_check) = load_doctor_runtime_config(&paths);
+    let tools =
+        runtime.resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(&paths.windbg_runtime_dir);
+    let report = collect_windows_service_doctor_report(
+        &paths,
+        &runtime,
+        &tools,
+        config_check,
+        options.report_path,
+        options.msi_summary_path,
+    );
+    if let Some(report_path) = &report.report_path {
+        write_text_file(report_path, &format_doctor_report(&report))?;
+    }
+    if let Some(summary_path) = &report.msi_summary_path {
+        write_text_file(summary_path, &format_doctor_msi_summary(&report))?;
+    }
+    let report_path_for_log = report
+        .report_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    append_service_diagnostic_log_for_paths(
+        &paths,
+        &format!(
+            "service_doctor status={} warning_count={} report_path={}",
+            report.status.label(),
+            report.warnings.len(),
+            log_value(report_path_for_log.as_deref())
+        ),
+    );
+    Ok(report)
+}
+
+fn load_doctor_runtime_config(paths: &ServiceInstallPaths) -> (RuntimeConfig, DoctorCheck) {
+    if !paths.config_path.is_file() {
+        return (
+            RuntimeConfig::default(),
+            doctor_check(
+                "runtime_config",
+                "Runtime config",
+                DoctorCheckStatus::Warning,
+                format!(
+                    "runtime config was not found at {}; using defaults for diagnostics",
+                    paths.config_path.display()
+                ),
+                None,
+                Some(paths.config_path.clone()),
+            ),
+        );
+    }
+    match RuntimeConfig::load(&paths.config_path) {
+        Ok(runtime) => (
+            runtime,
+            doctor_check(
+                "runtime_config",
+                "Runtime config",
+                DoctorCheckStatus::Ok,
+                "runtime config loaded".to_string(),
+                None,
+                Some(paths.config_path.clone()),
+            ),
+        ),
+        Err(error) => (
+            RuntimeConfig::default(),
+            doctor_check(
+                "runtime_config",
+                "Runtime config",
+                DoctorCheckStatus::Warning,
+                format!(
+                    "runtime config could not be loaded; using defaults for diagnostics: {error}"
+                ),
+                None,
+                Some(paths.config_path.clone()),
+            ),
+        ),
+    }
+}
+
+fn collect_windows_service_doctor_report(
+    paths: &ServiceInstallPaths,
+    runtime: &RuntimeConfig,
+    tools: &dbgatlas_runtime::ResolvedToolPaths,
+    config_check: DoctorCheck,
+    report_path: Option<PathBuf>,
+    msi_summary_path: Option<PathBuf>,
+) -> WindowsServiceDoctorReport {
+    let mut checks = vec![
+        config_check,
+        payload_doctor_check(paths),
+        vcruntime_doctor_check(paths),
+        ucrt_doctor_check(paths),
+        service_health_doctor_check(paths),
+        dbgeng_doctor_check(tools),
+        ttd_doctor_check(tools),
+        ida_doctor_check(runtime),
+    ];
+    let warnings = checks
+        .iter()
+        .filter(|check| check.status == DoctorCheckStatus::Warning)
+        .map(|check| check.summary.clone())
+        .collect::<Vec<_>>();
+    let status = if warnings.is_empty() {
+        DoctorCheckStatus::Ok
+    } else {
+        DoctorCheckStatus::Warning
+    };
+    WindowsServiceDoctorReport {
+        status,
+        install_root: paths.root_dir.clone(),
+        checks: {
+            checks.shrink_to_fit();
+            checks
+        },
+        warnings,
+        report_path,
+        msi_summary_path,
+    }
+}
+
+fn payload_doctor_check(paths: &ServiceInstallPaths) -> DoctorCheck {
+    let missing = WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES
+        .iter()
+        .map(|file_name| paths.bin_dir.join(file_name))
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        doctor_check(
+            "payload",
+            "Release payload",
+            DoctorCheckStatus::Ok,
+            "required DbgAtlas payload files are present".to_string(),
+            None,
+            Some(paths.bin_dir.clone()),
+        )
+    } else {
+        doctor_check(
+            "payload",
+            "Release payload",
+            DoctorCheckStatus::Warning,
+            format!("required payload files are missing: {}", missing.join(", ")),
+            None,
+            Some(paths.bin_dir.clone()),
+        )
+    }
+}
+
+fn vcruntime_doctor_check(paths: &ServiceInstallPaths) -> DoctorCheck {
+    match find_runtime_file("VCRUNTIME140.dll", paths) {
+        Some(path) => doctor_check(
+            "vcruntime",
+            "Microsoft Visual C++ runtime",
+            DoctorCheckStatus::Ok,
+            "VCRUNTIME140.dll was found".to_string(),
+            None,
+            Some(path),
+        ),
+        None => doctor_check(
+            "vcruntime",
+            "Microsoft Visual C++ runtime",
+            DoctorCheckStatus::Warning,
+            "VCRUNTIME140.dll was not found; install the Microsoft Visual C++ Redistributable x64 if DbgAtlas fails to start".to_string(),
+            None,
+            None,
+        ),
+    }
+}
+
+fn ucrt_doctor_check(paths: &ServiceInstallPaths) -> DoctorCheck {
+    match find_runtime_file("ucrtbase.dll", paths) {
+        Some(path) => doctor_check(
+            "ucrt",
+            "Universal C Runtime",
+            DoctorCheckStatus::Ok,
+            "ucrtbase.dll was found".to_string(),
+            None,
+            Some(path),
+        ),
+        None => doctor_check(
+            "ucrt",
+            "Universal C Runtime",
+            DoctorCheckStatus::Warning,
+            "ucrtbase.dll was not found; install current Windows updates or the Universal C Runtime if DbgAtlas fails to start".to_string(),
+            None,
+            None,
+        ),
+    }
+}
+
+fn service_health_doctor_check(paths: &ServiceInstallPaths) -> DoctorCheck {
+    let config = match installed_client_config_from_paths(paths) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return doctor_check(
+                "service_health",
+                "Installed service health",
+                DoctorCheckStatus::Warning,
+                "installed service client config was not available; service.health was not checked"
+                    .to_string(),
+                None,
+                Some(paths.root_dir.clone()),
+            );
+        }
+        Err(error) => {
+            return doctor_check(
+                "service_health",
+                "Installed service health",
+                DoctorCheckStatus::Warning,
+                format!("installed service client config could not be loaded: {error}"),
+                None,
+                Some(paths.root_dir.clone()),
+            );
+        }
+    };
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut last_error = None;
+    while started.elapsed() <= timeout {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!("doctor-health")),
+            method: "service.health".to_string(),
+            params: Some(json!({})),
+        };
+        match invoke_http_json_rpc(config.bind, &config.bearer_token, &request) {
+            Ok(response) if response.error.is_none() => {
+                return doctor_check(
+                    "service_health",
+                    "Installed service health",
+                    DoctorCheckStatus::Ok,
+                    "service.health responded successfully".to_string(),
+                    Some(format!("http://{}/rpc", config.bind)),
+                    Some(paths.installed_exe.clone()),
+                );
+            }
+            Ok(response) => {
+                last_error = response.error.map(|error| error.message);
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    doctor_check(
+        "service_health",
+        "Installed service health",
+        DoctorCheckStatus::Warning,
+        format!(
+            "service.health did not respond successfully at http://{}/rpc within {} ms",
+            config.bind,
+            timeout.as_millis()
+        ),
+        last_error.map(|error| format!("last error: {error}")),
+        Some(paths.installed_exe.clone()),
+    )
+}
+
+fn dbgeng_doctor_check(tools: &dbgatlas_runtime::ResolvedToolPaths) -> DoctorCheck {
+    if tools.dbgeng_candidates.is_empty() {
+        return doctor_check(
+            "dbgeng",
+            "WinDbg DbgEng runtime",
+            DoctorCheckStatus::Warning,
+            "dbgeng.dll was not detected; debug sessions may fail until WinDbg or Windows Debugging Tools are installed".to_string(),
+            None,
+            None,
+        );
+    }
+    let detail = tools
+        .dbgeng_candidates
+        .iter()
+        .map(|location| format!("{:?}: {}", location.source, location.dir.display()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    doctor_check(
+        "dbgeng",
+        "WinDbg DbgEng runtime",
+        DoctorCheckStatus::Ok,
+        "dbgeng.dll candidate was detected".to_string(),
+        Some(detail),
+        tools.dbgeng.as_ref().map(|location| location.dir.clone()),
+    )
+}
+
+fn ttd_doctor_check(tools: &dbgatlas_runtime::ResolvedToolPaths) -> DoctorCheck {
+    match &tools.ttd {
+        Some(location) => doctor_check(
+            "ttd",
+            "Time Travel Debugging",
+            DoctorCheckStatus::Ok,
+            "TTD.exe was found".to_string(),
+            Some(format!("{:?}: {}", location.source, location.dir.display())),
+            Some(location.dir.join("TTD.exe")),
+        ),
+        None => doctor_check(
+            "ttd",
+            "Time Travel Debugging",
+            DoctorCheckStatus::Warning,
+            "TTD.exe was not detected; TTD recording is unavailable until WinDbg/TTD is installed"
+                .to_string(),
+            None,
+            None,
+        ),
+    }
+}
+
+fn ida_doctor_check(runtime: &RuntimeConfig) -> DoctorCheck {
+    let install_dir = runtime
+        .tools
+        .ida
+        .install_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IDA_INSTALL_DIR));
+    let ida_dll = install_dir.join("ida.dll");
+    let idalib_dll = install_dir.join("idalib.dll");
+    if install_dir.is_dir() && ida_dll.is_file() && idalib_dll.is_file() {
+        return doctor_check(
+            "ida",
+            "IDA Pro",
+            DoctorCheckStatus::Ok,
+            "IDA runtime files were found".to_string(),
+            Some("ida.dll and idalib.dll are present".to_string()),
+            Some(install_dir),
+        );
+    }
+    let mut missing = Vec::new();
+    if !install_dir.is_dir() {
+        missing.push("install directory");
+    }
+    if !ida_dll.is_file() {
+        missing.push("ida.dll");
+    }
+    if !idalib_dll.is_file() {
+        missing.push("idalib.dll");
+    }
+    doctor_check(
+        "ida",
+        "IDA Pro",
+        DoctorCheckStatus::Warning,
+        format!(
+            "IDA Pro 9.3 runtime was not detected at {}; reverse features are unavailable unless callers pass a valid ida_install_dir",
+            install_dir.display()
+        ),
+        Some(format!("missing {}", missing.join(", "))),
+        Some(install_dir),
+    )
+}
+
+fn doctor_check(
+    id: &str,
+    label: &str,
+    status: DoctorCheckStatus,
+    summary: String,
+    detail: Option<String>,
+    path: Option<PathBuf>,
+) -> DoctorCheck {
+    DoctorCheck {
+        id: id.to_string(),
+        label: label.to_string(),
+        status,
+        summary,
+        detail,
+        path,
+    }
+}
+
+fn find_runtime_file(file_name: &str, paths: &ServiceInstallPaths) -> Option<PathBuf> {
+    runtime_search_dirs(paths)
+        .into_iter()
+        .map(|dir| dir.join(file_name))
+        .find(|path| path.is_file())
+}
+
+fn runtime_search_dirs(paths: &ServiceInstallPaths) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    push_unique_path(&mut dirs, paths.bin_dir.clone());
+    if let Some(system_root) = std::env::var_os("SystemRoot").map(PathBuf::from) {
+        push_unique_path(&mut dirs, system_root.join("System32"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            push_unique_path(&mut dirs, dir);
+        }
+    }
+    dirs
+}
+
+pub fn format_doctor_report(report: &WindowsServiceDoctorReport) -> String {
+    let mut text = String::new();
+    text.push_str("DbgAtlas post-install diagnostic report\n");
+    text.push_str(&format!("status: {}\n", report.status.label()));
+    text.push_str(&format!(
+        "install_root: {}\n",
+        report.install_root.display()
+    ));
+    text.push_str("\nchecks:\n");
+    for check in &report.checks {
+        text.push_str(&format!(
+            "- [{}] {}: {}\n",
+            check.status.label(),
+            check.label,
+            check.summary
+        ));
+        if let Some(path) = &check.path {
+            text.push_str(&format!("  path: {}\n", path.display()));
+        }
+        if let Some(detail) = &check.detail {
+            text.push_str(&format!("  detail: {detail}\n"));
+        }
+    }
+    if report.warnings.is_empty() {
+        text.push_str("\nwarnings: none\n");
+    } else {
+        text.push_str("\nwarnings:\n");
+        for warning in &report.warnings {
+            text.push_str(&format!("- {warning}\n"));
+        }
+    }
+    text
+}
+
+pub fn format_doctor_msi_summary(report: &WindowsServiceDoctorReport) -> String {
+    let mut lines = Vec::new();
+    if report.warnings.is_empty() {
+        lines.push(
+            "DbgAtlas installed successfully. No post-install diagnostic warnings were detected."
+                .to_string(),
+        );
+    } else {
+        lines.push("DbgAtlas installed successfully, with diagnostic warnings:".to_string());
+        let warning_checks = report
+            .checks
+            .iter()
+            .filter(|check| check.status == DoctorCheckStatus::Warning)
+            .collect::<Vec<_>>();
+        for check in warning_checks.iter().take(4) {
+            lines.push(format!("- {}", doctor_msi_warning_line(check)));
+        }
+        if warning_checks.len() > 4 {
+            lines.push(format!(
+                "- {} additional warning(s); see the post-install report.",
+                warning_checks.len() - 4
+            ));
+        }
+    }
+    if let Some(path) = &report.report_path {
+        lines.push(format!("Details: {}", path.display()));
+    }
+    lines.join("\r\n")
+}
+
+fn doctor_msi_warning_line(check: &DoctorCheck) -> String {
+    match check.id.as_str() {
+        "runtime_config" => {
+            "Runtime config was not loaded; defaults were used for diagnostics.".to_string()
+        }
+        "payload" => "Required DbgAtlas payload files are missing.".to_string(),
+        "vcruntime" => "Microsoft Visual C++ runtime was not detected.".to_string(),
+        "ucrt" => "Universal C Runtime was not detected.".to_string(),
+        "service_health" => "Installed service health check did not pass.".to_string(),
+        "dbgeng" => "WinDbg DbgEng runtime was not detected; debug sessions may fail.".to_string(),
+        "ttd" => "TTD.exe was not detected; TTD recording is unavailable.".to_string(),
+        "ida" => {
+            "IDA Pro 9.3 runtime was not detected; reverse features are unavailable.".to_string()
+        }
+        _ => format!("{}: {}", check.label, check.summary),
+    }
+}
+
+fn write_text_file(path: &Path, text: &str) -> Result<(), ServiceError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, text)?;
+    Ok(())
 }
 
 pub fn install_windows_service(
@@ -9667,9 +10199,13 @@ fn append_operation_diagnostic_log(
 }
 
 fn append_service_diagnostic_log(message: &str) {
+    append_service_diagnostic_log_for_paths(&default_windows_service_paths(), message);
+}
+
+fn append_service_diagnostic_log_for_paths(paths: &ServiceInstallPaths, message: &str) {
     let timestamp = Timestamp::now().unix_millis;
     let day = (timestamp / 86_400_000) as i64;
-    let log_path = default_windows_service_paths()
+    let log_path = paths
         .log_dir
         .join(format!("service-{}.log", log_utc_date_from_unix_day(day)));
     let _ = fs::create_dir_all(log_path.parent().unwrap_or_else(|| Path::new(".")));
@@ -12224,6 +12760,77 @@ mod tests {
             paths.installed_exe,
             PathBuf::from(r"C:\ProgramData\DbgAtlas\bin\dbgatlas.exe")
         );
+    }
+
+    #[test]
+    fn service_doctor_writes_postinstall_report_and_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(&paths.config_path, "version = 1\n").unwrap();
+        for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
+            fs::write(paths.bin_dir.join(file_name), b"payload").unwrap();
+        }
+        let report_path = paths.log_dir.join(WINDOWS_SERVICE_POSTINSTALL_REPORT_FILE);
+        let summary_path = paths.log_dir.join(WINDOWS_SERVICE_POSTINSTALL_SUMMARY_FILE);
+
+        let report = run_windows_service_doctor(WindowsServiceDoctorOptions {
+            install_root: Some(paths.root_dir.clone()),
+            report_path: Some(report_path.clone()),
+            msi_summary_path: Some(summary_path.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(report.install_root, paths.root_dir);
+        assert_eq!(report.report_path.as_ref(), Some(&report_path));
+        assert_eq!(report.msi_summary_path.as_ref(), Some(&summary_path));
+        assert!(report.checks.iter().any(|check| check.id == "payload"));
+        assert!(
+            fs::read_to_string(report_path)
+                .unwrap()
+                .contains("DbgAtlas post-install diagnostic report")
+        );
+        assert!(
+            fs::read_to_string(summary_path)
+                .unwrap()
+                .contains("DbgAtlas installed successfully")
+        );
+    }
+
+    #[test]
+    fn doctor_msi_summary_limits_warning_count() {
+        let warnings = (1..=5)
+            .map(|index| format!("warning {index}"))
+            .collect::<Vec<_>>();
+        let report = WindowsServiceDoctorReport {
+            status: DoctorCheckStatus::Warning,
+            install_root: PathBuf::from(r"C:\DbgAtlas"),
+            checks: warnings
+                .iter()
+                .map(|warning| {
+                    doctor_check(
+                        warning,
+                        warning,
+                        DoctorCheckStatus::Warning,
+                        warning.clone(),
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            warnings,
+            report_path: Some(PathBuf::from(r"C:\DbgAtlas\var\log\postinstall-report.txt")),
+            msi_summary_path: None,
+        };
+
+        let summary = format_doctor_msi_summary(&report);
+
+        assert!(summary.contains("warning 1"));
+        assert!(summary.contains("warning 4"));
+        assert!(!summary.contains("warning 5\r\n"));
+        assert!(summary.contains("1 additional warning"));
+        assert!(summary.contains("postinstall-report.txt"));
     }
 
     #[test]
