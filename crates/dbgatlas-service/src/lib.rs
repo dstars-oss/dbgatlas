@@ -293,6 +293,7 @@ impl ServiceHost {
             "operation.get" => self.operation_get(request.params),
             "operation.cancel" => self.operation_cancel(request.params),
             "operation.stream" => self.operation_stream(request.params),
+            "session.list" => self.session_list(request.params),
             "debug.session.create" => self.debug_session_create(request.params),
             "debug.session.close" => self.debug_session_close(request.params),
             "debug.session.kill" => self.debug_session_kill(request.params),
@@ -427,6 +428,7 @@ impl ServiceHost {
             | "operation.get"
             | "operation.cancel"
             | "operation.stream"
+            | "session.list"
             | "debug.session.create"
             | "debug.session.close"
             | "debug.session.kill"
@@ -534,6 +536,34 @@ impl ServiceHost {
             "status": "ok",
             "service": "DbgAtlas",
             "version": env!("CARGO_PKG_VERSION"),
+        }))
+    }
+
+    fn session_list(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        if let Some(params) = params {
+            if !params.is_object() {
+                return Err(ServiceError::Rpc(
+                    "session.list arguments must be a JSON object".to_string(),
+                ));
+            }
+        }
+        let mut sessions = {
+            let state = self.lock_state()?;
+            state
+                .sessions
+                .values()
+                .map(SessionListItem::from)
+                .collect::<Vec<_>>()
+        };
+        sessions.sort_by(|left, right| {
+            left.session_id
+                .id
+                .as_str()
+                .cmp(right.session_id.id.as_str())
+        });
+        Ok(json!({
+            "count": sessions.len(),
+            "sessions": sessions,
         }))
     }
 
@@ -3583,6 +3613,47 @@ struct ManagedSession {
     updated_at: Timestamp,
     last_operation: Option<OperationRef>,
     artifacts: Vec<ArtifactRef>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SessionListItem {
+    session_id: SessionRef,
+    capability: String,
+    state: DebugSessionState,
+    project_root: PathBuf,
+    target: Option<DebugTarget>,
+    database_path: Option<PathBuf>,
+    ida_install_dir: Option<PathBuf>,
+    worker_id: Id,
+    worker_identity: WorkerIdentity,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    last_operation: Option<OperationRef>,
+    artifact_refs: Vec<ArtifactRef>,
+    close_tool: String,
+    kill_tool: Option<String>,
+}
+
+impl From<&ManagedSession> for SessionListItem {
+    fn from(session: &ManagedSession) -> Self {
+        Self {
+            session_id: session.session_id.clone(),
+            capability: session.capability.clone(),
+            state: session.state.clone(),
+            project_root: session.project_root.clone(),
+            target: session.target.clone(),
+            database_path: session.database_path.clone(),
+            ida_install_dir: session.ida_install_dir.clone(),
+            worker_id: session.worker.worker_id.clone(),
+            worker_identity: session.worker.identity.clone(),
+            created_at: session.created_at.clone(),
+            updated_at: session.updated_at.clone(),
+            last_operation: session.last_operation.clone(),
+            artifact_refs: session.artifacts.clone(),
+            close_tool: format!("{}.session.close", session.capability),
+            kill_tool: (session.capability == "debug").then(|| "debug.session.kill".to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10311,6 +10382,11 @@ fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
             }),
         ),
         mcp_tool(
+            "session.list",
+            "List current debug and reverse sessions known to this service process.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        mcp_tool(
             "debug.session.create",
             "Create a debug session from a file, attach, or launch target. Use kind=file with a .run path for TTD replay.",
             json!({
@@ -15988,6 +16064,7 @@ allow_py_eval = true
         let body = http_body_json(&response);
         let tools = body["result"]["tools"].as_array().unwrap();
         assert!(tools.iter().any(|tool| tool["name"] == "debug.eval"));
+        assert!(tools.iter().any(|tool| tool["name"] == "session.list"));
         let service_update = tools
             .iter()
             .find(|tool| tool["name"] == "service.update")
@@ -16215,6 +16292,59 @@ allow_py_eval = true
         assert_eq!(result["function"], "list_funcs");
         assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 1);
         assert_eq!(result["result"]["count"], 1);
+        server.stop();
+    }
+
+    #[test]
+    fn http_mcp_session_list_returns_debug_and_reverse_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sample.exe");
+        fs::write(&database, b"sample").unwrap();
+        let server = start_mock_http_service();
+        let debug = mcp_tool_call(
+            server.endpoint,
+            "debug.session.create",
+            json!({
+                "project_root": temp.path(),
+                "target": { "kind": "file", "path": "sample.dmp" }
+            }),
+        );
+        let reverse = mcp_tool_call(
+            server.endpoint,
+            "reverse.session.open",
+            json!({
+                "project_root": temp.path(),
+                "database_path": database
+            }),
+        );
+
+        let list = mcp_tool_call(server.endpoint, "session.list", json!({}));
+        let sessions = list["sessions"].as_array().unwrap();
+        let debug_session = sessions
+            .iter()
+            .find(|session| session["session_id"] == debug["session_id"])
+            .expect("debug session is listed");
+        let reverse_session = sessions
+            .iter()
+            .find(|session| session["session_id"] == reverse["session_id"])
+            .expect("reverse session is listed");
+
+        assert_eq!(list["count"], 2);
+        assert_eq!(debug_session["capability"], "debug");
+        assert_eq!(debug_session["state"], "Ready");
+        assert_eq!(debug_session["close_tool"], "debug.session.close");
+        assert_eq!(debug_session["kill_tool"], "debug.session.kill");
+        assert!(debug_session["target"].is_object());
+        assert_eq!(reverse_session["capability"], "reverse");
+        assert_eq!(reverse_session["state"], "Ready");
+        assert_eq!(reverse_session["close_tool"], "reverse.session.close");
+        assert!(reverse_session["kill_tool"].is_null());
+        assert!(
+            reverse_session["database_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("sample.exe")
+        );
         server.stop();
     }
 
