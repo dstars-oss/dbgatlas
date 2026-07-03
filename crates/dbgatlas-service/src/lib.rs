@@ -61,6 +61,7 @@ pub const WINDOWS_SERVICE_INSTALL_MARKER_FILE: &str = ".dbgatlas-install-root";
 pub const WINDOWS_SERVICE_LOG_RETENTION_DAYS: i64 = 7;
 pub const WINDOWS_SERVICE_POSTINSTALL_REPORT_FILE: &str = "postinstall-report.txt";
 pub const WINDOWS_SERVICE_POSTINSTALL_SUMMARY_FILE: &str = "postinstall-summary.txt";
+const DBGATLAS_TOKEN_ENV_VAR: &str = "DBGATLAS_TOKEN";
 pub const DEFAULT_SERVICE_UPDATE_TIMEOUT_MS: u64 = 60_000;
 pub const SERVICE_UPDATE_DELAY_MS: u64 = 500;
 pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
@@ -84,6 +85,50 @@ static SERVICE_INSTALL_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 pub struct ServiceConfig {
     pub bind: SocketAddr,
     pub bearer_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallTokenSelection {
+    token: String,
+    write_system_env: bool,
+}
+
+fn resolve_install_token<F>(
+    system_env_token: Option<&str>,
+    file_token: Option<&str>,
+    generate_token: F,
+) -> Result<InstallTokenSelection, ServiceError>
+where
+    F: FnOnce() -> Result<String, ServiceError>,
+{
+    if let Some(token) = trimmed_non_empty_token(system_env_token) {
+        return Ok(InstallTokenSelection {
+            token,
+            write_system_env: false,
+        });
+    }
+    if let Some(token) = trimmed_non_empty_token(file_token) {
+        return Ok(InstallTokenSelection {
+            token,
+            write_system_env: true,
+        });
+    }
+
+    let token = generate_token()?;
+    let token = trimmed_non_empty_token(Some(&token)).ok_or(ServiceError::EmptyBearerToken)?;
+    Ok(InstallTokenSelection {
+        token,
+        write_system_env: true,
+    })
+}
+
+fn trimmed_non_empty_token(value: Option<&str>) -> Option<String> {
+    let token = value?.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 impl ServiceConfig {
@@ -8711,6 +8756,7 @@ mod windows_service_control {
 mod windows_service_control {
     use super::*;
     use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
     use std::sync::OnceLock;
     use std::time::Instant;
     use windows_service::service::{
@@ -8721,10 +8767,20 @@ mod windows_service_control {
         self, ServiceControlHandlerResult, ServiceStatusHandle,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+    };
 
     windows_service::define_windows_service!(ffi_service_main, service_main);
 
     static RUN_OPTIONS: OnceLock<WindowsServiceRunOptions> = OnceLock::new();
+    const MACHINE_ENVIRONMENT_REGISTRY_KEY: &str =
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 
     pub fn install(
         options: WindowsServiceInstallOptions,
@@ -8794,7 +8850,7 @@ mod windows_service_control {
         }
         copy_missing_install_state_from_previous_root(&paths)?;
         let runtime = create_runtime_config_if_missing(&paths, options.bind)?;
-        ensure_token_file(&paths.token_file)?;
+        ensure_install_token(&paths.token_file)?;
         if options.payload_mode == WindowsServicePayloadMode::Copy {
             install_payload(&payload, &paths)?;
         }
@@ -9283,20 +9339,195 @@ mod windows_service_control {
             .map_err(map_windows_service_error)
     }
 
-    fn ensure_token_file(path: &Path) -> Result<(), ServiceError> {
+    fn ensure_install_token(path: &Path) -> Result<(), ServiceError> {
+        let system_env_token = read_machine_environment_variable(DBGATLAS_TOKEN_ENV_VAR)?;
+        let file_token = read_install_token_file(path)?;
+        let selection = resolve_install_token(
+            system_env_token.as_deref(),
+            file_token.as_deref(),
+            generate_token,
+        )?;
+        if selection.write_system_env {
+            write_machine_environment_variable(DBGATLAS_TOKEN_ENV_VAR, &selection.token)?;
+            broadcast_environment_change();
+        }
+        write_install_token_file(path, &selection.token)
+    }
+
+    fn read_install_token_file(path: &Path) -> Result<Option<String>, ServiceError> {
         if path.exists() {
             let token = fs::read_to_string(path)?;
-            if token.trim().is_empty() {
-                return Err(ServiceError::EmptyBearerToken);
-            }
-            return Ok(());
+            return Ok(trimmed_non_empty_token(Some(&token)));
         }
+        Ok(None)
+    }
+
+    fn write_install_token_file(path: &Path, token: &str) -> Result<(), ServiceError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let token = generate_token()?;
         fs::write(path, format!("{token}\n"))?;
         Ok(())
+    }
+
+    fn read_machine_environment_variable(name: &str) -> Result<Option<String>, ServiceError> {
+        let key = RegistryKey::open_machine_environment(KEY_QUERY_VALUE)?;
+        let name = wide_null(name);
+        let mut value_type = 0u32;
+        let mut byte_len = 0u32;
+        let status = unsafe {
+            RegQueryValueExW(
+                key.raw(),
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut value_type,
+                std::ptr::null_mut(),
+                &mut byte_len,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
+            return Err(registry_error(
+                "query machine environment variable size",
+                status,
+            ));
+        }
+        if value_type != REG_SZ && value_type != REG_EXPAND_SZ {
+            return Err(ServiceError::ServiceControl(format!(
+                "machine environment variable {DBGATLAS_TOKEN_ENV_VAR} has unsupported registry type {value_type}"
+            )));
+        }
+
+        let mut bytes = vec![0u8; byte_len as usize];
+        let status = unsafe {
+            RegQueryValueExW(
+                key.raw(),
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut value_type,
+                bytes.as_mut_ptr(),
+                &mut byte_len,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(registry_error("query machine environment variable", status));
+        }
+        bytes.truncate(byte_len as usize);
+        utf16_registry_string(&bytes).map(Some)
+    }
+
+    fn write_machine_environment_variable(name: &str, value: &str) -> Result<(), ServiceError> {
+        let key = RegistryKey::open_machine_environment(KEY_SET_VALUE)?;
+        let name = wide_null(name);
+        let value = wide_null(value);
+        let byte_len = value
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                ServiceError::ServiceControl(
+                    "machine environment variable value is too large".to_string(),
+                )
+            })?;
+        let status = unsafe {
+            RegSetValueExW(
+                key.raw(),
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                value.as_ptr().cast::<u8>(),
+                byte_len,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(registry_error("write machine environment variable", status));
+        }
+        Ok(())
+    }
+
+    struct RegistryKey(HKEY);
+
+    impl RegistryKey {
+        fn open_machine_environment(access: u32) -> Result<Self, ServiceError> {
+            let subkey = wide_null(MACHINE_ENVIRONMENT_REGISTRY_KEY);
+            let mut key = std::ptr::null_mut();
+            let status =
+                unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, access, &mut key) };
+            if status != ERROR_SUCCESS {
+                return Err(registry_error(
+                    "open machine environment registry key",
+                    status,
+                ));
+            }
+            Ok(Self(key))
+        }
+
+        fn raw(&self) -> HKEY {
+            self.0
+        }
+    }
+
+    impl Drop for RegistryKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+
+    fn utf16_registry_string(bytes: &[u8]) -> Result<String, ServiceError> {
+        let mut chunks = bytes.chunks_exact(2);
+        let mut units = chunks
+            .by_ref()
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        if !chunks.remainder().is_empty() {
+            return Err(ServiceError::ServiceControl(
+                "machine environment variable contains invalid UTF-16 bytes".to_string(),
+            ));
+        }
+        while units.last() == Some(&0) {
+            units.pop();
+        }
+        String::from_utf16(&units).map_err(|error| {
+            ServiceError::ServiceControl(format!(
+                "machine environment variable contains invalid UTF-16: {error}"
+            ))
+        })
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    fn broadcast_environment_change() {
+        let environment = wide_null("Environment");
+        let mut result = 0usize;
+        unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                environment.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                5000,
+                &mut result,
+            );
+        }
+    }
+
+    fn registry_error(operation: &str, status: u32) -> ServiceError {
+        ServiceError::ServiceControl(format!("{operation} failed with Win32 status {status}"))
     }
 
     fn generate_token() -> Result<String, ServiceError> {

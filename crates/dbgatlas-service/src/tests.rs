@@ -510,6 +510,79 @@ fn installed_client_config_reads_runtime_config_and_token() {
 }
 
 #[test]
+fn install_token_prefers_system_environment_token() {
+    let generated = std::cell::Cell::new(false);
+
+    let selection = resolve_install_token(Some(" system-token \n"), Some("file-token"), || {
+        generated.set(true);
+        Ok("generated-token".to_string())
+    })
+    .unwrap();
+
+    assert_eq!(
+        selection,
+        InstallTokenSelection {
+            token: "system-token".to_string(),
+            write_system_env: false,
+        }
+    );
+    assert!(!generated.get());
+}
+
+#[test]
+fn install_token_reuses_file_token_when_system_environment_is_missing() {
+    let generated = std::cell::Cell::new(false);
+
+    let selection = resolve_install_token(None, Some(" file-token \n"), || {
+        generated.set(true);
+        Ok("generated-token".to_string())
+    })
+    .unwrap();
+
+    assert_eq!(
+        selection,
+        InstallTokenSelection {
+            token: "file-token".to_string(),
+            write_system_env: true,
+        }
+    );
+    assert!(!generated.get());
+}
+
+#[test]
+fn install_token_generates_token_when_system_environment_and_file_are_missing() {
+    let selection =
+        resolve_install_token(None, None, || Ok("generated-token".to_string())).unwrap();
+
+    assert_eq!(
+        selection,
+        InstallTokenSelection {
+            token: "generated-token".to_string(),
+            write_system_env: true,
+        }
+    );
+}
+
+#[test]
+fn install_token_treats_blank_values_as_missing() {
+    let selection =
+        resolve_install_token(
+            Some(" \n"),
+            Some("\t"),
+            || Ok("generated-token".to_string()),
+        )
+        .unwrap();
+
+    assert_eq!(
+        selection,
+        InstallTokenSelection {
+            token: "generated-token".to_string(),
+            write_system_env: true,
+        }
+    );
+}
+
+#[test]
 fn service_capabilities_read_ida_py_eval_runtime_policy() {
     let runtime = RuntimeConfig::from_toml_str(
         r#"

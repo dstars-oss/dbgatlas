@@ -27,7 +27,6 @@ cargo run -p dbgatlas-cli -- native version
 cargo run -p dbgatlas-cli -- service run --bind 127.0.0.1:7331 --token dev-token
 .\script\build-release-install.ps1
 .\script\build-release-install.ps1 -BuildOnly
-.\script\smoke-installed-service.ps1
 $installRoot = "$env:LOCALAPPDATA\Programs\dbgatlas"
 dbgatlas service install --install-root $installRoot --payload-mode copy --payload-dir .\target\release
 dbgatlas service start --install-root $installRoot
