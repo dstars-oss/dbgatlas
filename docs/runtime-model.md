@@ -35,10 +35,10 @@ analysis-workspace/
 - `proxy`
 - `server.bind`
 
-安装态 Windows service 默认使用当前用户 Local Programs 下的显式 install root；安装器或提权脚本应把该路径传给 `dbgatlas service install --install-root`，避免 LocalSystem / elevated 进程重新推导 `%LOCALAPPDATA%`：
+安装态 Windows service 默认使用 machine-wide Program Files 下的 install root；安装器或提权脚本应复用 service 命令默认行为，只有自定义目录时才传入 `--install-root`：
 
 ```text
-%LOCALAPPDATA%\Programs\dbgatlas\
+%ProgramFiles%\DbgAtlas\
   bin\                  # installed runtime payload
     dbgatlas.exe
     dbgatlas-worker.exe

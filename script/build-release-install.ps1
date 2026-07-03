@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$Bind = "127.0.0.1:7331",
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "Programs\dbgatlas"),
+    [string]$InstallRoot,
     [switch]$BuildOnly,
     [switch]$InstallOnly,
     [switch]$NoStart,
@@ -59,7 +59,7 @@ function Assert-ReleasePayload {
 function Install-ReleasePayload {
     param(
         [Parameter(Mandatory = $true)][string]$ReleaseDir,
-        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [string]$InstallRoot,
         [Parameter(Mandatory = $true)][string]$Bind,
         [switch]$NoStart,
         [switch]$NoForce
@@ -69,8 +69,6 @@ function Install-ReleasePayload {
     $installArgs = @(
         "service",
         "install",
-        "--install-root",
-        $InstallRoot,
         "--payload-mode",
         "copy",
         "--payload-dir",
@@ -78,6 +76,9 @@ function Install-ReleasePayload {
         "--bind",
         $Bind
     )
+    if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $installArgs += @("--install-root", $InstallRoot)
+    }
     if (-not $NoForce) {
         $installArgs += "--force"
     }
@@ -91,7 +92,11 @@ function Install-ReleasePayload {
     }
 
     Write-Host "Starting DbgAtlas service..."
-    Invoke-Checked -FilePath $dbgatlasExe -Arguments @("service", "start", "--install-root", $InstallRoot)
+    $startArgs = @("service", "start")
+    if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $startArgs += @("--install-root", $InstallRoot)
+    }
+    Invoke-Checked -FilePath $dbgatlasExe -Arguments $startArgs
 }
 
 function Quote-ProcessArgument {
@@ -121,7 +126,12 @@ if (-not $InstallOnly -and -not (Get-Command cargo -ErrorAction SilentlyContinue
 Write-Host "DbgAtlas release build context:"
 Write-Host "  repo root: $repoRoot"
 Write-Host "  release dir: $releaseDir"
-Write-Host "  install root: $InstallRoot"
+if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+    Write-Host "  install root: service default"
+}
+else {
+    Write-Host "  install root: $InstallRoot"
+}
 Write-Host "  bind: $Bind"
 Write-Host "  BuildOnly=$BuildOnly InstallOnly=$InstallOnly NoStart=$NoStart NoForce=$NoForce"
 
@@ -153,11 +163,12 @@ if (-not (Test-Administrator)) {
         "-File",
         (Quote-ProcessArgument $PSCommandPath),
         "-InstallOnly",
-        "-InstallRoot",
-        (Quote-ProcessArgument $InstallRoot),
         "-Bind",
         $Bind
     )
+    if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $installArgs += @("-InstallRoot", (Quote-ProcessArgument $InstallRoot))
+    }
 
     if ($NoStart) {
         $installArgs += "-NoStart"
@@ -177,11 +188,16 @@ if (-not (Test-Administrator)) {
     exit 0
 }
 
-Install-ReleasePayload `
-    -ReleaseDir $releaseDir `
-    -InstallRoot $InstallRoot `
-    -Bind $Bind `
-    -NoStart:$NoStart `
-    -NoForce:$NoForce
+$installParameters = @{
+    ReleaseDir = $releaseDir
+    Bind = $Bind
+    NoStart = $NoStart
+    NoForce = $NoForce
+}
+if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
+    $installParameters.InstallRoot = $InstallRoot
+}
+
+Install-ReleasePayload @installParameters
 
 Write-Host "DbgAtlas release install completed."

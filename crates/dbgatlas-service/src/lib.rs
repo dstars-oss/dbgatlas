@@ -7432,15 +7432,10 @@ pub fn default_windows_service_paths() -> ServiceInstallPaths {
 }
 
 pub fn default_windows_service_root() -> PathBuf {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
+    let program_files = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .map(PathBuf::from)
-                .map(|path| path.join("AppData").join("Local"))
-        })
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Local"));
-    local_app_data.join("Programs").join(WINDOWS_SERVICE_DIR)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    program_files.join("DbgAtlas")
 }
 
 fn process_service_install_root() -> Option<PathBuf> {

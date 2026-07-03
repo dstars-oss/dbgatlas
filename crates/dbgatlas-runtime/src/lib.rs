@@ -432,15 +432,10 @@ pub fn default_dbgatlas_windbg_runtime_dir() -> PathBuf {
 }
 
 fn default_dbgatlas_install_root() -> PathBuf {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
+    let program_files = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .map(PathBuf::from)
-                .map(|path| path.join("AppData").join("Local"))
-        })
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Local"));
-    local_app_data.join("Programs").join("dbgatlas")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    program_files.join("DbgAtlas")
 }
 
 pub fn resolve_store_windbg_dbgeng_dir() -> Option<PathBuf> {

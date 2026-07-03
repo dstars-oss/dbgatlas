@@ -5,6 +5,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[test]
+fn default_service_root_uses_program_files_dbgatlas() {
+    let program_files = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+
+    assert_eq!(
+        default_windows_service_root(),
+        program_files.join("DbgAtlas")
+    );
+}
+
+#[test]
 fn service_paths_are_rooted_under_dbgatlas_install_dir() {
     let root = PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas");
     let paths = ServiceInstallPaths::for_root(root.clone());
