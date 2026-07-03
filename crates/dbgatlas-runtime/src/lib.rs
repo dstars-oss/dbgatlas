@@ -316,8 +316,10 @@ pub fn resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(
     _tools: &ToolRuntimeConfig,
     dbgatlas_windbg_runtime_dir: &Path,
 ) -> ResolvedToolPaths {
-    let mut roots = ToolSearchRoots::default();
-    roots.dbgatlas_windbg_runtime_dir = dbgatlas_windbg_runtime_dir.to_path_buf();
+    let roots = ToolSearchRoots {
+        dbgatlas_windbg_runtime_dir: dbgatlas_windbg_runtime_dir.to_path_buf(),
+        ..ToolSearchRoots::default()
+    };
     resolve_tool_paths_from_roots(&roots)
 }
 

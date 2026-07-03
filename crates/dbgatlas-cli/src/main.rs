@@ -943,7 +943,7 @@ fn print_rpc_response(response: dbgatlas_service::JsonRpcResponse, as_json: bool
     if let Some(error) = response.error {
         anyhow::bail!("{} ({})", error.message, error.code);
     }
-    print_json(response.result.unwrap_or_else(|| json!(null)))
+    print_json(response.result.unwrap_or(Value::Null))
 }
 
 struct ClientConnection {

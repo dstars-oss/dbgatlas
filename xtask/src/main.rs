@@ -14,6 +14,7 @@ const FAST_TEST_PACKAGES: &[&str] = &[
 
 fn main() -> ExitCode {
     match env::args().nth(1).as_deref() {
+        Some("check") => run_checks(),
         Some("check-fast") => run_fast_checks(),
         Some("-h" | "--help") | None => {
             print_help();
@@ -25,6 +26,34 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_checks() -> ExitCode {
+    let steps: &[(&str, &[&str])] = &[
+        ("cargo", &["fmt", "--check"]),
+        (
+            "cargo",
+            &[
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        ("cargo", &["test", "--workspace"]),
+    ];
+
+    for (program, args) in steps {
+        eprintln!("running `{program} {}`", args.join(" "));
+        if let Err(status) = run_command(program, args) {
+            eprintln!("check step failed: `{program} {}`", args.join(" "));
+            return status;
+        }
+    }
+
+    ExitCode::SUCCESS
 }
 
 fn run_fast_checks() -> ExitCode {
@@ -56,7 +85,22 @@ fn run_fast_checks() -> ExitCode {
     }
 }
 
+fn run_command(program: &str, args: &[&str]) -> Result<(), ExitCode> {
+    match Command::new(program).args(args).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            eprintln!("command exited with status {status}");
+            Err(ExitCode::FAILURE)
+        }
+        Err(error) => {
+            eprintln!("failed to run {program}: {error}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
 fn print_help() {
     println!("DbgAtlas xtask commands:");
+    println!("  check         Run fmt, clippy, and full workspace tests");
     println!("  check-fast    Run Rust-only tests that do not build native adapter crates");
 }
