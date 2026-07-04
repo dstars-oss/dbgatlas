@@ -47,6 +47,9 @@ cargo run -p dbgatlas-cli -- recording ttd --project-root .\scratch-project --la
 cargo run -p dbgatlas-cli -- recording ttd --project-root .\scratch-project --attach <pid> --timeout-ms 30000 --accept-eula --worker-identity active_interactive_user
 ```
 
+For MSI installation and Codex / Claude Code MCP client configuration, see
+[`docs/install-configuration.md`](docs/install-configuration.md).
+
 The installed service can update its own runtime payload through JSON-RPC or
 MCP by calling `service.update` with a built payload directory:
 
