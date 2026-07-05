@@ -3614,6 +3614,138 @@ fn http_mcp_reverse_core_function_uses_service_results_with_refs() {
 }
 
 #[test]
+fn http_mcp_reverse_decompile_accepts_module_rva_without_new_tool() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("sample.exe");
+    fs::write(&database, b"sample").unwrap();
+    let server = start_mock_http_service();
+    let open = mcp_tool_call(
+        server.endpoint,
+        "reverse.session.open",
+        json!({
+            "project_root": temp.path(),
+            "database_path": database
+        }),
+    );
+    let result = mcp_tool_call(
+        server.endpoint,
+        "reverse.decompile",
+        json!({
+            "session_id": open["session_id"],
+            "addr": "libxsse+0x93660"
+        }),
+    );
+
+    assert_eq!(result["operation_status"], "success");
+    assert_eq!(result["function"], "decompile");
+    assert_eq!(result["result"]["addr"], 0x140093660u64);
+    assert_eq!(result["result"]["normalized_address"]["kind"], "module_rva");
+    assert_eq!(result["normalized_addresses"][0]["module"], "libxsse");
+    assert_eq!(result["address_warnings"].as_array().unwrap().len(), 0);
+    server.stop();
+}
+
+#[test]
+fn http_mcp_reverse_decompile_accepts_windbg_backtick_hex() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("sample.exe");
+    fs::write(&database, b"sample").unwrap();
+    let server = start_mock_http_service();
+    let open = mcp_tool_call(
+        server.endpoint,
+        "reverse.session.open",
+        json!({
+            "project_root": temp.path(),
+            "database_path": database
+        }),
+    );
+    let result = mcp_tool_call(
+        server.endpoint,
+        "reverse.decompile",
+        json!({
+            "session_id": open["session_id"],
+            "addr": "00000001`40093660"
+        }),
+    );
+
+    assert_eq!(result["operation_status"], "success");
+    assert_eq!(result["result"]["addr"], 0x140093660u64);
+    assert_eq!(result["result"]["normalized_address"]["kind"], "ida_ea");
+    server.stop();
+}
+
+#[test]
+fn http_mcp_reverse_lookup_funcs_rejects_ttd_position() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("sample.exe");
+    fs::write(&database, b"sample").unwrap();
+    let server = start_mock_http_service();
+    let open = mcp_tool_call(
+        server.endpoint,
+        "reverse.session.open",
+        json!({
+            "project_root": temp.path(),
+            "database_path": database
+        }),
+    );
+    let body = mcp_tool_call_body(
+        server.endpoint,
+        "reverse.lookup_funcs",
+        json!({
+            "session_id": open["session_id"],
+            "queries": ["151E:2020"]
+        }),
+    );
+
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let text: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        text["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("TTD position")
+    );
+    server.stop();
+}
+
+#[test]
+fn http_mcp_reverse_write_tool_returns_normalized_address_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("sample.exe");
+    fs::write(&database, b"sample").unwrap();
+    let server = start_mock_http_service();
+    let open = mcp_tool_call(
+        server.endpoint,
+        "reverse.session.open",
+        json!({
+            "project_root": temp.path(),
+            "database_path": database
+        }),
+    );
+    let result = mcp_tool_call(
+        server.endpoint,
+        "reverse.rename",
+        json!({
+            "session_id": open["session_id"],
+            "items": [{
+                "kind": "function",
+                "addr": "libxsse+0x93660",
+                "new_name": "Detect_FormatCandidates_0x93660"
+            }]
+        }),
+    );
+
+    assert_eq!(result["operation_status"], "success");
+    assert_eq!(
+        result["result"]["items"][0]["normalized_address"]["kind"],
+        "module_rva"
+    );
+    assert_eq!(result["normalized_addresses"][0]["rva"], 0x93660u64);
+    server.stop();
+}
+
+#[test]
 fn http_mcp_session_list_returns_debug_and_reverse_sessions() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("sample.exe");

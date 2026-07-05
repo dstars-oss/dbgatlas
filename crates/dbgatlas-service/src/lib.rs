@@ -5427,6 +5427,7 @@ fn record_successful_reverse_core_operation(
     let byte_len = write_jsonl_file(&session.artifact_dir.join(&core_file), &event)?;
     let artifact_id = next_artifact_ref();
     let response_result = reverse_core_response_result(&core, &artifact_id, byte_len)?;
+    let normalized_addresses = collect_normalized_addresses(&response_result);
     workspace.register_artifact(&ArtifactMetadata {
         artifact_id: artifact_id.clone(),
         kind: "reverse.core".to_string(),
@@ -5464,7 +5465,7 @@ fn record_successful_reverse_core_operation(
         session.artifacts.push(artifact_id.clone());
     }
 
-    Ok(json!({
+    let mut response = json!({
         "session_id": session_id,
         "operation_id": operation_id,
         "operation_status": "success",
@@ -5477,7 +5478,12 @@ fn record_successful_reverse_core_operation(
             "artifact_refs": [artifact_id],
             "raw_output_ref": null
         }
-    }))
+    });
+    if !normalized_addresses.is_empty() {
+        response["normalized_addresses"] = Value::Array(normalized_addresses);
+        response["address_warnings"] = Value::Array(Vec::new());
+    }
+    Ok(response)
 }
 
 fn reverse_core_response_result(
@@ -5515,6 +5521,31 @@ fn reverse_core_response_result(
         "full_result_artifact_ref": artifact_id,
         "full_result_byte_len": artifact_byte_len,
     }))
+}
+
+fn collect_normalized_addresses(value: &Value) -> Vec<Value> {
+    fn visit(value: &Value, out: &mut Vec<Value>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(address) = object.get("normalized_address") {
+                    out.push(address.clone());
+                }
+                for child in object.values() {
+                    visit(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    visit(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut addresses = Vec::new();
+    visit(value, &mut addresses);
+    addresses
 }
 
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
@@ -5684,12 +5715,12 @@ fn mock_reverse_core_response(
         "xrefs_to" => mock_xrefs_to(&arguments)?,
         "xrefs_to_field" => mock_xrefs_to_field(&arguments)?,
         "callees" => mock_callees(&arguments)?,
-        "rename" => mock_batch_write_result_with_diagnostics(&arguments, "items"),
-        "set_comments" => mock_batch_write_result(&arguments, "items"),
-        "set_type" => mock_set_type_result(&arguments),
+        "rename" => mock_batch_write_result_with_diagnostics(&arguments, "items")?,
+        "set_comments" => mock_batch_write_result(&arguments, "items")?,
+        "set_type" => mock_set_type_result(&arguments)?,
         "declare_type" => mock_declare_type(&arguments),
-        "inspect_item" => mock_inspect_item(&arguments),
-        "force_recompile" => mock_force_recompile(&arguments),
+        "inspect_item" => mock_inspect_item(&arguments)?,
+        "force_recompile" => mock_force_recompile(&arguments)?,
         "idb_save" => mock_idb_save(&arguments),
         "py_eval" => mock_py_eval(&arguments),
         "find_bytes" => mock_find_bytes(&arguments)?,
@@ -5721,6 +5752,25 @@ fn mock_lookup_funcs(arguments: &Value) -> Result<Value, ServiceError> {
     let ida_image_base = optional_u64_argument(arguments, "ida_image_base")?.unwrap_or(0);
     let mut items = Vec::new();
     for query in queries {
+        if looks_like_ttd_position(&query) {
+            return Err(ServiceError::Rpc(
+                "queries contains a TTD position, not a code address".to_string(),
+            ));
+        }
+        if let Some((ida_ea, normalized)) = parse_mock_module_rva_address(&query)? {
+            let start = ida_ea & !0xff;
+            items.push(json!({
+                "query": query,
+                "input_type": "address",
+                "found": true,
+                "ida_ea": ida_ea,
+                "function_start": start,
+                "function_end": start + 0x100,
+                "function_name": format!("mock_function_{start:x}"),
+                "normalized_address": normalized
+            }));
+            continue;
+        }
         if let Some(address) = parse_optional_u64_text(&query) {
             if address < runtime_module_base {
                 return Err(ServiceError::Rpc(
@@ -5743,7 +5793,13 @@ fn mock_lookup_funcs(arguments: &Value) -> Result<Value, ServiceError> {
                 "ida_ea": ida_ea,
                 "function_start": start,
                 "function_end": start + 0x100,
-                "function_name": format!("mock_function_{start:x}")
+                "function_name": format!("mock_function_{start:x}"),
+                "normalized_address": {
+                    "input": query,
+                    "kind": if runtime_module_base != 0 || ida_image_base != 0 { "runtime_va" } else { "ida_ea" },
+                    "ida_ea": ida_ea,
+                    "confidence": "high"
+                }
             }));
         } else {
             let found = !query.contains("missing");
@@ -5821,7 +5877,7 @@ fn mock_list_strings(arguments: &Value) -> Result<Value, ServiceError> {
 }
 
 fn mock_get_string(arguments: &Value) -> Result<Value, ServiceError> {
-    let addr = required_u64_argument(arguments, "addr")?;
+    let (addr, normalized) = required_mock_code_address_argument(arguments, "addr")?;
     let length = optional_u64_argument(arguments, "length")?;
     if let Some(length) = length
         && (length == 0 || length > 4096)
@@ -5839,6 +5895,7 @@ fn mock_get_string(arguments: &Value) -> Result<Value, ServiceError> {
     };
     Ok(json!({
         "address": addr,
+        "normalized_address": normalized,
         "found": text.is_some(),
         "length": length.unwrap_or_else(|| text.map_or(0, str::len) as u64),
         "type": string_type,
@@ -5847,11 +5904,12 @@ fn mock_get_string(arguments: &Value) -> Result<Value, ServiceError> {
 }
 
 fn mock_get_bytes(arguments: &Value) -> Result<Value, ServiceError> {
-    let addr = required_u64_argument(arguments, "addr")?;
+    let (addr, normalized) = required_mock_code_address_argument(arguments, "addr")?;
     let length = required_u64_argument(arguments, "length")?;
     let bytes = mock_idb_bytes(addr, length)?;
     Ok(json!({
         "address": addr,
+        "normalized_address": normalized,
         "requested_length": length,
         "read_length": bytes.len(),
         "complete": bytes.len() as u64 == length,
@@ -5860,7 +5918,7 @@ fn mock_get_bytes(arguments: &Value) -> Result<Value, ServiceError> {
 }
 
 fn mock_get_int(arguments: &Value) -> Result<Value, ServiceError> {
-    let addr = required_u64_argument(arguments, "addr")?;
+    let (addr, normalized) = required_mock_code_address_argument(arguments, "addr")?;
     let size = optional_u64_argument(arguments, "size")?.unwrap_or(8);
     if !matches!(size, 1 | 2 | 4 | 8) {
         return Err(ServiceError::Rpc(
@@ -5889,6 +5947,7 @@ fn mock_get_int(arguments: &Value) -> Result<Value, ServiceError> {
     }
     Ok(json!({
         "address": addr,
+        "normalized_address": normalized,
         "size": size,
         "endian": endian,
         "complete": true,
@@ -5899,10 +5958,11 @@ fn mock_get_int(arguments: &Value) -> Result<Value, ServiceError> {
 }
 
 fn mock_decompile(arguments: &Value) -> Result<Value, ServiceError> {
-    let addr = required_u64_argument(arguments, "addr")?;
+    let (addr, normalized) = required_mock_code_address_argument(arguments, "addr")?;
     let start = addr & !0xff;
     Ok(json!({
         "addr": addr,
+        "normalized_address": normalized,
         "function_start": start,
         "function_name": format!("mock_function_{start:x}"),
         "language": "c",
@@ -5911,10 +5971,11 @@ fn mock_decompile(arguments: &Value) -> Result<Value, ServiceError> {
 }
 
 fn mock_disasm(arguments: &Value) -> Result<Value, ServiceError> {
-    let addr = required_u64_argument(arguments, "addr")?;
+    let (addr, normalized) = required_mock_code_address_argument(arguments, "addr")?;
     let start = addr & !0xff;
     Ok(json!({
         "addr": addr,
+        "normalized_address": normalized,
         "function_start": start,
         "function_name": format!("mock_function_{start:x}"),
         "arguments": [{ "name": "arg_0", "location": "rcx", "type": "uint64_t" }],
@@ -5931,10 +5992,10 @@ fn mock_xrefs_to(arguments: &Value) -> Result<Value, ServiceError> {
     let addrs = normalize_core_list(arguments.get("addrs").unwrap_or(&Value::Null));
     let mut items = Vec::new();
     for addr in addrs {
-        let ea = parse_optional_u64_text(&addr)
-            .ok_or_else(|| ServiceError::Rpc("xrefs_to addrs must be addresses".to_string()))?;
+        let (ea, normalized) = parse_mock_code_address_text(&addr)?;
         items.push(json!({
             "to": ea,
+            "normalized_address": normalized,
             "xrefs": [
                 { "from": ea.saturating_sub(0x20), "type": "code", "function": format!("mock_function_{:x}", ea.saturating_sub(0x20) & !0xff) }
             ]
@@ -5965,10 +6026,10 @@ fn mock_callees(arguments: &Value) -> Result<Value, ServiceError> {
     let addrs = normalize_core_list(arguments.get("addrs").unwrap_or(&Value::Null));
     let mut items = Vec::new();
     for addr in addrs {
-        let ea = parse_optional_u64_text(&addr)
-            .ok_or_else(|| ServiceError::Rpc("callees addrs must be addresses".to_string()))?;
+        let (ea, normalized) = parse_mock_code_address_text(&addr)?;
         items.push(json!({
             "function": ea,
+            "normalized_address": normalized,
             "callees": [
                 { "ea": 0x140001100u64, "name": "parse_args" },
                 { "ea": 0x140001200u64, "name": "dispatch_command" }
@@ -5979,7 +6040,7 @@ fn mock_callees(arguments: &Value) -> Result<Value, ServiceError> {
     Ok(json!({ "items": items, "count": count }))
 }
 
-fn mock_batch_write_result(arguments: &Value, field: &'static str) -> Value {
+fn mock_batch_write_result(arguments: &Value, field: &'static str) -> Result<Value, ServiceError> {
     let items = arguments
         .get(field)
         .and_then(Value::as_array)
@@ -5990,24 +6051,30 @@ fn mock_batch_write_result(arguments: &Value, field: &'static str) -> Value {
                 .map(|value| vec![value.clone()])
                 .unwrap_or_default()
         });
-    let results: Vec<Value> = items
-        .into_iter()
-        .map(|item| {
-            json!({
+    let mut results = Vec::new();
+    for item in items {
+        let (_, normalized) = mock_item_addr_and_normalized(&item)?;
+        let mut result = json!({
                 "input": item,
                 "ok": true
-            })
-        })
-        .collect();
+        });
+        if let Some(normalized) = normalized {
+            result["normalized_address"] = normalized;
+        }
+        results.push(result);
+    }
     let count = results.len();
-    json!({
+    Ok(json!({
         "items": results,
         "count": count,
         "changed_count": count
-    })
+    }))
 }
 
-fn mock_batch_write_result_with_diagnostics(arguments: &Value, field: &'static str) -> Value {
+fn mock_batch_write_result_with_diagnostics(
+    arguments: &Value,
+    field: &'static str,
+) -> Result<Value, ServiceError> {
     let items = arguments
         .get(field)
         .and_then(Value::as_array)
@@ -6018,27 +6085,29 @@ fn mock_batch_write_result_with_diagnostics(arguments: &Value, field: &'static s
                 .map(|value| vec![value.clone()])
                 .unwrap_or_default()
         });
-    let results: Vec<Value> = items
-        .into_iter()
-        .map(|item| {
-            let addr = mock_item_addr(&item);
-            json!({
+    let mut results = Vec::new();
+    for item in items {
+        let (addr, normalized) = mock_item_addr_and_normalized(&item)?;
+        let mut result = json!({
                 "input": item,
                 "ea": addr,
                 "ok": true,
                 "item_state": mock_item_state(addr)
-            })
-        })
-        .collect();
+        });
+        if let Some(normalized) = normalized {
+            result["normalized_address"] = normalized;
+        }
+        results.push(result);
+    }
     let count = results.len();
-    json!({
+    Ok(json!({
         "items": results,
         "count": count,
         "changed_count": count
-    })
+    }))
 }
 
-fn mock_set_type_result(arguments: &Value) -> Value {
+fn mock_set_type_result(arguments: &Value) -> Result<Value, ServiceError> {
     let items = arguments
         .get("items")
         .and_then(Value::as_array)
@@ -6049,32 +6118,46 @@ fn mock_set_type_result(arguments: &Value) -> Value {
                 .map(|value| vec![value.clone()])
                 .unwrap_or_default()
         });
-    let results: Vec<Value> = items
-        .into_iter()
-        .map(|item| {
-            let addr = mock_item_addr(&item);
-            let type_text = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            json!({
+    let mut results = Vec::new();
+    for item in items {
+        let (addr, normalized) = mock_item_addr_and_normalized(&item)?;
+        let type_text = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let mut result = json!({
                 "input": item,
                 "ea": addr,
                 "ok": true,
                 "generated_decl": mock_generated_decl(type_text),
                 "item_state": mock_item_state(addr)
-            })
-        })
-        .collect();
+        });
+        if let Some(normalized) = normalized {
+            result["normalized_address"] = normalized;
+        }
+        results.push(result);
+    }
     let count = results.len();
-    json!({
+    Ok(json!({
         "items": results,
         "count": count,
         "changed_count": count
-    })
+    }))
 }
 
-fn mock_item_addr(item: &Value) -> u64 {
-    item.get("addr")
-        .and_then(parse_u64_value)
-        .unwrap_or(0x140020000)
+fn mock_item_addr_and_normalized(item: &Value) -> Result<(u64, Option<Value>), ServiceError> {
+    let Some(addr) = item.get("addr") else {
+        return Ok((0x140020000, None));
+    };
+    match addr {
+        Value::Number(number) => {
+            let address = number
+                .as_u64()
+                .ok_or_else(|| ServiceError::Rpc("addr must be an address".to_string()))?;
+            Ok((address, Some(mock_ida_ea_normalized_address(addr, address))))
+        }
+        Value::String(text) => {
+            parse_mock_code_address_text(text).map(|(ea, normalized)| (ea, Some(normalized)))
+        }
+        _ => Err(ServiceError::Rpc("addr must be an address".to_string())),
+    }
 }
 
 fn mock_item_state(addr: u64) -> Value {
@@ -6137,39 +6220,51 @@ fn mock_declare_type(arguments: &Value) -> Value {
     })
 }
 
-fn mock_inspect_item(arguments: &Value) -> Value {
+fn mock_inspect_item(arguments: &Value) -> Result<Value, ServiceError> {
     let queries = normalize_core_list(arguments.get("queries").unwrap_or(&Value::Null));
-    let items: Vec<Value> = queries
-        .into_iter()
-        .map(|query| {
-            let addr = parse_optional_u64_text(&query).unwrap_or(0x140020000);
-            json!({
+    let mut items = Vec::new();
+    for query in queries {
+        let (addr, normalized) = match parse_mock_code_address_text(&query) {
+            Ok((addr, normalized)) => (addr, Some(normalized)),
+            Err(ServiceError::Rpc(_)) if !looks_like_ttd_position(&query) => (0x140020000, None),
+            Err(error) => return Err(error),
+        };
+        let mut item = json!({
                 "query": query,
                 "ea": addr,
                 "item_state": mock_item_state(addr)
-            })
-        })
-        .collect();
+        });
+        if let Some(normalized) = normalized {
+            item["normalized_address"] = normalized;
+        }
+        items.push(item);
+    }
     let count = items.len();
-    json!({
+    Ok(json!({
         "items": items,
         "count": count
-    })
+    }))
 }
 
-fn mock_force_recompile(arguments: &Value) -> Value {
+fn mock_force_recompile(arguments: &Value) -> Result<Value, ServiceError> {
     let addrs = normalize_core_list(arguments.get("addrs").unwrap_or(&Value::Null));
-    let items: Vec<Value> = addrs
-        .into_iter()
-        .map(|addr| json!({ "query": addr, "ea": 0x140001000u64, "ok": true }))
-        .collect();
+    let mut items = Vec::new();
+    for addr in addrs {
+        let (ea, normalized) = parse_mock_code_address_text(&addr)?;
+        items.push(json!({
+            "query": addr,
+            "ea": ea & !0xff,
+            "ok": true,
+            "normalized_address": normalized
+        }));
+    }
     let count = items.len();
-    json!({
+    Ok(json!({
         "items": items,
         "count": count,
         "changed_count": count,
         "all": count == 0
-    })
+    }))
 }
 
 fn mock_idb_save(arguments: &Value) -> Value {
@@ -6227,6 +6322,14 @@ fn mock_search_text(arguments: &Value) -> Result<Value, ServiceError> {
 
 fn mock_query_xrefs(arguments: &Value) -> Result<Value, ServiceError> {
     let target = arguments.get("target").cloned().unwrap_or(Value::Null);
+    let normalized = match target.as_str() {
+        Some(text) => match parse_mock_code_address_text(text) {
+            Ok((_, normalized)) => Some(normalized),
+            Err(ServiceError::Rpc(_)) if !looks_like_ttd_position(text) => None,
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
     let rows = vec![
         json!({
             "direction": arguments.get("direction").and_then(Value::as_str).unwrap_or("to"),
@@ -6243,7 +6346,11 @@ fn mock_query_xrefs(arguments: &Value) -> Result<Value, ServiceError> {
             "function": Value::Null
         }),
     ];
-    paginate_filtered(rows, arguments)
+    let mut result = paginate_filtered(rows, arguments)?;
+    if let Some(normalized) = normalized {
+        result["normalized_address"] = normalized;
+    }
+    Ok(result)
 }
 
 fn mock_query_funcs(arguments: &Value) -> Result<Value, ServiceError> {
@@ -6344,6 +6451,97 @@ fn required_u64_argument(arguments: &Value, field: &'static str) -> Result<u64, 
         .ok_or_else(|| ServiceError::Rpc(format!("{field} must be an address")))
 }
 
+fn required_mock_code_address_argument(
+    arguments: &Value,
+    field: &'static str,
+) -> Result<(u64, Value), ServiceError> {
+    let value = arguments
+        .get(field)
+        .ok_or_else(|| ServiceError::Rpc(format!("{field} is required")))?;
+    match value {
+        Value::Number(number) => {
+            let address = number
+                .as_u64()
+                .ok_or_else(|| ServiceError::Rpc(format!("{field} must be an address")))?;
+            Ok((address, mock_ida_ea_normalized_address(value, address)))
+        }
+        Value::String(text) => parse_mock_code_address_text(text),
+        _ => Err(ServiceError::Rpc(format!("{field} must be an address"))),
+    }
+}
+
+fn parse_mock_code_address_text(text: &str) -> Result<(u64, Value), ServiceError> {
+    if looks_like_ttd_position(text) {
+        return Err(ServiceError::Rpc(
+            "address is a TTD position, not a code address".to_string(),
+        ));
+    }
+    if let Some((address, normalized)) = parse_mock_module_rva_address(text)? {
+        return Ok((address, normalized));
+    }
+    if let Some(address) = parse_optional_u64_text(text) {
+        return Ok((
+            address,
+            mock_ida_ea_normalized_address(&json!(text), address),
+        ));
+    }
+    Err(ServiceError::Rpc(
+        "address must be an IDA address, integer string, or module+RVA string".to_string(),
+    ))
+}
+
+fn parse_mock_module_rva_address(text: &str) -> Result<Option<(u64, Value)>, ServiceError> {
+    let text = text.trim();
+    let Some((module, rva_text)) = text.rsplit_once('+') else {
+        return Ok(None);
+    };
+    let module = module.trim();
+    if module.is_empty() || module.contains(':') {
+        return Ok(None);
+    }
+    let Some(rva) = parse_optional_u64_text(rva_text.trim()) else {
+        return Ok(None);
+    };
+    const MOCK_IDA_IMAGE_BASE: u64 = 0x1400_0000_0;
+    let ida_ea = MOCK_IDA_IMAGE_BASE
+        .checked_add(rva)
+        .ok_or_else(|| ServiceError::Rpc("module+RVA overflows IDA address space".to_string()))?;
+    Ok(Some((
+        ida_ea,
+        json!({
+            "input": text,
+            "kind": "module_rva",
+            "module": module,
+            "rva": rva,
+            "ida_image_base": MOCK_IDA_IMAGE_BASE,
+            "ida_ea": ida_ea,
+            "confidence": "medium"
+        }),
+    )))
+}
+
+fn mock_ida_ea_normalized_address(input: &Value, ida_ea: u64) -> Value {
+    json!({
+        "input": input,
+        "kind": "ida_ea",
+        "ida_ea": ida_ea,
+        "confidence": "high"
+    })
+}
+
+fn looks_like_ttd_position(text: &str) -> bool {
+    let value = text.trim();
+    let value = value.split_once("..").map_or(value, |(start, _)| start);
+    let Some((left, right)) = value.split_once(':') else {
+        return false;
+    };
+    !left.is_empty()
+        && !right.is_empty()
+        && !right.contains(':')
+        && left.chars().all(|ch| ch.is_ascii_hexdigit())
+        && right.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 fn optional_u64_argument(
     arguments: &Value,
     field: &'static str,
@@ -6365,11 +6563,15 @@ fn parse_u64_value(value: &Value) -> Option<u64> {
 }
 
 fn parse_optional_u64_text(text: &str) -> Option<u64> {
-    let text = text.trim();
+    let had_backtick = text.contains('`');
+    let normalized = text.trim().replace('`', "");
+    let text = normalized.as_str();
     if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()
     } else if let Some(binary) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
         u64::from_str_radix(binary, 2).ok()
+    } else if had_backtick {
+        u64::from_str_radix(text, 16).ok()
     } else {
         text.parse::<u64>().ok()
     }

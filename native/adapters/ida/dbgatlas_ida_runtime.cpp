@@ -78,6 +78,7 @@ using close_database_fn = void(idaapi*)(bool);
 using auto_wait_fn = bool(idaapi*)();
 using save_database_fn = bool(idaapi*)(const char*, uint32, const snapshot_t*, const snapshot_t*);
 using get_library_version_fn = bool(idaapi*)(int&, int&, int&);
+using getinf_fn = size_t(idaapi*)(inftag_t);
 using qalloc_fn = void*(idaapi*)(size_t);
 using qrealloc_fn = void*(idaapi*)(void*, size_t);
 using qfree_fn = void(idaapi*)(void*);
@@ -133,6 +134,7 @@ struct IdaApis {
     auto_wait_fn auto_wait = nullptr;
     save_database_fn save_database = nullptr;
     get_library_version_fn get_library_version = nullptr;
+    getinf_fn getinf = nullptr;
     qalloc_fn qalloc = nullptr;
     qrealloc_fn qrealloc = nullptr;
     qfree_fn qfree = nullptr;
@@ -267,6 +269,7 @@ void dbgatlas_ida_runtime_load(const std::wstring& install_dir) {
     api.auto_wait = bind_proc<auto_wait_fn>(api.ida, "ida.dll", "auto_wait");
     api.save_database = bind_proc<save_database_fn>(api.ida, "ida.dll", "save_database");
     api.get_library_version = bind_proc<get_library_version_fn>(api.idalib, "idalib.dll", "get_library_version");
+    api.getinf = bind_proc<getinf_fn>(api.ida, "ida.dll", "getinf");
     api.qalloc = bind_proc<qalloc_fn>(api.ida, "ida.dll", "qalloc");
     api.qrealloc = bind_proc<qrealloc_fn>(api.ida, "ida.dll", "qrealloc");
     api.qfree = bind_proc<qfree_fn>(api.ida, "ida.dll", "qfree");
@@ -352,6 +355,11 @@ void dbgatlas_term_hexrays_plugin() {
 asize_t dbgatlas_get_item_size(ea_t ea) {
     ea_t end = get_item_end(ea);
     return end > ea ? end - ea : 0;
+}
+
+ea_t dbgatlas_get_imagebase() {
+    ensure_loaded();
+    return static_cast<ea_t>(g_api.getinf(INF_IMAGEBASE));
 }
 
 idaman ea_t ida_export prev_not_tail(ea_t ea) {

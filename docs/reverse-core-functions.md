@@ -41,8 +41,11 @@ resolving user-provided addresses or names to concrete IDA entities.
 - `reverse.query_entities`: `{ session_id, kind, filter?, fields?, offset?, count? }`
 
 List inputs accept either a JSON array or a comma-separated string. Integer inputs accept
-JSON numbers, decimal strings, `0x` hex strings, and `0b` binary strings. `int_convert`
-also accepts `bytes:` / `bytes_le:` little-endian byte lists and `ascii:` strings.
+JSON numbers, decimal strings, `0x` hex strings, WinDbg-style backtick hex strings,
+and `0b` binary strings. Reverse code-address inputs also accept `module+RVA`
+strings such as `libxsse+0x93660`; these are normalized against the open IDA
+database image base and returned as IDA EA values. `int_convert` also accepts
+`bytes:` / `bytes_le:` little-endian byte lists and `ascii:` strings.
 All reverse tools accept `session_id` either as the returned ref object
 (`{"id":"session-..."}`) or as the raw string (`"session-..."`). Results continue
 to serialize refs as objects for compatibility with existing callers.
@@ -72,6 +75,13 @@ current name, and data/code state for addresses or names. When `reverse.rename`
 or `reverse.set_type` reports that an address is inside an existing item, call
 `reverse.inspect_item` before attempting any IDB state repair. DbgAtlas does not
 split or undefine existing data items implicitly.
+
+Address-consuming reverse tools keep their existing method names and argument
+shapes. When an address is normalized, the tool result may include
+`normalized_address` near the specific result item and a top-level
+`normalized_addresses` array for callers that want a stable summary. TTD positions
+such as `151E:2020` are rejected for these code-address parameters because they
+belong to the replay timeline, not the IDA address space.
 
 `reverse.session.open` itself does not modify the IDB. Session metadata keeps
 the legacy `writes_idb: false` field for compatibility and also records

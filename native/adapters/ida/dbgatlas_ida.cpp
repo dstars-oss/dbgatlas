@@ -172,7 +172,12 @@ bool parse_u64_text(const std::string& text, uint64_t* out) {
     if (value.empty()) {
         return false;
     }
-    int base = 10;
+    bool had_backtick = value.find('`') != std::string::npos;
+    value.erase(std::remove(value.begin(), value.end(), '`'), value.end());
+    if (value.empty()) {
+        return false;
+    }
+    int base = had_backtick ? 16 : 10;
     if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
         base = 16;
         value = value.substr(2);
@@ -196,6 +201,107 @@ bool parse_u64_text(const std::string& text, uint64_t* out) {
     }
     *out = result;
     return true;
+}
+
+std::string to_lower_copy(std::string value);
+
+bool is_hexish_text(const std::string& text) {
+    if (text.empty()) {
+        return false;
+    }
+    for (char ch : text) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool looks_like_ttd_position(const std::string& text) {
+    std::string value = trim_copy(text);
+    size_t range = value.find("..");
+    if (range != std::string::npos) {
+        value = value.substr(0, range);
+    }
+    size_t colon = value.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= value.size()) {
+        return false;
+    }
+    return value.find(':', colon + 1) == std::string::npos
+        && is_hexish_text(value.substr(0, colon))
+        && is_hexish_text(value.substr(colon + 1));
+}
+
+struct AddressResolution {
+    std::string input;
+    std::string kind;
+    std::string module;
+    uint64_t rva = 0;
+    uint64_t ida_image_base = 0;
+    ea_t ea = BADADDR;
+    std::string confidence;
+};
+
+bool parse_module_rva_text(const std::string& text, std::string* module, uint64_t* rva) {
+    std::string value = trim_copy(text);
+    size_t plus = value.rfind('+');
+    if (plus == std::string::npos || plus == 0 || plus + 1 >= value.size()) {
+        return false;
+    }
+    std::string lhs = trim_copy(value.substr(0, plus));
+    std::string rhs = trim_copy(value.substr(plus + 1));
+    if (lhs.empty() || rhs.empty() || lhs.find(':') != std::string::npos) {
+        return false;
+    }
+    uint64_t parsed = 0;
+    if (!parse_u64_text(rhs, &parsed)) {
+        return false;
+    }
+    *module = lhs;
+    *rva = parsed;
+    return true;
+}
+
+AddressResolution resolve_code_address_text(const std::string& text, const std::string& key) {
+    std::string input = trim_copy(text);
+    if (looks_like_ttd_position(input)) {
+        throw std::invalid_argument(
+            key + " is a TTD position, not a code address; use a TTD seek operation before passing code addresses to reverse tools");
+    }
+
+    uint64_t address = 0;
+    if (parse_u64_text(input, &address)) {
+        return AddressResolution{
+            input,
+            "ida_ea",
+            "",
+            0,
+            0,
+            static_cast<ea_t>(address),
+            "high",
+        };
+    }
+
+    std::string module;
+    uint64_t rva = 0;
+    if (parse_module_rva_text(input, &module, &rva)) {
+        ea_t image_base = dbgatlas_get_imagebase();
+        uint64_t image_base_u64 = static_cast<uint64_t>(image_base);
+        if (image_base_u64 > std::numeric_limits<uint64_t>::max() - rva) {
+            throw std::invalid_argument(key + " module+RVA overflows the IDA address space");
+        }
+        return AddressResolution{
+            input,
+            "module_rva",
+            module,
+            rva,
+            image_base_u64,
+            static_cast<ea_t>(image_base_u64 + rva),
+            "medium",
+        };
+    }
+
+    throw std::invalid_argument(key + " must be an IDA address, integer string, or module+RVA string");
 }
 
 Json parse_json_args(const std::string& args) {
@@ -368,6 +474,46 @@ bool json_bool_arg(const Json& args, const char* key, bool fallback) {
 
 Json nullable_ea(ea_t value) {
     return value == BADADDR ? Json(nullptr) : Json(static_cast<uint64_t>(value));
+}
+
+Json address_resolution_json(const AddressResolution& address) {
+    Json result = {
+        {"input", address.input},
+        {"kind", address.kind},
+        {"ida_ea", nullable_ea(address.ea)},
+        {"confidence", address.confidence},
+    };
+    if (address.kind == "module_rva") {
+        result["module"] = address.module;
+        result["rva"] = address.rva;
+        result["ida_image_base"] = address.ida_image_base;
+    }
+    return result;
+}
+
+uint64_t json_code_address_value(const Json& value, const std::string& key, AddressResolution* resolved) {
+    AddressResolution address = resolve_code_address_text(json_scalar_text(value), key);
+    if (resolved != nullptr) {
+        *resolved = address;
+    }
+    return static_cast<uint64_t>(address.ea);
+}
+
+uint64_t required_json_code_address_arg(const Json& args, const char* key, AddressResolution* resolved = nullptr) {
+    const Json* value = json_arg(args, key);
+    if (value == nullptr) {
+        throw std::invalid_argument(std::string(key) + " is required");
+    }
+    return json_code_address_value(*value, key, resolved);
+}
+
+bool optional_json_code_address_arg(const Json& args, const char* key, AddressResolution* resolved) {
+    const Json* value = json_arg(args, key);
+    if (value == nullptr) {
+        return false;
+    }
+    (void)json_code_address_value(*value, key, resolved);
+    return true;
 }
 
 std::string json_string(const std::string& text) {
@@ -599,13 +745,32 @@ std::string core_lookup_funcs(const Json& args) {
     out << "{\"items\":[";
     bool first = true;
     for (const auto& query : queries) {
+        if (looks_like_ttd_position(query)) {
+            throw std::invalid_argument("queries contains a TTD position, not a code address");
+        }
         uint64_t address = 0;
         bool is_address = parse_u64_text(query, &address);
+        AddressResolution normalized{};
+        bool has_normalized = false;
         ea_t ea = BADADDR;
         if (is_address) {
             if (address >= runtime_module_base && ida_image_base <= std::numeric_limits<uint64_t>::max() - (address - runtime_module_base)) {
                 ea = static_cast<ea_t>(ida_image_base + (address - runtime_module_base));
+                normalized = AddressResolution{
+                    query,
+                    runtime_module_base != 0 || ida_image_base != 0 ? "runtime_va" : "ida_ea",
+                    "",
+                    runtime_module_base != 0 || ida_image_base != 0 ? address - runtime_module_base : 0,
+                    ida_image_base,
+                    ea,
+                    "high",
+                };
+                has_normalized = true;
             }
+        } else if (parse_module_rva_text(query, &normalized.module, &normalized.rva)) {
+            normalized = resolve_code_address_text(query, "queries");
+            ea = normalized.ea;
+            has_normalized = true;
         } else {
             ea = get_name_ea(BADADDR, query.c_str());
         }
@@ -613,10 +778,14 @@ std::string core_lookup_funcs(const Json& args) {
         if (!first) out << ",";
         first = false;
         out << "{\"query\":" << json_string(query)
-            << ",\"input_type\":" << json_string(is_address ? "address" : "name")
+            << ",\"input_type\":" << json_string(is_address || has_normalized ? "address" : "name")
             << ",\"found\":" << (function == nullptr ? "false" : "true")
             << ",\"ida_ea\":" << json_nullable_u64(ea)
-            << ",\"function\":" << function_json(function) << "}";
+            << ",\"function\":" << function_json(function);
+        if (has_normalized) {
+            out << ",\"normalized_address\":" << address_resolution_json(normalized).dump();
+        }
+        out << "}";
     }
     out << "],\"count\":" << queries.size() << "}";
     return out.str();
@@ -792,7 +961,8 @@ std::string core_list_strings(IdaSessionHandleImpl* handle, const Json& args) {
 
 std::string core_get_string(IdaSessionHandleImpl* handle, const Json& args) {
     ensure_string_list(handle);
-    uint64_t addr = required_json_u64_arg(args, "addr");
+    AddressResolution normalized{};
+    uint64_t addr = required_json_code_address_arg(args, "addr", &normalized);
     ea_t ea = static_cast<ea_t>(addr);
 
     string_info_t item;
@@ -828,6 +998,7 @@ std::string core_get_string(IdaSessionHandleImpl* handle, const Json& args) {
     bool found = read_string_text(ea, length, type, &text);
     std::ostringstream out;
     out << "{\"address\":" << json_u64(addr)
+        << ",\"normalized_address\":" << address_resolution_json(normalized).dump()
         << ",\"found\":" << (found ? "true" : "false")
         << ",\"length\":" << (length == size_t(-1) ? "null" : json_u64(static_cast<uint64_t>(length)))
         << ",\"type\":" << type;
@@ -841,11 +1012,13 @@ std::string core_get_string(IdaSessionHandleImpl* handle, const Json& args) {
 }
 
 std::string core_get_bytes(const Json& args) {
-    uint64_t addr = required_json_u64_arg(args, "addr");
+    AddressResolution normalized{};
+    uint64_t addr = required_json_code_address_arg(args, "addr", &normalized);
     uint64_t length = required_json_u64_arg(args, "length");
     std::vector<uint8_t> bytes = read_idb_bytes(static_cast<ea_t>(addr), length);
     std::ostringstream out;
     out << "{\"address\":" << json_u64(addr)
+        << ",\"normalized_address\":" << address_resolution_json(normalized).dump()
         << ",\"requested_length\":" << json_u64(length)
         << ",\"read_length\":" << json_u64(static_cast<uint64_t>(bytes.size()))
         << ",\"complete\":" << (bytes.size() == length ? "true" : "false")
@@ -854,7 +1027,8 @@ std::string core_get_bytes(const Json& args) {
 }
 
 std::string core_get_int(const Json& args) {
-    uint64_t addr = required_json_u64_arg(args, "addr");
+    AddressResolution normalized{};
+    uint64_t addr = required_json_code_address_arg(args, "addr", &normalized);
     uint64_t size = 8;
     optional_json_u64_arg(args, "size", &size);
     if (size != 1 && size != 2 && size != 4 && size != 8) {
@@ -872,6 +1046,7 @@ std::string core_get_int(const Json& args) {
     bool complete = bytes.size() == size;
     std::ostringstream out;
     out << "{\"address\":" << json_u64(addr)
+        << ",\"normalized_address\":" << address_resolution_json(normalized).dump()
         << ",\"size\":" << json_u64(size)
         << ",\"endian\":" << json_string(endian)
         << ",\"complete\":" << (complete ? "true" : "false")
@@ -899,10 +1074,16 @@ std::string core_get_int(const Json& args) {
 }
 
 std::string core_decompile(const Json& args) {
-    uint64_t addr = required_json_u64_arg(args, "addr");
+    AddressResolution normalized{};
+    uint64_t addr = required_json_code_address_arg(args, "addr", &normalized);
     func_t* function = get_func(static_cast<ea_t>(addr));
     if (function == nullptr) {
-        return "{\"found\":false,\"pseudocode\":null,\"error\":\"function not found\"}";
+        return Json{
+            {"found", false},
+            {"normalized_address", address_resolution_json(normalized)},
+            {"pseudocode", nullptr},
+            {"error", "function not found"}
+        }.dump();
     }
 
     if (!dbgatlas_init_hexrays_plugin()) {
@@ -944,6 +1125,7 @@ std::string core_decompile(const Json& args) {
     std::string pseudocode_text = text.str();
     Json result = {
         {"found", true},
+        {"normalized_address", address_resolution_json(normalized)},
         {"function", Json::parse(function_json(function))},
         {"language", "c"},
         {"pseudocode", pseudocode_text},
@@ -960,13 +1142,20 @@ std::string core_decompile(const Json& args) {
 }
 
 std::string core_disasm(const Json& args) {
-    uint64_t addr = required_json_u64_arg(args, "addr");
+    AddressResolution normalized{};
+    uint64_t addr = required_json_code_address_arg(args, "addr", &normalized);
     func_t* function = get_func(static_cast<ea_t>(addr));
     if (function == nullptr) {
-        return "{\"found\":false,\"instructions\":[],\"warnings\":[\"function not found\"]}";
+        return Json{
+            {"found", false},
+            {"normalized_address", address_resolution_json(normalized)},
+            {"instructions", Json::array()},
+            {"warnings", Json::array({"function not found"})}
+        }.dump();
     }
     std::ostringstream out;
     out << "{\"found\":true,\"function\":" << function_json(function)
+        << ",\"normalized_address\":" << address_resolution_json(normalized).dump()
         << ",\"arguments\":[],\"stack_frame\":{\"size\":" << json_u64(static_cast<uint64_t>(get_frame_size(function)))
         << "},\"instructions\":[";
     bool first = true;
@@ -993,14 +1182,14 @@ std::string core_xrefs_to(const Json& args) {
     out << "{\"items\":[";
     bool first_item = true;
     for (const auto& text : addrs) {
-        uint64_t value = 0;
-        if (!parse_u64_text(text, &value)) {
-            throw std::invalid_argument("xrefs_to addrs must contain only addresses");
-        }
+        AddressResolution normalized = resolve_code_address_text(text, "addrs");
+        uint64_t value = static_cast<uint64_t>(normalized.ea);
         ea_t to = static_cast<ea_t>(value);
         if (!first_item) out << ",";
         first_item = false;
-        out << "{\"to\":" << json_u64(value) << ",\"xrefs\":[";
+        out << "{\"to\":" << json_u64(value)
+            << ",\"normalized_address\":" << address_resolution_json(normalized).dump()
+            << ",\"xrefs\":[";
         bool first = true;
         for (ea_t from = get_first_cref_to(to); from != BADADDR; from = get_next_cref_to(to, from)) {
             if (!first) out << ",";
@@ -1073,14 +1262,14 @@ std::string core_callees(const Json& args) {
     out << "{\"items\":[";
     bool first_item = true;
     for (const auto& text : addrs) {
-        uint64_t value = 0;
-        if (!parse_u64_text(text, &value)) {
-            throw std::invalid_argument("callees addrs must contain only addresses");
-        }
+        AddressResolution normalized = resolve_code_address_text(text, "addrs");
+        uint64_t value = static_cast<uint64_t>(normalized.ea);
         func_t* function = get_func(static_cast<ea_t>(value));
         if (!first_item) out << ",";
         first_item = false;
-        out << "{\"function\":" << function_json(function) << ",\"callees\":[";
+        out << "{\"function\":" << function_json(function)
+            << ",\"normalized_address\":" << address_resolution_json(normalized).dump()
+            << ",\"callees\":[";
         bool first = true;
         if (function != nullptr) {
             for (ea_t ea = function->start_ea; ea < function->end_ea;) {
@@ -1102,10 +1291,13 @@ std::string core_callees(const Json& args) {
     return out.str();
 }
 
-ea_t resolve_addr_or_name(const Json& object, bool required = true) {
-    uint64_t addr = 0;
-    if (optional_json_u64_arg(object, "addr", &addr)) {
-        return static_cast<ea_t>(addr);
+ea_t resolve_addr_or_name(const Json& object, bool required = true, AddressResolution* resolved = nullptr) {
+    AddressResolution local_resolved{};
+    if (optional_json_code_address_arg(object, "addr", &local_resolved)) {
+        if (resolved != nullptr) {
+            *resolved = local_resolved;
+        }
+        return local_resolved.ea;
     }
     std::string name = json_string_arg(object, "name");
     if (!name.empty()) {
@@ -1118,11 +1310,27 @@ ea_t resolve_addr_or_name(const Json& object, bool required = true) {
 }
 
 ea_t resolve_query_addr_or_name(const std::string& query) {
-    uint64_t addr = 0;
-    if (parse_u64_text(query, &addr)) {
-        return static_cast<ea_t>(addr);
+    try {
+        AddressResolution resolved = resolve_code_address_text(query, "query");
+        return resolved.ea;
+    } catch (const std::invalid_argument&) {
+        if (looks_like_ttd_position(query)) {
+            throw;
+        }
     }
     return get_name_ea(BADADDR, query.c_str());
+}
+
+bool try_resolve_query_code_address(const std::string& query, AddressResolution* resolved) {
+    try {
+        *resolved = resolve_code_address_text(query, "query");
+        return true;
+    } catch (const std::invalid_argument&) {
+        if (looks_like_ttd_position(query)) {
+            throw;
+        }
+        return false;
+    }
 }
 
 std::string current_name_or_placeholder(ea_t ea) {
@@ -1190,10 +1398,13 @@ std::string core_rename(const Json& args) {
         std::string kind = json_string_arg(item, "kind");
         std::string new_name = json_string_arg(item, "new_name");
         ea_t ea = BADADDR;
+        AddressResolution normalized{};
+        bool has_normalized = false;
         std::string error;
         bool ok = false;
         try {
-            ea = resolve_addr_or_name(item);
+            ea = resolve_addr_or_name(item, true, &normalized);
+            has_normalized = !normalized.input.empty();
             if (kind.empty()) kind = "addr";
             if (kind != "function" && kind != "global") {
                 throw std::invalid_argument("kind must be `function` or `global`");
@@ -1227,6 +1438,9 @@ std::string core_rename(const Json& args) {
             {"ok", ok},
             {"item_state", item_state_json(ea)}
         };
+        if (has_normalized) {
+            result["normalized_address"] = address_resolution_json(normalized);
+        }
         if (!error.empty()) {
             result["error"] = error;
             result["hint"] = error == "set_name failed" ? set_name_failure_hint(ea) : error;
@@ -1248,12 +1462,15 @@ std::string core_set_comments(const Json& args) {
     size_t changed = 0;
     for (const auto& item : items) {
         ea_t ea = BADADDR;
+        AddressResolution normalized{};
+        bool has_normalized = false;
         std::string text = json_string_arg(item, "text");
         bool repeatable = json_bool_arg(item, "repeatable", false);
         bool ok = false;
         std::string error;
         try {
-            ea = resolve_addr_or_name(item);
+            ea = resolve_addr_or_name(item, true, &normalized);
+            has_normalized = !normalized.input.empty();
             ok = set_cmt(ea, text.c_str(), repeatable);
             if (!ok) {
                 error = "set_cmt failed";
@@ -1268,6 +1485,9 @@ std::string core_set_comments(const Json& args) {
         out << "{\"ea\":" << json_nullable_u64(ea)
             << ",\"repeatable\":" << (repeatable ? "true" : "false")
             << ",\"ok\":" << (ok ? "true" : "false");
+        if (has_normalized) {
+            out << ",\"normalized_address\":" << address_resolution_json(normalized).dump();
+        }
         if (!error.empty()) out << ",\"error\":" << json_string(error);
         out << "}";
     }
@@ -1283,11 +1503,14 @@ std::string core_set_type(const Json& args) {
         std::string kind = json_string_arg(item, "kind");
         std::string type_text = json_string_arg(item, "type");
         ea_t ea = BADADDR;
+        AddressResolution normalized{};
+        bool has_normalized = false;
         bool ok = false;
         std::string error;
         std::string decl;
         try {
-            ea = resolve_addr_or_name(item);
+            ea = resolve_addr_or_name(item, true, &normalized);
+            has_normalized = !normalized.input.empty();
             if (kind.empty()) kind = "addr";
             if (kind != "function" && kind != "global" && kind != "addr") {
                 throw std::invalid_argument("kind must be `function`, `global`, or `addr`");
@@ -1322,6 +1545,9 @@ std::string core_set_type(const Json& args) {
             {"generated_decl", decl},
             {"item_state", item_state_json(ea)}
         };
+        if (has_normalized) {
+            result["normalized_address"] = address_resolution_json(normalized);
+        }
         if (!error.empty()) {
             result["error"] = error;
             result["hint"] = error == "apply_cdecl failed" ? apply_cdecl_failure_hint(ea, decl) : error;
@@ -1382,12 +1608,18 @@ std::string core_inspect_item(const Json& args) {
     std::vector<std::string> queries = json_list_arg(args, "queries");
     Json rows = Json::array();
     for (const auto& query : queries) {
+        AddressResolution normalized{};
+        bool has_normalized = try_resolve_query_code_address(query, &normalized);
         ea_t ea = resolve_query_addr_or_name(query);
-        rows.push_back(Json{
+        Json row = {
             {"query", query},
             {"ea", nullable_ea(ea)},
             {"item_state", item_state_json(ea)}
-        });
+        };
+        if (has_normalized) {
+            row["normalized_address"] = address_resolution_json(normalized);
+        }
+        rows.push_back(std::move(row));
     }
     return Json{
         {"items", rows},
@@ -1409,6 +1641,8 @@ std::string core_force_recompile(const Json& args) {
     bool first = true;
     size_t changed = 0;
     for (const auto& text : addrs) {
+        AddressResolution normalized{};
+        bool has_normalized = try_resolve_query_code_address(text, &normalized);
         ea_t ea = resolve_query_addr_or_name(text);
         func_t* function = ea == BADADDR ? nullptr : get_func(ea);
         bool ok = false;
@@ -1425,6 +1659,9 @@ std::string core_force_recompile(const Json& args) {
         out << "{\"query\":" << json_string(text)
             << ",\"ea\":" << json_nullable_u64(function == nullptr ? BADADDR : function->start_ea)
             << ",\"ok\":" << (ok ? "true" : "false");
+        if (has_normalized) {
+            out << ",\"normalized_address\":" << address_resolution_json(normalized).dump();
+        }
         if (!error.empty()) out << ",\"error\":" << json_string(error);
         out << "}";
     }
@@ -1732,6 +1969,8 @@ std::string core_query_xrefs(const Json& args) {
     if (xref_type.empty()) xref_type = "all";
     uint64_t offset = json_u64_arg(args, "offset", 0);
     uint64_t count = json_u64_arg(args, "limit", json_u64_arg(args, "count", 100));
+    AddressResolution normalized{};
+    bool has_normalized = try_resolve_query_code_address(target, &normalized);
     ea_t ea = resolve_query_addr_or_name(target);
     if (ea == BADADDR) {
         throw std::invalid_argument("target was not found");
@@ -1764,7 +2003,11 @@ std::string core_query_xrefs(const Json& args) {
     } else {
         throw std::invalid_argument("direction must be `to` or `from`");
     }
-    return paged_result_json(rows, offset, count);
+    Json result = Json::parse(paged_result_json(rows, offset, count));
+    if (has_normalized) {
+        result["normalized_address"] = address_resolution_json(normalized);
+    }
+    return result.dump();
 }
 
 std::string core_query_funcs(const Json& args) {

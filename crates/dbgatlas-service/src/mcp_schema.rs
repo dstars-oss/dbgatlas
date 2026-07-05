@@ -230,10 +230,12 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
         ),
         mcp_tool(
             "reverse.lookup_funcs",
-            "Lookup IDA functions by address or name.",
+            "Lookup IDA functions by address, module+RVA, or name.",
             mcp_reverse_core_schema_required(
                 json!({
-                "queries": {},
+                "queries": {
+                    "description": "Address or name queries. Address strings may be IDA EA values such as 0x180093660 or module+RVA values such as libxsse+0x93660."
+                },
                 "runtime_module_base": {},
                 "ida_image_base": {}
                 }),
@@ -286,7 +288,7 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
             "Read an IDA string at an address.",
             mcp_reverse_core_schema_required(
                 json!({
-                    "addr": {},
+                    "addr": reverse_address_schema(),
                     "length": { "type": "integer" },
                     "type": { "type": "integer" }
                 }),
@@ -298,7 +300,7 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
             "Read IDB bytes at an address.",
             mcp_reverse_core_schema_required(
                 json!({
-                    "addr": {},
+                    "addr": reverse_address_schema(),
                     "length": { "type": "integer" }
                 }),
                 &["addr", "length"],
@@ -309,7 +311,7 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
             "Read an integer from IDB bytes at an address.",
             mcp_reverse_core_schema_required(
                 json!({
-                    "addr": {},
+                    "addr": reverse_address_schema(),
                     "size": { "type": "integer" },
                     "endian": {
                         "type": "string",
@@ -323,17 +325,30 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
         mcp_tool(
             "reverse.decompile",
             "Decompile the function containing an IDA address.",
-            mcp_reverse_core_schema_required(json!({ "addr": {} }), &["addr"]),
+            mcp_reverse_core_schema_required(
+                json!({ "addr": reverse_address_schema() }),
+                &["addr"],
+            ),
         ),
         mcp_tool(
             "reverse.disasm",
             "Disassemble the function containing an IDA address.",
-            mcp_reverse_core_schema_required(json!({ "addr": {} }), &["addr"]),
+            mcp_reverse_core_schema_required(
+                json!({ "addr": reverse_address_schema() }),
+                &["addr"],
+            ),
         ),
         mcp_tool(
             "reverse.xrefs_to",
             "Find cross-references to one or more IDA addresses.",
-            mcp_reverse_core_schema_required(json!({ "addrs": {} }), &["addrs"]),
+            mcp_reverse_core_schema_required(
+                json!({
+                    "addrs": {
+                        "description": "One or more IDA EA or module+RVA code addresses."
+                    }
+                }),
+                &["addrs"],
+            ),
         ),
         mcp_tool(
             "reverse.xrefs_to_field",
@@ -343,7 +358,14 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
         mcp_tool(
             "reverse.callees",
             "List callees for one or more IDA functions.",
-            mcp_reverse_core_schema_required(json!({ "addrs": {} }), &["addrs"]),
+            mcp_reverse_core_schema_required(
+                json!({
+                    "addrs": {
+                        "description": "One or more IDA EA or module+RVA code addresses."
+                    }
+                }),
+                &["addrs"],
+            ),
         ),
         mcp_tool(
             "reverse.rename",
@@ -807,6 +829,12 @@ fn mcp_reverse_core_schema_required(extra_properties: Value, extra_required: &[&
         "type": "object",
         "properties": properties,
         "required": required
+    })
+}
+
+fn reverse_address_schema() -> Value {
+    json!({
+        "description": "IDA EA, decimal integer, WinDbg-style hex integer, or module+RVA string such as libxsse+0x93660. TTD positions such as 151E:2020 are rejected because they are not code addresses."
     })
 }
 

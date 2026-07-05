@@ -37,3 +37,4 @@ void dbgatlas_validate_ida_runtime_version();
 bool dbgatlas_init_hexrays_plugin(int flags = 0);
 void dbgatlas_term_hexrays_plugin();
 asize_t dbgatlas_get_item_size(ea_t ea);
+ea_t dbgatlas_get_imagebase();
