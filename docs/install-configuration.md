@@ -20,6 +20,7 @@ DbgAtlas service 只允许 loopback bind。不要把默认 endpoint 暴露到公
 使用当前仓库构建出的 MSI：
 
 ```powershell
+.\script\build-msi.ps1
 msiexec.exe /i .\target\installer\DbgAtlas-0.1.0-x64.msi
 ```
 
