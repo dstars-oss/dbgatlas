@@ -9,7 +9,7 @@ DbgAtlas 接入 DbgEng/ETW/IDA 等长生命周期能力前，先按 service-mana
 - 同一 session 请求串行化，避免 debug engine 状态被并发命令破坏。
 - 不同 session 可并发运行，各自有独立 worker 生命周期。
 - 主进程可以 close、cancel 或 kill 卡死 worker，并把结果记录为 operation。
-- worker 绑定在 service 管理的 Windows Job Object 下，service 退出时不应残留。
+- worker 通过 service 管理的 lifetime pipe heartbeat 和 worker 侧 watchdog 约束生命周期；service 正常退出时主动关闭 worker，异常断开时 worker 应自主退出。
 
 ## 生命周期
 

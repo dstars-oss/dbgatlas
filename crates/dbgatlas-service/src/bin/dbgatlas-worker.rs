@@ -15,7 +15,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const LIFETIME_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() {
     if let Err(error) = run() {
@@ -27,6 +29,8 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = WorkerArgs::parse()?;
     let mut pipe = open_pipe(&args.pipe)?;
+    let lifetime_pipe = open_pipe(&args.lifetime_pipe)?;
+    let _watchdog = start_lifetime_watchdog(lifetime_pipe);
     let mut state = WorkerState::new(args.session_id.clone(), args.dbgeng_dirs);
     loop {
         // worker 与 service 之间只走一行一个 JSON envelope 的 pipe 协议。
@@ -52,21 +56,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct WorkerArgs {
     pipe: String,
+    lifetime_pipe: String,
     session_id: String,
     dbgeng_dirs: Vec<PathBuf>,
 }
 
 impl WorkerArgs {
     fn parse() -> Result<Self, String> {
-        let mut args = std::env::args().skip(1);
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    fn parse_from<I>(args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut args = args.into_iter();
         let mut pipe = None;
+        let mut lifetime_pipe = None;
         let mut session_id = None;
         let mut dbgeng_dirs = Vec::new();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--pipe" => pipe = args.next(),
+                "--lifetime-pipe" => lifetime_pipe = args.next(),
                 "--session-id" => session_id = args.next(),
                 "--dbgeng-dir" => {
                     dbgeng_dirs.push(
@@ -80,11 +95,150 @@ impl WorkerArgs {
         }
         Ok(Self {
             pipe: pipe.ok_or_else(|| "missing --pipe".to_string())?,
+            lifetime_pipe: lifetime_pipe.ok_or_else(|| "missing --lifetime-pipe".to_string())?,
             session_id: session_id.ok_or_else(|| "missing --session-id".to_string())?,
             dbgeng_dirs,
         })
     }
 }
+
+fn start_lifetime_watchdog(mut lifetime_pipe: std::fs::File) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            match read_lifetime_line_with_timeout(&mut lifetime_pipe, LIFETIME_WATCHDOG_TIMEOUT) {
+                Ok(line) if line.trim_end() == "tick" => {}
+                Ok(_) => {}
+                Err(_) => {
+                    terminate_descendant_processes(std::process::id());
+                    std::process::exit(0);
+                }
+            }
+        }
+    })
+}
+
+#[cfg(windows)]
+fn read_lifetime_line_with_timeout(
+    reader: &mut std::fs::File,
+    timeout: Duration,
+) -> Result<String, std::io::Error> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let started = Instant::now();
+    let mut bytes = Vec::new();
+    loop {
+        let mut available = 0;
+        let ok = unsafe {
+            PeekNamedPipe(
+                reader.as_raw_handle() as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if available == 0 {
+            if started.elapsed() >= timeout {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for lifetime heartbeat",
+                ));
+            }
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        let mut byte = [0u8; 1];
+        let read = reader.read(&mut byte)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "lifetime pipe closed",
+            ));
+        }
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+        if bytes.len() > 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "lifetime heartbeat line is too large",
+            ));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn read_lifetime_line_with_timeout(
+    reader: &mut std::fs::File,
+    _timeout: Duration,
+) -> Result<String, std::io::Error> {
+    read_jsonl_line(reader)
+}
+
+#[cfg(windows)]
+fn terminate_descendant_processes(root_pid: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    for _ in 0..3 {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut processes = Vec::new();
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+        while ok != 0 {
+            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            ok = unsafe { Process32NextW(snapshot, &mut entry) };
+        }
+        unsafe {
+            CloseHandle(snapshot);
+        }
+
+        let mut descendants = Vec::new();
+        let mut frontier = vec![root_pid];
+        while let Some(parent_pid) = frontier.pop() {
+            for (pid, ppid) in &processes {
+                if *ppid == parent_pid && *pid != root_pid && !descendants.contains(pid) {
+                    descendants.push(*pid);
+                    frontier.push(*pid);
+                }
+            }
+        }
+
+        if descendants.is_empty() {
+            return;
+        }
+
+        for pid in descendants.into_iter().rev() {
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+            if handle.is_null() {
+                continue;
+            }
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_descendant_processes(_root_pid: u32) {}
 
 struct WorkerState {
     expected_session_id: String,
@@ -642,5 +796,35 @@ mod tests {
             }
             other => panic!("expected failed response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn worker_args_require_lifetime_pipe() {
+        let error = WorkerArgs::parse_from(vec![
+            "--pipe".to_string(),
+            r"\\.\pipe\dbgatlas-rpc-test".to_string(),
+            "--session-id".to_string(),
+            "session-001".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("missing --lifetime-pipe"));
+    }
+
+    #[test]
+    fn worker_args_accept_lifetime_pipe() {
+        let args = WorkerArgs::parse_from(vec![
+            "--pipe".to_string(),
+            r"\\.\pipe\dbgatlas-rpc-test".to_string(),
+            "--lifetime-pipe".to_string(),
+            r"\\.\pipe\dbgatlas-life-test".to_string(),
+            "--session-id".to_string(),
+            "session-001".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.pipe, r"\\.\pipe\dbgatlas-rpc-test");
+        assert_eq!(args.lifetime_pipe, r"\\.\pipe\dbgatlas-life-test");
+        assert_eq!(args.session_id, "session-001");
     }
 }

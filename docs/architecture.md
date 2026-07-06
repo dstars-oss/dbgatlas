@@ -35,7 +35,7 @@ flowchart LR
 
 对外 API 不暴露 `workspace.*`、`project.*` 或 `worker.*` 业务资源。调用方在创建 session 时传入 `project_root`；service 内部把它解析为 `<project_root>/dbgatlas` 作为 analysis workspace，并懒创建该目录。`workspace` 仍是内部持久化模型，负责 manifest、artifact metadata、operation log 和受控 artifact path。
 
-`session` 是公开生命周期对象，`worker` 是内部运行时对象。当前默认一个 session 绑定一个 worker；创建 session 时创建 worker，关闭或 kill session 时结束对应 worker。worker 由 service 的 Windows Job Object 管理，service 退出时 worker 不应残留。
+`session` 是公开生命周期对象，`worker` 是内部运行时对象。当前默认一个 session 绑定一个 worker；创建 session 时创建 worker，关闭或 kill session 时结束对应 worker。worker 由 service 的 lifetime pipe heartbeat 和 worker 侧 watchdog 管理，service 正常退出时主动关闭 worker，异常断开时 worker 应自主退出。
 
 `dbgatlas-debug` 代表 debug domain manager 边界：它定义 target、session、command 和状态模型。DbgEng、TTD、dump eval 等能力由 domain manager 编排 runtime、workspace 和具体 adapter/native wrapper。
 

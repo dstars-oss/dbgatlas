@@ -4035,6 +4035,48 @@ fn http_rpc_path_still_returns_health() {
     server.stop();
 }
 
+#[test]
+fn service_shutdown_closes_debug_and_reverse_workers() {
+    let temp = tempfile::tempdir().unwrap();
+    let supervisor = Arc::new(ShutdownRecordingSupervisor::new());
+    let host = ServiceHost::new(supervisor.clone());
+    let debug = create_debug_session(&host, temp.path());
+    assert!(debug.error.is_none(), "{:?}", debug.error);
+    let _reverse_session_id = open_reverse_session(&host, temp.path());
+
+    host.shutdown_workers_gracefully(Duration::from_millis(200));
+
+    let requests = supervisor.requests.lock().unwrap();
+    assert!(requests.contains(&"close_session"));
+    assert!(requests.contains(&"close_reverse_session"));
+    assert_eq!(supervisor.close_count.load(Ordering::SeqCst), 2);
+    assert_eq!(supervisor.kill_count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn service_shutdown_kills_worker_when_request_lock_is_busy() {
+    let temp = tempfile::tempdir().unwrap();
+    let supervisor = Arc::new(ShutdownRecordingSupervisor::new());
+    let host = ServiceHost::new(supervisor.clone());
+    let session_id = open_reverse_session(&host, temp.path());
+    let session_id = session_id["id"].as_str().unwrap().to_string();
+    let request_lock = {
+        let state = host.lock_state().unwrap();
+        state
+            .sessions
+            .get(&session_id)
+            .unwrap()
+            .request_lock
+            .clone()
+    };
+    let _guard = request_lock.lock().unwrap();
+
+    host.shutdown_workers_gracefully(Duration::from_millis(20));
+
+    assert_eq!(supervisor.close_count.load(Ordering::SeqCst), 0);
+    assert_eq!(supervisor.kill_count.load(Ordering::SeqCst), 1);
+}
+
 struct TestServer {
     endpoint: SocketAddr,
     shutdown: ServiceShutdown,
@@ -4378,6 +4420,22 @@ struct FailingReverseOpenSupervisor;
 struct FailingReverseCloseSupervisor;
 
 struct FailingReverseCoreSupervisor;
+
+struct ShutdownRecordingSupervisor {
+    requests: Mutex<Vec<&'static str>>,
+    close_count: AtomicU64,
+    kill_count: AtomicU64,
+}
+
+impl ShutdownRecordingSupervisor {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            close_count: AtomicU64::new(0),
+            kill_count: AtomicU64::new(0),
+        }
+    }
+}
 
 impl WorkerSupervisor for RecordingIdentitySupervisor {
     fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
@@ -4802,6 +4860,40 @@ impl WorkerSupervisor for FailingReverseCoreSupervisor {
     }
 
     fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+impl WorkerSupervisor for ShutdownRecordingSupervisor {
+    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
+        Ok(test_worker_handle(request.session_id))
+    }
+
+    fn request_worker(
+        &self,
+        _worker: &WorkerHandle,
+        request: WorkerRequest,
+    ) -> Result<WorkerResponse, ServiceError> {
+        self.requests.lock().unwrap().push(request.method_name());
+        mock_worker_response(request)
+    }
+
+    fn cancel_worker_operation(
+        &self,
+        _worker: &WorkerHandle,
+        _session_id: &SessionRef,
+        _operation_id: &OperationRef,
+    ) -> Result<WorkerCancelOutcome, ServiceError> {
+        Ok(WorkerCancelOutcome::Notified)
+    }
+
+    fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+        self.close_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+        self.kill_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }

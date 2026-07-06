@@ -46,6 +46,8 @@ const MAX_INLINE_REVERSE_RESULT_BYTES: usize = 128 * 1024;
 const MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES: usize = 32 * 1024;
 const MAX_WORKER_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
 const DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS: u64 = 5_000;
+const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WINDOWS_SERVICE_NAME: &str = "DbgAtlas";
 pub const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DbgAtlas Service";
 pub const WINDOWS_SERVICE_DESCRIPTION: &str = "DbgAtlas local debugging service";
@@ -196,6 +198,7 @@ fn append_ttd_helper_error(path: &Path, error: &ServiceError) -> Result<(), std:
 #[derive(Clone, Default)]
 pub struct ServiceShutdown {
     stop: Arc<AtomicBool>,
+    active_handlers: Arc<AtomicU64>,
 }
 
 impl ServiceShutdown {
@@ -209,6 +212,25 @@ impl ServiceShutdown {
 
     pub fn is_stopping(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+
+    fn handler_started(&self) {
+        self.active_handlers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn handler_finished(&self) {
+        self.active_handlers.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn wait_for_handlers(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while self.active_handlers.load(Ordering::SeqCst) != 0 {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        true
     }
 }
 
@@ -331,6 +353,129 @@ impl ServiceHost {
     fn with_ttd_runner(mut self, runner: Arc<dyn TtdRecorderRunner>) -> Self {
         self.ttd_runner = runner;
         self
+    }
+
+    fn shutdown_workers_gracefully(&self, timeout: Duration) {
+        let sessions = match self.lock_state() {
+            Ok(state) => state
+                .sessions
+                .values()
+                .filter(|session| !session.state.is_terminal())
+                .cloned()
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                append_service_diagnostic_log(&format!(
+                    "worker_shutdown_snapshot_failed error={}",
+                    sanitize_log_value(&error.to_string())
+                ));
+                return;
+            }
+        };
+        append_service_diagnostic_log(&format!(
+            "worker_shutdown_start session_count={} timeout_ms={}",
+            sessions.len(),
+            timeout.as_millis()
+        ));
+        for session in sessions {
+            self.shutdown_session_worker(session, timeout);
+        }
+        append_service_diagnostic_log("worker_shutdown_complete");
+    }
+
+    fn shutdown_session_worker(&self, session: ManagedSession, timeout: Duration) {
+        let started = Instant::now();
+        loop {
+            match session.request_lock.try_lock() {
+                Ok(_guard) => {
+                    let request = match session.capability.as_str() {
+                        "reverse" => WorkerRequest::CloseReverseSession {
+                            session_id: session.session_id.clone(),
+                        },
+                        "debug" => WorkerRequest::CloseSession {
+                            session_id: session.session_id.clone(),
+                        },
+                        _ => {
+                            let _ = self.supervisor.kill_worker(&session.worker);
+                            return;
+                        }
+                    };
+                    match self.supervisor.request_worker_with_timeout(
+                        &session.worker,
+                        request,
+                        timeout,
+                    ) {
+                        Ok(WorkerResponse::Ok { .. }) => {
+                            if let Err(error) = self.supervisor.close_worker(&session.worker) {
+                                append_service_diagnostic_log(&format!(
+                                    "worker_shutdown_close_failed worker_id={} session_id={} capability={} error={}",
+                                    sanitize_log_value(session.worker.worker_id.as_str()),
+                                    sanitize_log_value(session.session_id.id.as_str()),
+                                    sanitize_log_value(&session.capability),
+                                    sanitize_log_value(&error.to_string())
+                                ));
+                                let _ = self.supervisor.kill_worker(&session.worker);
+                            }
+                        }
+                        Ok(other) => {
+                            append_service_diagnostic_log(&format!(
+                                "worker_shutdown_unexpected_response worker_id={} session_id={} capability={} response={}",
+                                sanitize_log_value(session.worker.worker_id.as_str()),
+                                sanitize_log_value(session.session_id.id.as_str()),
+                                sanitize_log_value(&session.capability),
+                                sanitize_log_value(&format!("{other:?}"))
+                            ));
+                            let _ = self.supervisor.kill_worker(&session.worker);
+                        }
+                        Err(error) => {
+                            append_service_diagnostic_log(&format!(
+                                "worker_shutdown_request_failed worker_id={} session_id={} capability={} error={}",
+                                sanitize_log_value(session.worker.worker_id.as_str()),
+                                sanitize_log_value(session.session_id.id.as_str()),
+                                sanitize_log_value(&session.capability),
+                                sanitize_log_value(&error.to_string())
+                            ));
+                            let _ = self.supervisor.kill_worker(&session.worker);
+                        }
+                    }
+                    self.mark_session_closed_for_shutdown(&session);
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    append_service_diagnostic_log(&format!(
+                        "worker_shutdown_lock_poisoned worker_id={} session_id={}",
+                        sanitize_log_value(session.worker.worker_id.as_str()),
+                        sanitize_log_value(session.session_id.id.as_str())
+                    ));
+                    let _ = self.supervisor.kill_worker(&session.worker);
+                    self.mark_session_closed_for_shutdown(&session);
+                    return;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= timeout {
+                        append_service_diagnostic_log(&format!(
+                            "worker_shutdown_lock_timeout worker_id={} session_id={} timeout_ms={}",
+                            sanitize_log_value(session.worker.worker_id.as_str()),
+                            sanitize_log_value(session.session_id.id.as_str()),
+                            timeout.as_millis()
+                        ));
+                        let _ = self.supervisor.kill_worker(&session.worker);
+                        self.mark_session_closed_for_shutdown(&session);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    fn mark_session_closed_for_shutdown(&self, session: &ManagedSession) {
+        let Ok(mut state) = self.lock_state() else {
+            return;
+        };
+        if let Some(current) = state.sessions.get_mut(session.session_id.id.as_str()) {
+            current.state = DebugSessionState::Closed;
+            current.updated_at = Timestamp::now();
+        }
     }
 
     pub fn handle_rpc(&self, request: JsonRpcRequest) -> JsonRpcResponse {
@@ -3687,6 +3832,14 @@ pub trait WorkerSupervisor: Send + Sync {
         worker: &WorkerHandle,
         request: WorkerRequest,
     ) -> Result<WorkerResponse, ServiceError>;
+    fn request_worker_with_timeout(
+        &self,
+        worker: &WorkerHandle,
+        request: WorkerRequest,
+        _timeout: Duration,
+    ) -> Result<WorkerResponse, ServiceError> {
+        self.request_worker(worker, request)
+    }
     fn cancel_worker_operation(
         &self,
         worker: &WorkerHandle,
@@ -3763,14 +3916,12 @@ impl TtdRecorderRunner for ProcessTtdRecorderRunner {
 
 pub struct MockWorkerSupervisor {
     identity: WorkerIdentity,
-    _job: job::ManagedJob,
 }
 
 impl MockWorkerSupervisor {
     pub fn new() -> Self {
         Self {
             identity: WorkerIdentity::CurrentUserDevMode,
-            _job: job::ManagedJob::create("DbgAtlasMockWorkers"),
         }
     }
 }
@@ -3830,12 +3981,12 @@ pub struct ProcessWorkerSupervisor {
     identity: WorkerIdentity,
     worker_exe: Option<PathBuf>,
     workers: Mutex<HashMap<String, Arc<ProcessWorkerState>>>,
-    job: job::ManagedJob,
 }
 
 struct ProcessWorkerState {
     child: Mutex<WorkerProcess>,
     transport: Mutex<WorkerTransport>,
+    lifetime: Mutex<WorkerLifetime>,
 }
 
 enum WorkerProcess {
@@ -3845,6 +3996,24 @@ enum WorkerProcess {
 }
 
 impl WorkerProcess {
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Std(child) => child.id(),
+            #[cfg(windows)]
+            Self::RawWindows(process) => process.pid(),
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<Option<i32>>, std::io::Error> {
+        match self {
+            Self::Std(child) => child
+                .try_wait()
+                .map(|status| status.map(|status| status.code())),
+            #[cfg(windows)]
+            Self::RawWindows(process) => process.try_wait(),
+        }
+    }
+
     fn kill(&mut self) -> Result<(), std::io::Error> {
         match self {
             Self::Std(child) => child.kill(),
@@ -3860,7 +4029,152 @@ impl WorkerProcess {
             Self::RawWindows(process) => process.wait(),
         }
     }
+
+    fn wait_timeout(&mut self, timeout: Duration) -> Result<bool, std::io::Error> {
+        let started = Instant::now();
+        loop {
+            if self.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            if started.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
+
+struct WorkerLifetime {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WorkerLifetime {
+    fn start(worker_id: &Id, session_id: &SessionRef, transport: WorkerTransport) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let worker_id = worker_id.as_str().to_string();
+        let session_id = session_id.id.as_str().to_string();
+        let join = std::thread::spawn(move || {
+            let mut file = transport.into_file();
+            while !thread_stop.load(Ordering::SeqCst) {
+                if let Err(error) = file.write_all(b"tick\n").and_then(|_| file.flush()) {
+                    append_service_diagnostic_log(&format!(
+                        "worker_lifetime_heartbeat_stopped worker_id={} session_id={} error={}",
+                        sanitize_log_value(&worker_id),
+                        sanitize_log_value(&session_id),
+                        sanitize_log_value(&error.to_string())
+                    ));
+                    return;
+                }
+                let started = Instant::now();
+                while started.elapsed() < WORKER_HEARTBEAT_INTERVAL {
+                    if thread_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if self.join.as_ref().is_some_and(|join| join.is_finished()) {
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(windows)]
+fn terminate_descendant_processes(root_pid: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    for _ in 0..3 {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            append_service_diagnostic_log(&format!(
+                "worker_descendant_cleanup_snapshot_failed root_pid={} error={}",
+                root_pid,
+                sanitize_log_value(&std::io::Error::last_os_error().to_string())
+            ));
+            return;
+        }
+
+        let mut processes = Vec::new();
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+        while ok != 0 {
+            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            ok = unsafe { Process32NextW(snapshot, &mut entry) };
+        }
+        unsafe {
+            CloseHandle(snapshot);
+        }
+
+        let mut descendants = Vec::new();
+        let mut frontier = vec![root_pid];
+        while let Some(parent_pid) = frontier.pop() {
+            for (pid, ppid) in &processes {
+                if *ppid == parent_pid && *pid != root_pid && !descendants.contains(pid) {
+                    descendants.push(*pid);
+                    frontier.push(*pid);
+                }
+            }
+        }
+
+        if descendants.is_empty() {
+            return;
+        }
+
+        for pid in descendants.into_iter().rev() {
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+            if handle.is_null() {
+                append_service_diagnostic_log(&format!(
+                    "worker_descendant_open_failed root_pid={} pid={} error={}",
+                    root_pid,
+                    pid,
+                    sanitize_log_value(&std::io::Error::last_os_error().to_string())
+                ));
+                continue;
+            }
+            let ok = unsafe { TerminateProcess(handle, 1) };
+            if ok == 0 {
+                append_service_diagnostic_log(&format!(
+                    "worker_descendant_terminate_failed root_pid={} pid={} error={}",
+                    root_pid,
+                    pid,
+                    sanitize_log_value(&std::io::Error::last_os_error().to_string())
+                ));
+            }
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_descendant_processes(_root_pid: u32) {}
 
 impl ProcessWorkerSupervisor {
     pub fn new() -> Result<Self, ServiceError> {
@@ -3868,7 +4182,6 @@ impl ProcessWorkerSupervisor {
             identity: WorkerIdentity::CurrentUserDevMode,
             worker_exe: None,
             workers: Mutex::new(HashMap::new()),
-            job: job::ManagedJob::create_result("DbgAtlasDevWorkers")?,
         })
     }
 
@@ -3877,7 +4190,6 @@ impl ProcessWorkerSupervisor {
             identity: WorkerIdentity::CurrentUserDevMode,
             worker_exe: Some(worker_exe),
             workers: Mutex::new(HashMap::new()),
-            job: job::ManagedJob::create_result("DbgAtlasDevWorkers")?,
         })
     }
 
@@ -3886,7 +4198,6 @@ impl ProcessWorkerSupervisor {
             identity: WorkerIdentity::LocalSystem,
             worker_exe: None,
             workers: Mutex::new(HashMap::new()),
-            job: job::ManagedJob::create_result("DbgAtlasInstalledWorkers")?,
         })
     }
 
@@ -3908,6 +4219,7 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         let worker_id = Id::new(format!("worker-{}", request.session_id.id.as_str()))
             .expect("generated worker ids are valid");
         let pipe_name = unique_pipe_name(&request.session_id);
+        let lifetime_pipe_name = unique_lifetime_pipe_name(&request.session_id);
         let identity = request.identity.unwrap_or_else(|| self.identity.clone());
         let dbgeng_dirs = prepare_dbgeng_dirs_for_worker_identity(&identity, &request.dbgeng_dirs)?;
         let dbgeng_dir_count = dbgeng_dirs.len();
@@ -3930,6 +4242,20 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             );
             ServiceError::Worker(format!("failed to create worker pipe server: {error}"))
         })?;
+        let lifetime_transport =
+            WorkerTransport::create_server(&lifetime_pipe_name).map_err(|error| {
+                append_worker_create_failed_log(
+                    &worker_id,
+                    &request.session_id,
+                    &identity,
+                    started,
+                    "lifetime_pipe_server",
+                    &error.to_string(),
+                );
+                ServiceError::Worker(format!(
+                    "failed to create worker lifetime pipe server: {error}"
+                ))
+            })?;
         let worker_exe = self
             .worker_exe
             .clone()
@@ -3949,6 +4275,7 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         let mut child = spawn_worker_process(
             &worker_exe,
             &pipe_name,
+            &lifetime_pipe_name,
             request.session_id.id.as_str(),
             &identity,
             &dbgeng_dirs,
@@ -3963,21 +4290,6 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
                 &error.to_string(),
             );
         })?;
-        if let Err(error) = self.job.assign_process(&child) {
-            let _ = child.kill();
-            let _ = child.wait();
-            append_worker_create_failed_log(
-                &worker_id,
-                &request.session_id,
-                &identity,
-                started,
-                "assign_job",
-                &error.to_string(),
-            );
-            return Err(ServiceError::Worker(format!(
-                "failed to assign worker process to cleanup job: {error}"
-            )));
-        }
         let connected = match transport.connect(request.startup_timeout_ms) {
             Ok(connected) => connected,
             Err(error) => {
@@ -3994,9 +4306,27 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
                 return Err(error);
             }
         };
+        let lifetime_connected = match lifetime_transport.connect(request.startup_timeout_ms) {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                append_worker_create_failed_log(
+                    &worker_id,
+                    &request.session_id,
+                    &identity,
+                    started,
+                    "lifetime_connect",
+                    &error.to_string(),
+                );
+                return Err(error);
+            }
+        };
+        let lifetime = WorkerLifetime::start(&worker_id, &request.session_id, lifetime_connected);
         let state = Arc::new(ProcessWorkerState {
             child: Mutex::new(child),
             transport: Mutex::new(connected),
+            lifetime: Mutex::new(lifetime),
         });
         self.workers
             .lock()
@@ -4029,6 +4359,37 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             .lock()
             .map_err(|_| ServiceError::Worker("worker transport lock poisoned".to_string()))?;
         transport.request(worker, request)
+    }
+
+    fn request_worker_with_timeout(
+        &self,
+        worker: &WorkerHandle,
+        request: WorkerRequest,
+        timeout: Duration,
+    ) -> Result<WorkerResponse, ServiceError> {
+        let worker_state = self.get_worker(worker)?;
+        let started = Instant::now();
+        loop {
+            match worker_state.transport.try_lock() {
+                Ok(mut transport) => {
+                    return transport.request_with_timeout(worker, request, timeout);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(ServiceError::Worker(
+                        "worker transport lock poisoned".to_string(),
+                    ));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= timeout {
+                        return Err(ServiceError::Worker(format!(
+                            "timed out waiting for worker transport lock after {} ms",
+                            timeout.as_millis()
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
     }
 
     fn cancel_worker_operation(
@@ -4075,11 +4436,25 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             .remove(worker.worker_id.as_str());
         let found = worker_state.is_some();
         if let Some(worker_state) = worker_state {
+            if let Ok(mut lifetime) = worker_state.lifetime.lock() {
+                lifetime.stop();
+            }
             let mut child = worker_state
                 .child
                 .lock()
                 .map_err(|_| ServiceError::Worker("worker process lock poisoned".to_string()))?;
-            let _ = child.wait();
+            if !child.wait_timeout(WORKER_SHUTDOWN_TIMEOUT)? {
+                append_service_diagnostic_log(&format!(
+                    "worker_close_timeout worker_id={} session_id={} identity={} timeout_ms={}",
+                    sanitize_log_value(worker.worker_id.as_str()),
+                    sanitize_log_value(worker.session_id.id.as_str()),
+                    sanitize_log_value(&format!("{:?}", worker.identity)),
+                    WORKER_SHUTDOWN_TIMEOUT.as_millis(),
+                ));
+                terminate_descendant_processes(child.pid());
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
         append_service_diagnostic_log(&format!(
             "worker_close worker_id={} session_id={} identity={} found={} duration_ms={}",
@@ -4101,10 +4476,14 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             .remove(worker.worker_id.as_str());
         let found = worker_state.is_some();
         if let Some(worker_state) = worker_state {
+            if let Ok(mut lifetime) = worker_state.lifetime.lock() {
+                lifetime.stop();
+            }
             let mut child = worker_state
                 .child
                 .lock()
                 .map_err(|_| ServiceError::Worker("worker process lock poisoned".to_string()))?;
+            terminate_descendant_processes(child.pid());
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -4124,7 +4503,11 @@ impl Drop for ProcessWorkerSupervisor {
     fn drop(&mut self) {
         if let Ok(mut workers) = self.workers.lock() {
             for (_, worker) in workers.drain() {
+                if let Ok(mut lifetime) = worker.lifetime.lock() {
+                    lifetime.stop();
+                }
                 if let Ok(mut child) = worker.child.lock() {
+                    terminate_descendant_processes(child.pid());
                     let _ = child.kill();
                     let _ = child.wait();
                 }
@@ -6895,6 +7278,14 @@ fn register_worker_writes(
 }
 
 fn unique_pipe_name(session_id: &SessionRef) -> String {
+    unique_worker_pipe_name(session_id, "rpc")
+}
+
+fn unique_lifetime_pipe_name(session_id: &SessionRef) -> String {
+    unique_worker_pipe_name(session_id, "life")
+}
+
+fn unique_worker_pipe_name(session_id: &SessionRef, purpose: &str) -> String {
     let counter = WORKER_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6902,7 +7293,7 @@ fn unique_pipe_name(session_id: &SessionRef) -> String {
         .unwrap_or(0)
         ^ counter as u128;
     format!(
-        r"\\.\pipe\dbgatlas-{}-{}-{nonce:x}",
+        r"\\.\pipe\dbgatlas-{purpose}-{}-{}-{nonce:x}",
         std::process::id(),
         session_id.id.as_str()
     )
@@ -7345,11 +7736,12 @@ fn cleanup_windbg_runtime_update_dirs(paths: &ServiceInstallPaths) -> Result<(),
 fn spawn_worker_process(
     worker_exe: &Path,
     pipe_name: &str,
+    lifetime_pipe_name: &str,
     session_id: &str,
     identity: &WorkerIdentity,
     dbgeng_dirs: &[PathBuf],
 ) -> Result<WorkerProcess, ServiceError> {
-    let args = worker_process_args(pipe_name, session_id, dbgeng_dirs);
+    let args = worker_process_args(pipe_name, lifetime_pipe_name, session_id, dbgeng_dirs);
     match identity {
         WorkerIdentity::ActiveInteractiveUser => {
             spawn_active_interactive_worker_process(worker_exe, &args)
@@ -7360,10 +7752,17 @@ fn spawn_worker_process(
     }
 }
 
-fn worker_process_args(pipe_name: &str, session_id: &str, dbgeng_dirs: &[PathBuf]) -> Vec<String> {
+fn worker_process_args(
+    pipe_name: &str,
+    lifetime_pipe_name: &str,
+    session_id: &str,
+    dbgeng_dirs: &[PathBuf],
+) -> Vec<String> {
     let mut args = vec![
         "--pipe".to_string(),
         pipe_name.to_string(),
+        "--lifetime-pipe".to_string(),
+        lifetime_pipe_name.to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
     ];
@@ -9934,10 +10333,32 @@ impl WorkerTransport {
         create_worker_pipe_server(pipe_name)
     }
 
+    fn into_file(self) -> std::fs::File {
+        self.file
+    }
+
     fn request(
         &mut self,
         worker: &WorkerHandle,
         request: WorkerRequest,
+    ) -> Result<WorkerResponse, ServiceError> {
+        self.request_inner(worker, request, None)
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        worker: &WorkerHandle,
+        request: WorkerRequest,
+        timeout: Duration,
+    ) -> Result<WorkerResponse, ServiceError> {
+        self.request_inner(worker, request, Some(timeout))
+    }
+
+    fn request_inner(
+        &mut self,
+        worker: &WorkerHandle,
+        request: WorkerRequest,
+        response_timeout: Option<Duration>,
     ) -> Result<WorkerResponse, ServiceError> {
         let request_id = next_worker_request_id();
         let method = request.method_name();
@@ -10000,7 +10421,11 @@ impl WorkerTransport {
             );
             return Err(error.into());
         }
-        let response_line = read_jsonl_line(&mut self.file).inspect_err(|error| {
+        let response_line = match response_timeout {
+            Some(timeout) => read_jsonl_line_with_timeout(&mut self.file, timeout),
+            None => read_jsonl_line(&mut self.file),
+        }
+        .inspect_err(|error| {
             append_worker_transport_log(
                 "read_failed",
                 worker,
@@ -10094,6 +10519,71 @@ fn read_jsonl_line(reader: &mut impl Read) -> Result<String, ServiceError> {
         }
     }
     String::from_utf8(bytes).map_err(|error| ServiceError::Worker(error.to_string()))
+}
+
+#[cfg(windows)]
+fn read_jsonl_line_with_timeout(
+    reader: &mut std::fs::File,
+    timeout: Duration,
+) -> Result<String, ServiceError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let started = Instant::now();
+    let mut bytes = Vec::new();
+    loop {
+        let mut available = 0;
+        let ok = unsafe {
+            PeekNamedPipe(
+                reader.as_raw_handle() as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if available == 0 {
+            if started.elapsed() >= timeout {
+                return Err(ServiceError::Worker(format!(
+                    "timed out waiting for worker response after {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        let mut byte = [0u8; 1];
+        let read = reader.read(&mut byte)?;
+        if read == 0 {
+            return Err(ServiceError::Worker(
+                "worker pipe closed before response".to_string(),
+            ));
+        }
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes)
+                .map_err(|error| ServiceError::Worker(error.to_string()));
+        }
+        if bytes.len() > MAX_WORKER_RESPONSE_LINE_BYTES {
+            discard_jsonl_line_tail(reader)?;
+            return Err(ServiceError::Worker(
+                "worker response line is too large".to_string(),
+            ));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn read_jsonl_line_with_timeout(
+    reader: &mut std::fs::File,
+    _timeout: Duration,
+) -> Result<String, ServiceError> {
+    read_jsonl_line(reader)
 }
 
 fn discard_jsonl_line_tail(reader: &mut impl Read) -> Result<(), ServiceError> {
@@ -10930,7 +11420,10 @@ pub fn run_http_service_until(
         };
         let config = config.clone();
         let host = host.clone();
+        shutdown.handler_started();
+        let handler_shutdown = shutdown.clone();
         std::thread::spawn(move || {
+            let _handler_guard = HttpHandlerGuard(handler_shutdown);
             let response_result = handle_http_stream(&mut stream, &config, &host, Some(peer_addr));
             let (response, write_stage) = match response_result {
                 Ok(response) => (response, "write_response"),
@@ -10970,7 +11463,22 @@ pub fn run_http_service_until(
         "http_service_stop bind={}",
         sanitize_log_value(&config.bind.to_string())
     ));
+    if !shutdown.wait_for_handlers(WORKER_SHUTDOWN_TIMEOUT) {
+        append_service_diagnostic_log(&format!(
+            "http_service_stop_active_handlers_timeout timeout_ms={}",
+            WORKER_SHUTDOWN_TIMEOUT.as_millis()
+        ));
+    }
+    host.shutdown_workers_gracefully(WORKER_SHUTDOWN_TIMEOUT);
     Ok(())
+}
+
+struct HttpHandlerGuard(ServiceShutdown);
+
+impl Drop for HttpHandlerGuard {
+    fn drop(&mut self) {
+        self.0.handler_finished();
+    }
 }
 
 pub fn invoke_http_json_rpc(
@@ -11697,12 +12205,6 @@ mod job {
 
     #[cfg(windows)]
     impl ManagedJob {
-        pub fn create(_name: &str) -> Self {
-            Self::create_result(_name).unwrap_or(Self {
-                handle: std::ptr::null_mut(),
-            })
-        }
-
         pub fn create_result(_name: &str) -> Result<Self, std::io::Error> {
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {
@@ -11725,23 +12227,6 @@ mod job {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(Self { handle })
-        }
-
-        pub fn assign_process(&self, process: &crate::WorkerProcess) -> Result<(), std::io::Error> {
-            use std::os::windows::io::AsRawHandle;
-
-            if self.handle.is_null() {
-                return Ok(());
-            }
-            let process_handle = match process {
-                crate::WorkerProcess::Std(child) => child.as_raw_handle() as HANDLE,
-                crate::WorkerProcess::RawWindows(process) => process.handle(),
-            };
-            let ok = unsafe { AssignProcessToJobObject(self.handle, process_handle) };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
         }
 
         pub fn assign_child_process(
@@ -11778,19 +12263,8 @@ mod job {
 
     #[cfg(not(windows))]
     impl ManagedJob {
-        pub fn create(_name: &str) -> Self {
-            Self
-        }
-
         pub fn create_result(_name: &str) -> Result<Self, std::io::Error> {
             Ok(Self)
-        }
-
-        pub fn assign_process(
-            &self,
-            _process: &crate::WorkerProcess,
-        ) -> Result<(), std::io::Error> {
-            Ok(())
         }
 
         pub fn assign_child_process(
@@ -11829,6 +12303,7 @@ mod windows_active_user_process {
     pub struct RawProcess {
         process_handle: HANDLE,
         thread_handle: HANDLE,
+        pid: u32,
         exit_code: Option<i32>,
         waited: bool,
     }
@@ -11836,8 +12311,8 @@ mod windows_active_user_process {
     unsafe impl Send for RawProcess {}
 
     impl RawProcess {
-        pub fn handle(&self) -> HANDLE {
-            self.process_handle
+        pub fn pid(&self) -> u32 {
+            self.pid
         }
 
         pub fn kill(&mut self) -> Result<(), io::Error> {
@@ -12049,6 +12524,7 @@ mod windows_active_user_process {
         Ok(RawProcess {
             process_handle: process_info.hProcess,
             thread_handle: process_info.hThread,
+            pid: process_info.dwProcessId,
             exit_code: None,
             waited: false,
         })
