@@ -175,6 +175,8 @@ enum ServiceCommand {
         #[arg(long)]
         executable: PathBuf,
         #[arg(long)]
+        current_dir: Option<PathBuf>,
+        #[arg(long)]
         stdout_path: PathBuf,
         #[arg(long)]
         stderr_path: PathBuf,
@@ -302,6 +304,8 @@ enum RecordingCommand {
         project_root: PathBuf,
         #[arg(long)]
         launch: Option<PathBuf>,
+        #[arg(long)]
+        start_directory: Option<PathBuf>,
         #[arg(long)]
         attach: Option<u32>,
         #[arg(long)]
@@ -616,12 +620,14 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
         }
         ServiceCommand::RunTtdCommand {
             executable,
+            current_dir,
             stdout_path,
             stderr_path,
             args,
         } => {
             let exit_code = run_ttd_command_helper(TtdCommandHelperOptions {
                 executable,
+                current_dir,
                 args,
                 stdout_path,
                 stderr_path,
@@ -791,6 +797,7 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
         RecordingCommand::Ttd {
             project_root,
             launch,
+            start_directory,
             attach,
             monitor,
             cmd_line_filter,
@@ -812,15 +819,22 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
             let target = match (launch, attach, monitor) {
                 (Some(executable), None, None) => serde_json::to_value(TtdTarget::Launch {
                     executable: absolute_path(executable)?,
+                    start_directory: start_directory.map(absolute_path).transpose()?,
                     args,
                 })?,
                 (None, Some(pid), None) => {
+                    if start_directory.is_some() {
+                        anyhow::bail!("--start-directory can only be used with --launch");
+                    }
                     if !args.is_empty() {
                         anyhow::bail!("--attach does not accept launch args");
                     }
                     serde_json::to_value(TtdTarget::Attach { pid })?
                 }
                 (None, None, Some(program)) => {
+                    if start_directory.is_some() {
+                        anyhow::bail!("--start-directory can only be used with --launch");
+                    }
                     if !args.is_empty() {
                         anyhow::bail!("--monitor does not accept launch args");
                     }

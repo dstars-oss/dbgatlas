@@ -612,12 +612,17 @@ fn ttd_recording_target_schema() -> Value {
                 "properties": {
                     "kind": { "type": "string", "const": "launch" },
                     "executable": { "type": "string" },
+                    "start_directory": {
+                        "type": "string",
+                        "description": "Optional working directory used when launching TTD.exe for this launch target. This is not the trace output directory."
+                    },
                     "args": {
                         "type": "array",
                         "items": { "type": "string" },
                         "default": []
                     }
                 },
+                "additionalProperties": false,
                 "required": ["kind", "executable"]
             },
             {
@@ -626,6 +631,7 @@ fn ttd_recording_target_schema() -> Value {
                     "kind": { "type": "string", "const": "attach" },
                     "pid": { "type": "integer", "minimum": 1 }
                 },
+                "additionalProperties": false,
                 "required": ["kind", "pid"]
             },
             {
@@ -635,6 +641,7 @@ fn ttd_recording_target_schema() -> Value {
                     "program": { "type": "string" },
                     "cmd_line_filter": { "type": "string" }
                 },
+                "additionalProperties": false,
                 "required": ["kind", "program"]
             }
         ]

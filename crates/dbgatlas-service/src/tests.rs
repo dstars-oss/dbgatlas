@@ -1384,6 +1384,23 @@ fn mcp_tool_schemas_expose_structured_targets_and_write_items() {
         json!(["kind", "executable"])
     );
     assert_eq!(
+        recording["inputSchema"]["properties"]["target"]["oneOf"][0]["properties"]["start_directory"]
+            ["type"],
+        "string"
+    );
+    assert_eq!(
+        recording["inputSchema"]["properties"]["target"]["oneOf"][0]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        recording["inputSchema"]["properties"]["target"]["oneOf"][1]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        recording["inputSchema"]["properties"]["target"]["oneOf"][2]["additionalProperties"],
+        false
+    );
+    assert_eq!(
         recording["inputSchema"]["properties"]["target"]["oneOf"][2]["required"],
         json!(["kind", "program"])
     );
@@ -2848,6 +2865,121 @@ fn recording_ttd_attach_uses_attach_args_and_requested_identity() {
 }
 
 #[test]
+fn recording_ttd_launch_uses_start_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let start_directory = temp.path().join("launch-cwd");
+    fs::create_dir_all(&start_directory).unwrap();
+    let (host, invocations) = ttd_test_host_and_invocations(MockTtdRunnerMode::CompletedWithTrace);
+    let response = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: "recording.ttd".to_string(),
+        params: Some(json!({
+            "project_root": temp.path(),
+            "target": {
+                "kind": "launch",
+                "executable": "app.exe",
+                "start_directory": start_directory.clone(),
+                "args": ["--sample"]
+            },
+            "timeout_ms": 1000
+        })),
+    });
+
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.as_ref().unwrap();
+    assert_eq!(result["mode"], "launch");
+    let invocations = invocations.lock().unwrap();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(
+        invocations[0].current_dir.as_deref(),
+        Some(start_directory.as_path())
+    );
+    let args = invocations[0]
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(args.contains(&"-launch".to_string()));
+    assert!(args.contains(&"app.exe".to_string()));
+    assert!(!args.contains(&start_directory.to_string_lossy().into_owned()));
+    drop(invocations);
+
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let recording_id = result["recording_id"]["id"].as_str().unwrap();
+    let metadata: Value = serde_json::from_str(
+        &fs::read_to_string(
+            workspace
+                .root()
+                .join("artifacts")
+                .join("recordings")
+                .join(recording_id)
+                .join("recording.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["target"]["kind"], "launch");
+    assert_eq!(
+        metadata["target"]["start_directory"].as_str().unwrap(),
+        start_directory.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn recording_ttd_launch_rejects_missing_start_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let start_directory = temp.path().join("missing");
+    let (host, invocations) = ttd_test_host_and_invocations(MockTtdRunnerMode::CompletedWithTrace);
+    let response = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: "recording.ttd".to_string(),
+        params: Some(json!({
+            "project_root": temp.path(),
+            "target": {
+                "kind": "launch",
+                "executable": "app.exe",
+                "start_directory": start_directory.clone()
+            },
+            "timeout_ms": 1000
+        })),
+    });
+
+    let error = response.error.as_ref().unwrap();
+    assert!(
+        error
+            .message
+            .contains("start_directory does not exist or is not a directory")
+    );
+    assert!(invocations.lock().unwrap().is_empty());
+}
+
+#[test]
+fn recording_ttd_rejects_start_directory_for_attach() {
+    let temp = tempfile::tempdir().unwrap();
+    let (host, invocations) = ttd_test_host_and_invocations(MockTtdRunnerMode::CompletedWithTrace);
+    let response = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: "recording.ttd".to_string(),
+        params: Some(json!({
+            "project_root": temp.path(),
+            "target": {
+                "kind": "attach",
+                "pid": 4242,
+                "start_directory": temp.path()
+            },
+            "timeout_ms": 1000
+        })),
+    });
+
+    let error = response.error.as_ref().unwrap();
+    assert!(error.message.contains("unknown field"));
+    assert!(invocations.lock().unwrap().is_empty());
+}
+
+#[test]
 fn ttd_active_user_helper_args_preserve_recorder_args_after_separator() {
     let args = vec![
         OsString::from("-out"),
@@ -2858,6 +2990,7 @@ fn ttd_active_user_helper_args_preserve_recorder_args_after_separator() {
     let helper_args = ttd_command_helper_args(
         Path::new(r"C:\ttd\TTD.exe"),
         &args,
+        None,
         Path::new(r"C:\case\recorder.stdout.txt"),
         Path::new(r"C:\case\recorder.stderr.txt"),
     );
@@ -2872,6 +3005,36 @@ fn ttd_active_user_helper_args_preserve_recorder_args_after_separator() {
     assert_eq!(
         &text[separator + 1..],
         ["-out", r"C:\case\traces", "-attach", "4242"]
+    );
+}
+
+#[test]
+fn ttd_active_user_helper_args_include_current_dir_before_separator() {
+    let args = vec![
+        OsString::from("-out"),
+        OsString::from(r"C:\case\traces"),
+        OsString::from("-launch"),
+        OsString::from(r"C:\tools\app.exe"),
+    ];
+    let helper_args = ttd_command_helper_args(
+        Path::new(r"C:\ttd\TTD.exe"),
+        &args,
+        Some(Path::new(r"C:\work")),
+        Path::new(r"C:\case\recorder.stdout.txt"),
+        Path::new(r"C:\case\recorder.stderr.txt"),
+    );
+    let text = helper_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    let current_dir = text.iter().position(|arg| arg == "--current-dir").unwrap();
+    let separator = text.iter().position(|arg| arg == "--").unwrap();
+    assert!(current_dir < separator);
+    assert_eq!(text[current_dir + 1], r"C:\work");
+    assert_eq!(
+        &text[separator + 1..],
+        ["-out", r"C:\case\traces", "-launch", r"C:\tools\app.exe"]
     );
 }
 

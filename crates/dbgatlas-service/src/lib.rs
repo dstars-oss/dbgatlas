@@ -145,6 +145,7 @@ impl ServiceConfig {
 #[derive(Debug)]
 pub struct TtdCommandHelperOptions {
     pub executable: PathBuf,
+    pub current_dir: Option<PathBuf>,
     pub args: Vec<OsString>,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
@@ -172,12 +173,16 @@ fn run_ttd_command_helper_inner(
     let stdout = fs::File::create(&options.stdout_path)?;
     let stderr = fs::File::create(&options.stderr_path)?;
     let job = job::ManagedJob::create_result("DbgAtlasTtdCommandHelper")?;
-    let mut child = Command::new(&options.executable)
+    let mut command = Command::new(&options.executable);
+    command
         .args(&options.args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()?;
+        .stderr(Stdio::from(stderr));
+    if let Some(current_dir) = &options.current_dir {
+        command.current_dir(current_dir);
+    }
+    let mut child = command.spawn()?;
     if let Err(error) = job.assign_child_process(&child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -952,6 +957,7 @@ impl ServiceHost {
             options: params.options,
         }
         .validate()?;
+        let current_dir = ttd_launch_start_directory(&request.target)?;
         let recording_id = next_recording_ref();
         let operation_id = next_operation_ref();
         let _active_guard = self.start_ttd_recording(recording_id.clone())?;
@@ -991,7 +997,8 @@ impl ServiceHost {
             "recorder_starting",
             Timestamp::now(),
             json!({
-                "args": args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>()
+                "args": args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                "current_dir": current_dir.as_ref(),
             }),
             None,
         )?;
@@ -1000,6 +1007,7 @@ impl ServiceHost {
         let recorder_exit = self.ttd_runner.run(TtdRecorderInvocation {
             ttd_exe: ttd_exe.clone(),
             args,
+            current_dir,
             timeout: Duration::from_millis(request.timeout_ms),
             stdout_path: stdout_path.clone(),
             stderr_path: stderr_path.clone(),
@@ -3860,6 +3868,7 @@ pub enum WorkerCancelOutcome {
 struct TtdRecorderInvocation {
     ttd_exe: PathBuf,
     args: Vec<OsString>,
+    current_dir: Option<PathBuf>,
     timeout: Duration,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -5169,6 +5178,7 @@ impl TtdRecorderProcess {
 fn spawn_ttd_process(
     ttd_exe: &Path,
     args: &[OsString],
+    current_dir: Option<&Path>,
     worker_identity: TtdRecorderIdentity,
     stdout_path: &Path,
     stderr_path: &Path,
@@ -5183,17 +5193,23 @@ fn spawn_ttd_process(
         TtdRecorderIdentity::Default => {
             let stdout = fs::File::create(stdout_path)?;
             let stderr = fs::File::create(stderr_path)?;
-            Ok(TtdRecorderProcess::Std(
-                Command::new(ttd_exe)
-                    .args(args)
-                    .stdout(Stdio::from(stdout))
-                    .stderr(Stdio::from(stderr))
-                    .spawn()?,
-            ))
+            let mut command = Command::new(ttd_exe);
+            command
+                .args(args)
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+            if let Some(current_dir) = current_dir {
+                command.current_dir(current_dir);
+            }
+            Ok(TtdRecorderProcess::Std(command.spawn()?))
         }
-        TtdRecorderIdentity::ActiveInteractiveUser => {
-            spawn_active_interactive_ttd_process(ttd_exe, args, stdout_path, stderr_path)
-        }
+        TtdRecorderIdentity::ActiveInteractiveUser => spawn_active_interactive_ttd_process(
+            ttd_exe,
+            args,
+            current_dir,
+            stdout_path,
+            stderr_path,
+        ),
     }
 }
 
@@ -5201,11 +5217,12 @@ fn spawn_ttd_process(
 fn spawn_active_interactive_ttd_process(
     ttd_exe: &Path,
     args: &[OsString],
+    current_dir: Option<&Path>,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<TtdRecorderProcess, ServiceError> {
     let helper_exe = std::env::current_exe()?;
-    let helper_args = ttd_command_helper_args(ttd_exe, args, stdout_path, stderr_path);
+    let helper_args = ttd_command_helper_args(ttd_exe, args, current_dir, stdout_path, stderr_path);
     windows_active_user_process::spawn_os(&helper_exe, &helper_args)
         .map(TtdRecorderProcess::RawWindows)
 }
@@ -5213,6 +5230,7 @@ fn spawn_active_interactive_ttd_process(
 fn ttd_command_helper_args(
     ttd_exe: &Path,
     args: &[OsString],
+    current_dir: Option<&Path>,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Vec<OsString> {
@@ -5225,8 +5243,12 @@ fn ttd_command_helper_args(
         stdout_path.as_os_str().to_os_string(),
         OsString::from("--stderr-path"),
         stderr_path.as_os_str().to_os_string(),
-        OsString::from("--"),
     ];
+    if let Some(current_dir) = current_dir {
+        helper_args.push(OsString::from("--current-dir"));
+        helper_args.push(current_dir.as_os_str().to_os_string());
+    }
+    helper_args.push(OsString::from("--"));
     helper_args.extend(args.iter().cloned());
     helper_args
 }
@@ -5235,6 +5257,7 @@ fn ttd_command_helper_args(
 fn spawn_active_interactive_ttd_process(
     _ttd_exe: &Path,
     _args: &[OsString],
+    _current_dir: Option<&Path>,
     _stdout_path: &Path,
     _stderr_path: &Path,
 ) -> Result<TtdRecorderProcess, ServiceError> {
@@ -5245,6 +5268,7 @@ fn run_ttd_process(invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, 
     let mut child = spawn_ttd_process(
         &invocation.ttd_exe,
         &invocation.args,
+        invocation.current_dir.as_deref(),
         invocation.worker_identity,
         &invocation.stdout_path,
         &invocation.stderr_path,
@@ -5357,7 +5381,14 @@ fn run_ttd_command(
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<TtdCommandExit, ServiceError> {
-    let mut child = spawn_ttd_process(ttd_exe, args, worker_identity, stdout_path, stderr_path)?;
+    let mut child = spawn_ttd_process(
+        ttd_exe,
+        args,
+        None,
+        worker_identity,
+        stdout_path,
+        stderr_path,
+    )?;
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(exit_code) = child.try_wait()? {
@@ -5424,6 +5455,24 @@ fn append_ttd_recording_event(
             "error": error,
         }),
     )
+}
+
+fn ttd_launch_start_directory(target: &TtdTarget) -> Result<Option<PathBuf>, ServiceError> {
+    let Some(start_directory) = (match target {
+        TtdTarget::Launch {
+            start_directory, ..
+        } => start_directory.as_ref(),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if !start_directory.is_dir() {
+        return Err(ServiceError::Rpc(format!(
+            "TTD launch start_directory does not exist or is not a directory: {}",
+            start_directory.display()
+        )));
+    }
+    Ok(Some(start_directory.clone()))
 }
 
 fn discover_ttd_artifacts(traces_dir: &Path) -> Result<DiscoveredTtdArtifacts, ServiceError> {

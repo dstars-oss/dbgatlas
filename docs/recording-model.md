@@ -38,7 +38,7 @@ dbgatlas recording status <recording-id>
 dbgatlas recording stop <recording-id>
 dbgatlas recording cancel <recording-id>
 dbgatlas recording kill <recording-id>
-dbgatlas recording ttd --project-root <path> --launch <exe> --timeout-ms <ms> [-- <args>]
+dbgatlas recording ttd --project-root <path> --launch <exe> [--start-directory <dir>] --timeout-ms <ms> [-- <args>]
 dbgatlas recording ttd --project-root <path> --attach <pid> --timeout-ms <ms>
 dbgatlas recording ttd --project-root <path> --attach <pid> --timeout-ms <ms> --worker-identity active_interactive_user
 dbgatlas recording ttd --project-root <path> --monitor <program> --timeout-ms <ms>
@@ -108,6 +108,8 @@ artifacts/
 `events/*.jsonl` 是按 category 拆分的低层事件流。每一行是一条规范化事件，同时保留 ETW provenance 和 raw payload，方便后续审计和重新解释。
 
 TTD recording 使用同一 `artifacts/recordings/<recording_id>/` namespace。`recording.json` 的 `adapter.kind` 为 `ttd`，`traces/*.run` / `traces/*.idx` 登记为 `recording.ttd.trace` / `recording.ttd.index`，recorder stdout/stderr 登记为 `recording.recorder_output`，事件审计写入 `events.jsonl`。`recording.ttd` tool result 也会直接返回 `primary_trace_path`、`trace_paths`、`trace_index_paths` 和 `.run` 对应的 `trace_artifacts`，便于后续用 `debug.session.create` 的 `{ "kind": "file", "path": "<trace.run>" }` replay。
+
+TTD launch target 可用 `{ "kind": "launch", "executable": <path>, "start_directory": <dir>, "args": [...] }` 指定目标启动时的 working directory；CLI 对应 `--start-directory <dir>`。该目录只影响 launch working directory，不改变 TTD trace 的 `-out` 输出目录，trace 仍由 DbgAtlas 写入当前 recording artifact 下的 `traces/`。
 
 TTD attach target 使用 `{ "kind": "attach", "pid": <pid> }`，CLI 对应 `--attach <pid>`。安装态 service 默认在 service 进程身份下启动 `TTD.exe`；当目标进程位于当前交互用户会话且 LocalSystem 无法完成用户级 attach 时，调用方可以传 `worker_identity: "active_interactive_user"` 或 CLI `--worker-identity active_interactive_user`，让 recorder 和 timeout stop 命令都在当前交互用户身份下执行。`recording.json` 和 tool result 会记录实际请求的 `worker_identity`。
 

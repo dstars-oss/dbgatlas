@@ -23,6 +23,10 @@ pub enum RecordingError {
     TtdFileTooLarge,
     #[error("TTD launch executable must not be empty")]
     EmptyTtdExecutable,
+    #[error("TTD launch start_directory must not be empty")]
+    EmptyTtdStartDirectory,
+    #[error("TTD launch start_directory must be an absolute path")]
+    InvalidTtdStartDirectory,
     #[error("TTD attach pid must not be zero")]
     InvalidTtdAttachPid,
     #[error("TTD monitor program must not be empty")]
@@ -184,10 +188,12 @@ impl RecordTtd {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TtdTarget {
     Launch {
         executable: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_directory: Option<PathBuf>,
         #[serde(default)]
         args: Vec<String>,
     },
@@ -204,10 +210,21 @@ pub enum TtdTarget {
 impl TtdTarget {
     pub fn validate(self) -> Result<Self, RecordingError> {
         match self {
-            Self::Launch { executable, args } => {
+            Self::Launch {
+                executable,
+                start_directory,
+                args,
+            } => {
                 validate_ttd_path(&executable, RecordingError::EmptyTtdExecutable)?;
+                if let Some(start_directory) = &start_directory {
+                    validate_ttd_start_directory(start_directory)?;
+                }
                 validate_args(&args)?;
-                Ok(Self::Launch { executable, args })
+                Ok(Self::Launch {
+                    executable,
+                    start_directory,
+                    args,
+                })
             }
             Self::Attach { pid } => {
                 if pid == 0 {
@@ -373,6 +390,7 @@ pub fn build_ttd_args(
     match target {
         TtdTarget::Launch {
             executable,
+            start_directory: _,
             args: target_args,
         } => {
             args.push(OsString::from("-launch"));
@@ -433,6 +451,14 @@ fn validate_ttd_path(path: &Path, empty_error: RecordingError) -> Result<(), Rec
     let text = path.as_os_str().to_string_lossy();
     if has_control_characters(&text) {
         return Err(RecordingError::ControlCharacters);
+    }
+    Ok(())
+}
+
+fn validate_ttd_start_directory(path: &Path) -> Result<(), RecordingError> {
+    validate_ttd_path(path, RecordingError::EmptyTtdStartDirectory)?;
+    if !path.is_absolute() {
+        return Err(RecordingError::InvalidTtdStartDirectory);
     }
     Ok(())
 }
@@ -533,9 +559,69 @@ mod tests {
     }
 
     #[test]
+    fn validates_ttd_launch_start_directory() {
+        let start_directory = std::env::current_dir().unwrap();
+        let request = RecordTtd {
+            target: TtdTarget::Launch {
+                executable: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                start_directory: Some(start_directory),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            options: TtdRecordingOptions::default(),
+        };
+        assert!(request.validate().is_ok());
+
+        let request = RecordTtd {
+            target: TtdTarget::Launch {
+                executable: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                start_directory: Some(PathBuf::new()),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            options: TtdRecordingOptions::default(),
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(RecordingError::EmptyTtdStartDirectory)
+        ));
+
+        let request = RecordTtd {
+            target: TtdTarget::Launch {
+                executable: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                start_directory: Some(PathBuf::from("relative")),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            options: TtdRecordingOptions::default(),
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(RecordingError::InvalidTtdStartDirectory)
+        ));
+
+        let current_dir = std::env::current_dir().unwrap();
+        let request = RecordTtd {
+            target: TtdTarget::Launch {
+                executable: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                start_directory: Some(PathBuf::from(format!("{}\n", current_dir.display()))),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            options: TtdRecordingOptions::default(),
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(RecordingError::ControlCharacters)
+        ));
+    }
+
+    #[test]
     fn builds_ttd_launch_args() {
+        let start_directory = std::env::current_dir().unwrap();
         let target = TtdTarget::Launch {
             executable: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            start_directory: Some(start_directory.clone()),
             args: vec!["/C".to_string(), "exit 0".to_string()],
         };
         let options = TtdRecordingOptions {
@@ -554,6 +640,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(text.contains(&"-out".to_string()));
+        assert!(!text.contains(&start_directory.to_string_lossy().into_owned()));
         assert!(text.contains(&"-accepteula".to_string()));
         assert!(text.contains(&"-children".to_string()));
         assert!(text.contains(&"-module".to_string()));
