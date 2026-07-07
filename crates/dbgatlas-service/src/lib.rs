@@ -11665,11 +11665,24 @@ fn authorize_http_request(
             return Err(ServiceError::InvalidOrigin(origin.clone()));
         }
     }
-    let expected = format!("Bearer {}", config.bearer_token);
     match request.headers.get("authorization") {
-        Some(actual) if actual == &expected => Ok(()),
+        Some(actual) if bearer_token_matches(actual, &config.bearer_token) => Ok(()),
         _ => Err(ServiceError::Unauthorized),
     }
+}
+
+fn bearer_token_matches(actual: &str, expected_token: &str) -> bool {
+    let mut parts = actual.split_ascii_whitespace();
+    let Some(scheme) = parts.next() else {
+        return false;
+    };
+    let Some(token) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    scheme.eq_ignore_ascii_case("Bearer") && token == expected_token
 }
 
 fn http_json_response(status: u16, value: &JsonRpcResponse) -> Result<String, ServiceError> {

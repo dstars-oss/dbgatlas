@@ -31,12 +31,12 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
         mcp_tool(
             "service.health",
             "Return DbgAtlas service health.",
-            json!({}),
+            empty_object_schema(),
         ),
         mcp_tool(
             "service.info",
             "Return DbgAtlas service information.",
-            json!({}),
+            empty_object_schema(),
         ),
         mcp_tool(
             "service.update",
@@ -559,6 +559,10 @@ fn mcp_tool(name: &str, description: &str, input_schema: Value) -> Value {
         "description": description,
         "inputSchema": input_schema,
     })
+}
+
+fn empty_object_schema() -> Value {
+    json!({ "type": "object", "properties": {} })
 }
 
 fn debug_target_schema() -> Value {

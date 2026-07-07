@@ -5,6 +5,7 @@
 !/temp/.gitkeep
 /.wix/
 /.codex/
+/.claude/
 /docs/superpowers/
 *.pdb
 *.ilk

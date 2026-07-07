@@ -1526,6 +1526,22 @@ fn mcp_tool_schemas_expose_structured_targets_and_write_items() {
 }
 
 #[test]
+fn mcp_tool_input_schemas_are_top_level_objects() {
+    let tools = mcp_tool_descriptors(ServiceCapabilities {
+        ida_py_eval: true,
+        ..ServiceCapabilities::default()
+    });
+
+    for tool in tools {
+        assert_eq!(
+            tool["inputSchema"]["type"], "object",
+            "tool `{}` must expose a top-level object inputSchema for strict MCP clients",
+            tool["name"]
+        );
+    }
+}
+
+#[test]
 fn repeated_close_is_rejected_after_session_is_terminal() {
     let temp = tempfile::tempdir().unwrap();
     let host = ServiceHost::with_mock_workers();
@@ -3994,6 +4010,69 @@ fn http_mcp_rejects_missing_bearer_token() {
 }
 
 #[test]
+fn http_mcp_accepts_case_insensitive_bearer_scheme() {
+    let server = start_mock_http_service();
+    let response = post_json_with_authorization_header(
+        server.endpoint,
+        "/mcp",
+        Some("bearer test-token"),
+        None,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }),
+    );
+
+    assert_eq!(http_status(&response), 200);
+    assert!(http_body_json(&response)["result"]["tools"].is_array());
+    server.stop();
+}
+
+#[test]
+fn http_mcp_accepts_extra_bearer_header_spacing() {
+    let server = start_mock_http_service();
+    let response = post_json_with_authorization_header(
+        server.endpoint,
+        "/mcp",
+        Some("Bearer    test-token"),
+        None,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }),
+    );
+
+    assert_eq!(http_status(&response), 200);
+    assert!(http_body_json(&response)["result"]["tools"].is_array());
+    server.stop();
+}
+
+#[test]
+fn http_mcp_rejects_bearer_header_with_extra_parts() {
+    let server = start_mock_http_service();
+    let response = post_json_with_authorization_header(
+        server.endpoint,
+        "/mcp",
+        Some("Bearer test-token extra"),
+        None,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }),
+    );
+
+    assert_eq!(http_status(&response), 401);
+    assert_eq!(http_body_json(&response)["error"]["code"], -32001);
+    server.stop();
+}
+
+#[test]
 fn http_mcp_rejects_non_loopback_origin() {
     let server = start_mock_http_service();
     let response = post_json(
@@ -4146,6 +4225,17 @@ fn post_json(
     origin: Option<&str>,
     body: Value,
 ) -> String {
+    let authorization = token.map(|token| format!("Bearer {token}"));
+    post_json_with_authorization_header(endpoint, path, authorization.as_deref(), origin, body)
+}
+
+fn post_json_with_authorization_header(
+    endpoint: SocketAddr,
+    path: &str,
+    authorization: Option<&str>,
+    origin: Option<&str>,
+    body: Value,
+) -> String {
     let body = serde_json::to_string(&body).unwrap();
     let mut stream = TcpStream::connect(endpoint).unwrap();
     write!(
@@ -4154,8 +4244,8 @@ fn post_json(
             body.len()
         )
         .unwrap();
-    if let Some(token) = token {
-        write!(stream, "Authorization: Bearer {token}\r\n").unwrap();
+    if let Some(authorization) = authorization {
+        write!(stream, "Authorization: {authorization}\r\n").unwrap();
     }
     if let Some(origin) = origin {
         write!(stream, "Origin: {origin}\r\n").unwrap();

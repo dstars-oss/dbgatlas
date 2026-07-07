@@ -131,7 +131,23 @@ claude mcp list
 
 这种方式适合个人本机配置；header 会进入 Claude Code 的本地 MCP 配置状态，应按密钥处理。
 
-如果要把配置放在项目级 `.mcp.json`，可使用 `headersHelper` 让 Claude Code 连接时从环境变量生成 header，避免把 token 明文写入文件：
+如果要把配置放在项目级 `.mcp.json`，顶层必须是 `mcpServers`。推荐让 Claude Code 在连接时从环境变量展开 token，避免把 token 明文写入文件：
+
+```json
+{
+  "mcpServers": {
+    "dbgatlas": {
+      "type": "http",
+      "url": "http://127.0.0.1:7331/mcp",
+      "headers": {
+        "Authorization": "Bearer ${DBGATLAS_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+如果当前 Claude Code 版本或运行环境没有展开环境变量，也可使用 `headersHelper` 动态生成 header：
 
 ```json
 {
@@ -145,7 +161,7 @@ claude mcp list
 }
 ```
 
-项目级 `.mcp.json` 可以提交给团队，但不要提交任何静态 token。首次使用项目级 MCP server 时，Claude Code 会要求确认项目配置。
+项目级 `.mcp.json` 可以提交给团队，但不要提交任何静态 token。不要把 server 直接写成 `.mcp.json` 顶层的 `dbgatlas` 对象；那不是 Claude Code 的项目配置格式。首次使用项目级 MCP server 时，Claude Code 会要求确认项目配置。
 
 在 Claude Code 中验证：
 
