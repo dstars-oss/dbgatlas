@@ -6,6 +6,7 @@ This repository contains the tool implementation. Real investigation data belong
 
 Current implementation includes:
 
+- A `0.2.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
 - A Rust workspace split into `model`, `workspace`, `adapter`, `core`, `cli`, and a minimal `dbgeng` native wrapper.
 - Debug session lifecycle, per-session worker supervision, named-pipe worker transport, and a minimal real DbgEng loop.
 - Runtime configuration types in `dbgatlas-runtime`, kept separate from workspace manifests.
@@ -13,6 +14,7 @@ Current implementation includes:
 - Controlled artifact helpers for debug sessions and reserved recording/reverse artifact layouts.
 - A C++20 DbgEng native DLL with adapter-specific C ABI for opening DbgEng files (`.dmp`, `.run`), attach process, raw command execution, session symbol path append, and virtual memory reads.
 - CLI commands for workspace initialization, workspace inspection, service dev mode, and debug session workflows.
+- RPC/MCP project fact queries through `artifact.list`, `operation.list`, and `audit.list_commands`, plus the complete ETW recording lifecycle.
 - Windows Service lifecycle commands that install or use an isolated runtime payload under `%ProgramFiles%\DbgAtlas\bin\`, machine config under `etc\`, and service logs under `var\log\`.
 
 Useful commands:

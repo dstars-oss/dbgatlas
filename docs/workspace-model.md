@@ -84,19 +84,27 @@ runtime config 不属于 manifest。DbgEng/ETW/TTD/IDA 安装路径、symbol pat
 
 ## Agent Facts
 
-AI agent 应优先通过稳定入口读取 workspace facts，而不是猜测目录结构：
+AI agent 应优先通过稳定入口读取项目事实，而不是猜测目录结构。本地 CLI 仍可直接读取显式 workspace：
 
 ```powershell
 dbgatlas --json workspace facts <project_root>\dbgatlas
 ```
 
-MCP 场景下使用 `workspace.facts` tool，参数为内部 workspace 路径：
+service `0.2` 的 RPC 和 MCP 使用三个产品级入口，参数统一为 project root：
 
 ```json
 {
-  "path": "D:\\case-001\\dbgatlas"
+  "project_root": "D:\\case-001"
 }
 ```
+
+| `0.1` 聚合字段 | `0.2` 方法 | `0.2` 返回 |
+| --- | --- | --- |
+| `artifacts` | `artifact.list` | `{ "artifacts": [...] }` |
+| `operations` | `operation.list` | `{ "operations": [...] }`，内容是持久化 operation records |
+| `command_audit` | `audit.list_commands` | `{ "commands": [...] }` |
+
+`workspace.facts` 已在 `0.2` 移除且没有兼容 alias。原先读取聚合结果的调用方应按需调用上述三个方法；service 始终在内部解析 `<project_root>/dbgatlas`，不再接受 analysis workspace 或 `artifacts/` 的内部路径。
 
 Codex 通过 service-hosted HTTP MCP endpoint 接入，token 从本地环境读取：
 

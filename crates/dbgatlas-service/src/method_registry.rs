@@ -1,32 +1,124 @@
-use super::{DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, ServiceCapabilities};
+use super::{DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, ServiceCapabilities, ServiceError};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
+
+static METHOD_SPECS: OnceLock<Vec<MethodSpec>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum McpToolRoute {
-    ServiceRpc,
-    WorkspaceFacts,
-    ReversePyEval,
+pub(super) enum MethodRoute {
+    Service,
+    Session,
+    Debug,
+    Reverse,
+    Recording,
+    Operation,
+    Artifact,
+    Audit,
 }
 
-pub(super) fn mcp_tool_route(name: &str) -> Option<McpToolRoute> {
-    match name {
-        "workspace.facts" => Some(McpToolRoute::WorkspaceFacts),
-        "reverse.py_eval" => Some(McpToolRoute::ReversePyEval),
-        _ if mcp_tool_names_include(name) => Some(McpToolRoute::ServiceRpc),
-        _ => None,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CapabilityGate {
+    Always,
+    IdaPyEval,
+}
+
+impl CapabilityGate {
+    fn is_enabled(self, capabilities: &ServiceCapabilities) -> bool {
+        match self {
+            Self::Always => true,
+            Self::IdaPyEval => capabilities.ida_py_eval,
+        }
     }
 }
 
-fn mcp_tool_names_include(name: &str) -> bool {
-    mcp_tool_descriptors(ServiceCapabilities {
-        ida_py_eval: true,
-        ..ServiceCapabilities::default()
+#[derive(Clone, Debug)]
+pub(super) struct MethodSpec {
+    pub(super) name: String,
+    pub(super) route: MethodRoute,
+    pub(super) capability_gate: CapabilityGate,
+    pub(super) descriptor: Value,
+}
+
+impl MethodSpec {
+    pub(super) fn ensure_available(
+        &self,
+        capabilities: &ServiceCapabilities,
+    ) -> Result<(), ServiceError> {
+        if self.capability_gate.is_enabled(capabilities) {
+            Ok(())
+        } else {
+            Err(ServiceError::Rpc(format!(
+                "{} is disabled by runtime policy",
+                self.name
+            )))
+        }
+    }
+}
+
+pub(super) fn method_spec(name: &str) -> Option<MethodSpec> {
+    registered_method_specs()
+        .iter()
+        .find(|spec| spec.name == name)
+        .cloned()
+}
+
+pub(super) fn method_specs(capabilities: ServiceCapabilities) -> Vec<MethodSpec> {
+    registered_method_specs()
+        .iter()
+        .filter(|spec| spec.capability_gate.is_enabled(&capabilities))
+        .cloned()
+        .collect()
+}
+
+fn registered_method_specs() -> &'static [MethodSpec] {
+    METHOD_SPECS.get_or_init(|| {
+        registered_method_descriptors(ServiceCapabilities {
+            ida_py_eval: true,
+            ..ServiceCapabilities::default()
+        })
+        .into_iter()
+        .map(|descriptor| {
+            let name = descriptor["name"]
+                .as_str()
+                .expect("registered method name is a string")
+                .to_string();
+            MethodSpec {
+                route: method_route(&name),
+                capability_gate: if name == "reverse.py_eval" {
+                    CapabilityGate::IdaPyEval
+                } else {
+                    CapabilityGate::Always
+                },
+                name,
+                descriptor,
+            }
+        })
+        .collect()
     })
-    .iter()
-    .any(|tool| tool["name"] == name)
 }
 
 pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
+    method_specs(capabilities)
+        .into_iter()
+        .map(|spec| spec.descriptor)
+        .collect()
+}
+
+fn method_route(name: &str) -> MethodRoute {
+    match name.split_once('.').map(|(prefix, _)| prefix) {
+        Some("service") => MethodRoute::Service,
+        Some("session") => MethodRoute::Session,
+        Some("debug") => MethodRoute::Debug,
+        Some("reverse") => MethodRoute::Reverse,
+        Some("recording") => MethodRoute::Recording,
+        Some("operation") => MethodRoute::Operation,
+        Some("artifact") => MethodRoute::Artifact,
+        Some("audit") => MethodRoute::Audit,
+        _ => panic!("registered method has unsupported namespace: {name}"),
+    }
+}
+
+fn registered_method_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
     let mut tools = vec![
         mcp_tool(
             "service.health",
@@ -70,6 +162,25 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
                         "enum": ["default", "active_interactive_user"],
                         "default": "default",
                         "description": "Use active_interactive_user for user-session TTD replay or live launch when the installed service default LocalSystem identity cannot access the target."
+                    }
+                },
+                "required": ["project_root", "target"]
+            }),
+        ),
+        mcp_tool(
+            "recording.start",
+            "Start an ETW process-tree recording and return its recording and operation refs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project_root": { "type": "string" },
+                    "target": etw_recording_target_schema(),
+                    "presets": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["process", "thread", "image", "file", "registry", "network"]
+                        }
                     }
                 },
                 "required": ["project_root", "target"]
@@ -527,15 +638,39 @@ pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Val
             mcp_operation_schema(),
         ),
         mcp_tool(
-            "workspace.facts",
-            "Read workspace facts: artifact registry, operations, and command audit.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" }
-                },
-                "required": ["path"]
-            }),
+            "recording.status",
+            "Return the current state and artifact refs for a recording.",
+            mcp_recording_schema(),
+        ),
+        mcp_tool(
+            "recording.stop",
+            "Stop a running recording and finalize its trace and event artifacts.",
+            mcp_recording_schema(),
+        ),
+        mcp_tool(
+            "recording.cancel",
+            "Cancel a running recording while preserving its audit trail.",
+            mcp_recording_schema(),
+        ),
+        mcp_tool(
+            "recording.kill",
+            "Forcefully terminate a recording worker and preserve failure artifacts.",
+            mcp_recording_schema(),
+        ),
+        mcp_tool(
+            "artifact.list",
+            "List persisted artifact metadata for a project analysis workspace.",
+            project_root_schema(),
+        ),
+        mcp_tool(
+            "operation.list",
+            "List persisted operation records for a project analysis workspace.",
+            project_root_schema(),
+        ),
+        mcp_tool(
+            "audit.list_commands",
+            "List persisted command audit records for a project analysis workspace.",
+            project_root_schema(),
         ),
     ];
     if capabilities.ida_py_eval {
@@ -563,6 +698,40 @@ fn mcp_tool(name: &str, description: &str, input_schema: Value) -> Value {
 
 fn empty_object_schema() -> Value {
     json!({ "type": "object", "properties": {} })
+}
+
+fn project_root_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project_root": { "type": "string" }
+        },
+        "required": ["project_root"]
+    })
+}
+
+fn etw_recording_target_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "type": { "const": "launch" },
+                    "executable": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["type", "executable", "args"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": { "const": "attach" },
+                    "pid": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["type", "pid"]
+            }
+        ]
+    })
 }
 
 fn debug_target_schema() -> Value {
@@ -812,6 +981,10 @@ fn operation_ref_schema() -> Value {
     ref_id_schema("operation", "op-123")
 }
 
+fn recording_ref_schema() -> Value {
+    ref_id_schema("recording", "recording-123")
+}
+
 fn mcp_session_schema() -> Value {
     json!({
         "type": "object",
@@ -857,4 +1030,58 @@ fn mcp_operation_schema() -> Value {
         },
         "required": ["operation_id"]
     })
+}
+
+fn mcp_recording_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "recording_id": recording_ref_schema()
+        },
+        "required": ["recording_id"]
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn registered_methods_are_unique_and_have_object_schemas() {
+        let capabilities = ServiceCapabilities {
+            ida_py_eval: true,
+            ..ServiceCapabilities::default()
+        };
+        let specs = method_specs(capabilities);
+        let mut names = HashSet::new();
+        for spec in &specs {
+            assert!(names.insert(spec.name.clone()), "duplicate {}", spec.name);
+            assert_eq!(spec.descriptor["inputSchema"]["type"], "object");
+            assert_eq!(method_spec(&spec.name).unwrap().route, spec.route);
+        }
+    }
+
+    #[test]
+    fn capability_gate_only_hides_py_eval_from_mcp_inventory() {
+        let names = method_specs(ServiceCapabilities::default())
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<HashSet<_>>();
+        assert!(!names.contains("reverse.py_eval"));
+        assert!(method_spec("reverse.py_eval").is_some());
+        assert!(!names.contains("workspace.facts"));
+        for name in [
+            "artifact.list",
+            "operation.list",
+            "audit.list_commands",
+            "recording.start",
+            "recording.status",
+            "recording.stop",
+            "recording.cancel",
+            "recording.kill",
+        ] {
+            assert!(names.contains(name), "missing {name}");
+        }
+    }
 }

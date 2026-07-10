@@ -9,6 +9,7 @@
 - Domain artifact layout helpers and artifact path validation.
 - Native C ABI boundaries for DbgEng, ETW, and IDA adapters with matching Rust `*-sys` crates and safe wrappers.
 - Installed Windows service lifecycle, development service mode, JSON-RPC `/rpc`, and HTTP MCP `/mcp`.
+- A shared service method registry that keeps JSON-RPC routes and MCP tool schemas aligned.
 - `--json` output for the main CLI workflows.
 
 ## Debug Workflow

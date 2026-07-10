@@ -118,7 +118,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "dbgatlas-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-model",
  "serde",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-adapter",
  "dbgatlas-model",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-dbgeng"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-dbgeng-sys",
  "serde",
@@ -166,11 +166,11 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-dbgeng-sys"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "dbgatlas-debug"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-model",
  "serde",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-etw"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-etw-sys",
  "serde",
@@ -190,11 +190,11 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-etw-sys"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "dbgatlas-ida"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-ida-sys",
  "serde",
@@ -206,11 +206,11 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-ida-sys"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "dbgatlas-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-recording"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-model",
  "serde",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-dbgeng",
  "dbgatlas-debug",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-worker-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-debug",
  "dbgatlas-model",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "dbgatlas-workspace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dbgatlas-model",
  "serde",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "zmij"

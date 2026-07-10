@@ -21,13 +21,13 @@ DbgAtlas service 只允许 loopback bind。不要把默认 endpoint 暴露到公
 
 ```powershell
 .\script\build-msi.ps1
-msiexec.exe /i .\target\installer\DbgAtlas-0.1.0-x64.msi
+msiexec.exe /i .\target\installer\DbgAtlas-0.2.0-x64.msi
 ```
 
 静默安装示例：
 
 ```powershell
-msiexec.exe /i .\target\installer\DbgAtlas-0.1.0-x64.msi /qn /norestart
+msiexec.exe /i .\target\installer\DbgAtlas-0.2.0-x64.msi /qn /norestart
 ```
 
 安装完成后检查服务：

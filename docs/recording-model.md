@@ -29,6 +29,8 @@ recording 是独立产品能力，不依赖 debug session。debug、reverse 和 
 - `recording.kill`：当 worker 卡死或无法协作停止时终止 recording worker，并把 operation 记录为 failed 或 canceled。
 - `recording.ttd`：用 `TTD.exe` 执行一次 launch / attach / monitor 录制，返回 `recording_id`、`operation_id`、状态和 artifact refs；该入口是一次性同步操作，不复用 ETW lifecycle 的 `recording.start/status/stop`。
 
+service `0.2` 在 JSON-RPC 和 MCP 上暴露相同的 `recording.start/status/stop/cancel/kill` lifecycle；MCP input schema 与 RPC 参数一致，并继续返回相同的 recording、operation 和 artifact 引用。
+
 CLI 方向与 service capability 对齐：
 
 ```powershell
