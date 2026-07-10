@@ -35,7 +35,7 @@ flowchart LR
 
 对外 API 不暴露 `workspace.*`、`project.*` 或 `worker.*` 业务资源。调用方在创建 session 时传入 `project_root`；service 内部把它解析为 `<project_root>/dbgatlas` 作为 analysis workspace，并懒创建该目录。`workspace` 仍是内部持久化模型，负责 manifest、artifact metadata、operation log 和受控 artifact path。
 
-service `0.2` 使用统一方法注册表定义 canonical method、domain route、MCP 描述、输入 schema 和 capability gate。JSON-RPC dispatch 与 MCP `tools/list` / `tools/call` 共享该注册表，避免入口能力漂移。项目事实通过 `artifact.list`、`operation.list` 和 `audit.list_commands` 暴露，三者都接收 `project_root`，不向调用方暴露内部 workspace 路径。
+service `0.3` 使用统一方法注册表定义 canonical method、domain route、MCP 描述、输入 schema 和 capability gate。JSON-RPC dispatch 与 MCP `tools/list` / `tools/call` 共享该注册表，避免入口能力漂移。项目事实通过 `artifact.list`、`operation.list` 和 `audit.list_commands` 暴露，三者都接收 `project_root`，不向调用方暴露内部 workspace 路径。
 
 `session` 是公开生命周期对象，`worker` 是内部运行时对象。当前默认一个 session 绑定一个 worker；创建 session 时创建 worker，关闭或 kill session 时结束对应 worker。worker 由 service 的 lifetime pipe heartbeat 和 worker 侧 watchdog 管理，service 正常退出时主动关闭 worker，异常断开时 worker 应自主退出。
 

@@ -390,6 +390,8 @@ struct FailingStartSupervisor;
 
 struct FailingEvalSupervisor;
 
+struct ArtifactThenTransportFailureSupervisor;
+
 struct BadEvalWriteSupervisor;
 
 struct FailingReverseOpenSupervisor;
@@ -667,6 +669,82 @@ impl WorkerSupervisor for FailingEvalSupervisor {
     }
 }
 
+impl WorkerSupervisor for ArtifactThenTransportFailureSupervisor {
+    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
+        Ok(WorkerHandle {
+            worker_id: Id::new(format!("test-worker-{}", request.session_id.id.as_str())).unwrap(),
+            session_id: request.session_id,
+            pipe_name: "test-pipe".to_string(),
+            identity: WorkerIdentity::CurrentUserDevMode,
+        })
+    }
+
+    fn request_worker(
+        &self,
+        _worker: &WorkerHandle,
+        request: WorkerRequest,
+    ) -> Result<WorkerResponse, ServiceError> {
+        match request {
+            WorkerRequest::ReverseCoreFunction {
+                operation_id,
+                artifact_dir,
+                ..
+            } => {
+                let final_path = artifact_dir
+                    .join("results")
+                    .join(format!("{}.json", operation_id.id.as_str()));
+                fs::create_dir_all(final_path.parent().unwrap())?;
+                fs::write(
+                    PathBuf::from(format!("{}.part", final_path.display())),
+                    b"{\"incomplete\":",
+                )?;
+                Err(ServiceError::Worker(
+                    "simulated reverse transport failure".to_string(),
+                ))
+            }
+            WorkerRequest::EvalDebugCommand {
+                operation_id,
+                artifact_dir,
+                command,
+                ..
+            } => {
+                let path = artifact_dir
+                    .join("raw")
+                    .join(format!("{}.txt", operation_id.id.as_str()));
+                let part_path = PathBuf::from(format!("{}.part", path.display()));
+                if command.contains("partial-only") {
+                    fs::create_dir_all(path.parent().unwrap())?;
+                    fs::write(part_path, b"incomplete output")?;
+                } else {
+                    write_atomic_bytes(&path, b"complete output before transport failure")?;
+                    fs::write(part_path, b"stale partial output")?;
+                }
+                Err(ServiceError::Worker(
+                    "simulated transport failure".to_string(),
+                ))
+            }
+            other => mock_worker_response(other),
+        }
+    }
+
+    fn cancel_worker_operation(
+        &self,
+        _worker: &WorkerHandle,
+        _session_id: &SessionRef,
+        _operation_id: &OperationRef,
+    ) -> Result<WorkerCancelOutcome, ServiceError> {
+        Ok(WorkerCancelOutcome::Notified)
+    }
+
+    fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
 impl WorkerSupervisor for BadEvalWriteSupervisor {
     fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
         Ok(test_worker_handle(request.session_id))
@@ -678,6 +756,29 @@ impl WorkerSupervisor for BadEvalWriteSupervisor {
         request: WorkerRequest,
     ) -> Result<WorkerResponse, ServiceError> {
         match request {
+            WorkerRequest::ReverseCoreFunction { function, .. } => {
+                let value = json!({"found": true});
+                let bytes = serde_json::to_vec(&value).unwrap();
+                Ok(WorkerResponse::ReverseCoreFunction {
+                    result: ReverseCoreFunctionResult {
+                        function,
+                        result: ResultPreview {
+                            value,
+                            truncated: false,
+                            full_byte_len: bytes.len() as u64,
+                            inline_byte_limit: DEFAULT_INLINE_RESULT_BYTE_LIMIT as u64,
+                        },
+                        warnings: Vec::new(),
+                    },
+                    writes: vec![WorkerArtifactWrite {
+                        relative_path: PathBuf::from("outside.json"),
+                        kind: "reverse.result".to_string(),
+                        role: Some(WorkerArtifactRole::FullResult),
+                        byte_len: bytes.len() as u64,
+                        description: Some("invalid reverse test write".to_string()),
+                    }],
+                })
+            }
             WorkerRequest::EvalDebugCommand {
                 session_id,
                 operation_id: _,
@@ -688,19 +789,15 @@ impl WorkerSupervisor for BadEvalWriteSupervisor {
                     session_id,
                     operation_id: None,
                     command,
-                    output: "bad write".to_string(),
-                    output_truncated: false,
-                    full_output_byte_len: Some(9),
-                    inline_output_byte_limit: Some(DEFAULT_INLINE_TEXT_BYTE_LIMIT as u64),
+                    result: ResultPreview::utf8("bad write", DEFAULT_INLINE_RESULT_BYTE_LIMIT),
                     final_state: Some(DebugSessionState::Ready),
-                    raw_output: None,
-                    full_output_artifact_ref: None,
                     warnings: Vec::new(),
                     error: None,
                 },
                 writes: vec![WorkerArtifactWrite {
                     relative_path: PathBuf::from("outside.txt"),
                     kind: "debug.raw_output".to_string(),
+                    role: Some(WorkerArtifactRole::FullResult),
                     byte_len: 9,
                     description: Some("invalid test write".to_string()),
                 }],

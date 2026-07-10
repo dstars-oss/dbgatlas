@@ -38,6 +38,17 @@ impl Default for DA_DbgEngTextView {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_DbgEngArtifactResult {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub preview: DA_DbgEngTextView,
+    pub full_byte_len: u64,
+    pub inline_byte_limit: u64,
+    pub truncated: i32,
+}
+
+#[repr(C)]
 pub struct DA_DbgEngSessionHandle {
     _private: [u8; 0],
 }
@@ -70,11 +81,26 @@ unsafe extern "C" {
         command_utf8: *const c_char,
         out: *mut DA_DbgEngTextView,
     ) -> i32;
+    pub fn da_dbgeng_session_execute_to_file(
+        handle: *mut DA_DbgEngSessionHandle,
+        command_utf8: *const c_char,
+        output_path_utf8: *const c_char,
+        inline_byte_limit: u64,
+        out: *mut DA_DbgEngArtifactResult,
+    ) -> i32;
     pub fn da_dbgeng_session_add_symbols(
         handle: *mut DA_DbgEngSessionHandle,
         symbol_path_utf8: *const c_char,
         reload: i32,
         out: *mut DA_DbgEngTextView,
+    ) -> i32;
+    pub fn da_dbgeng_session_add_symbols_to_file(
+        handle: *mut DA_DbgEngSessionHandle,
+        symbol_path_utf8: *const c_char,
+        reload: i32,
+        output_path_utf8: *const c_char,
+        inline_byte_limit: u64,
+        out: *mut DA_DbgEngArtifactResult,
     ) -> i32;
     pub fn da_dbgeng_session_read_virtual(
         handle: *mut DA_DbgEngSessionHandle,

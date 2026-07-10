@@ -33,7 +33,7 @@ analysis-workspace/
 - `artifacts/recordings/<recording_id>/`：统一 recording namespace，承载 ETW recording 和 TTD recording 的低层输出。
 - `artifacts/profiles/<profile_id>/`：早期 profiling / sampling 预留布局；后续需要时再决定迁移、兼容或保留策略。
 - `artifacts/ttd_recordings/<recording_id>/`：早期 TTD recording 预留布局；后续 TTD 应优先并入统一 `recordings` namespace。
-- `artifacts/reverse_sessions/<session_id>/`：IDA 或其他 reverse workflow 的低层工具输出。
+- `artifacts/reverse_sessions/<session_id>/`：IDA 或其他 reverse workflow 的低层工具输出；`results/` 保存完整纯 JSON，`core/` 保存引用结果的审计事件。
 
 workspace API 只接受位于 `artifacts/` 下的相对路径，拒绝绝对路径和 `..` 穿越。dump、trace、transcript、memory output 都按敏感 artifact 处理。
 
@@ -90,7 +90,7 @@ AI agent 应优先通过稳定入口读取项目事实，而不是猜测目录�
 dbgatlas --json workspace facts <project_root>\dbgatlas
 ```
 
-service `0.2` 的 RPC 和 MCP 使用三个产品级入口，参数统一为 project root：
+service `0.3` 的 RPC 和 MCP 使用三个产品级入口，参数统一为 project root：
 
 ```json
 {
@@ -124,6 +124,11 @@ debug workflow 的 CLI 和 MCP 调用都返回同一组引用字段：
 - `artifact_refs`：本次操作产生或更新的 artifact id 列表。
 - `raw_output_ref`：若存在，指向原始工具输出 artifact。
 - `memory_ref`：`debug.read_memory` 成功时指向 memory artifact。
+
+debug 文本命令与 reverse Core Functions 统一使用 `result` 返回最多 64 KiB
+的 inline preview，并用 `result_delivery` 返回 `truncated`、完整字节数、
+inline 上限和完整 artifact 引用。完整结果在 worker 回复前原子落盘；小结果
+同样保留完整 artifact。
 
 recording workflow 返回同一类引用字段，并增加 `recording_id`。报告或 agent 不应猜测 `events/` 内部文件名来确认一次 recording 是否完成，而应优先通过 operation/artifact refs 找到 `recording.json`、`trace.etl` 和 category event artifacts。
 

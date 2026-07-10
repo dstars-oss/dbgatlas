@@ -115,6 +115,12 @@ Successful calls return:
   "artifact_refs": [{ "id": "artifact-..." }],
   "function": "list_funcs",
   "result": {},
+  "result_delivery": {
+    "truncated": false,
+    "full_byte_len": 128,
+    "inline_byte_limit": 65536,
+    "full_artifact_ref": { "id": "artifact-..." }
+  },
   "warnings": [],
   "operation": {
     "status": "success",
@@ -132,20 +138,23 @@ If Hex-Rays is unavailable, a license is unavailable, or decompilation fails, th
 operation fails and records a `reverse.adapter_error` artifact. Assembly text is only
 available through an explicit `reverse.disasm` call.
 
-Large `reverse.decompile` results keep the complete result in the registered
-`reverse.core` artifact. The inline tool result remains unchanged for small
-functions; if the serialized result is too large for stable MCP transport, the
-inline `pseudocode` is truncated to a preview and the result includes
-`pseudocode_truncated`, `full_result_artifact_ref`, and `full_result_byte_len`.
+Every Core Function writes its complete compact JSON result before the worker
+responds. The inline `result` is limited to 64 KiB and `result_delivery` reports
+whether it was truncated, the complete byte length, and the complete-result
+artifact ref. `reverse.decompile` preserves function metadata and truncates only
+the pseudocode preview. `reverse.disasm` enumerates all function chunks into the
+artifact and returns a whole-instruction prefix inline.
 
 ## Artifact and operation records
 
-Each Core Function call writes one JSONL record under:
+Each Core Function call writes the complete result and a small audit record under:
 
 ```text
 artifacts/reverse_sessions/<session_id>/core/<operation_id>.jsonl
+artifacts/reverse_sessions/<session_id>/results/<operation_id>.json
 ```
 
-The workspace registers this output as a `reverse.core` artifact and appends an operation
-record with capability `reverse.<function>`, such as `reverse.list_funcs` or
-`reverse.decompile`. Adapter failures are recorded as `reverse.adapter_error` artifacts.
+The pure result is registered as `reverse.result`; the JSONL audit event is registered
+as `reverse.core` and references the result instead of embedding it. The operation
+record contains both artifacts. Adapter failures are recorded as
+`reverse.adapter_error` artifacts.

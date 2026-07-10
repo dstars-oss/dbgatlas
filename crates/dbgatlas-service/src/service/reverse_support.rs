@@ -40,31 +40,45 @@ pub(super) fn record_successful_reverse_core_operation(
     capability: &str,
     arguments: Value,
     core: ReverseCoreFunctionResult,
+    writes: RegisteredWorkerWrites,
 ) -> Result<Value, ServiceError> {
     let now = Timestamp::now();
+    let full_artifact_ref = writes.full_result.clone().ok_or_else(|| {
+        ServiceError::Worker(
+            "reverse core function did not produce a full result artifact".to_string(),
+        )
+    })?;
+    let delivery = ResultDelivery {
+        truncated: core.result.truncated,
+        full_byte_len: core.result.full_byte_len,
+        inline_byte_limit: core.result.inline_byte_limit,
+        full_artifact_ref: full_artifact_ref.clone(),
+    };
     let event = json!({
         "operation_id": operation_id,
         "session_id": session_id,
         "created_at": now,
         "function": core.function,
         "arguments": arguments,
-        "result": core.result,
+        "result_artifact_ref": full_artifact_ref,
+        "result_delivery": delivery,
         "warnings": core.warnings,
     });
     let core_file = format!("core/{}.jsonl", operation_id.id.as_str());
     let byte_len = write_jsonl_file(&session.artifact_dir.join(&core_file), &event)?;
-    let artifact_id = next_artifact_ref();
-    let response_result = reverse_core_response_result(&core, &artifact_id, byte_len)?;
-    let normalized_addresses = collect_normalized_addresses(&response_result);
+    let audit_artifact_id = next_artifact_ref();
+    let normalized_addresses = collect_normalized_addresses(&core.result.value);
     workspace.register_artifact(&ArtifactMetadata {
-        artifact_id: artifact_id.clone(),
+        artifact_id: audit_artifact_id.clone(),
         kind: "reverse.core".to_string(),
         relative_path: reverse_relative_path(session_id, &core_file),
         created_at: now,
         operation_id: Some(operation_id.clone()),
         byte_len: Some(byte_len),
-        description: Some(format!("IDA Core Function {} result", core.function)),
+        description: Some(format!("IDA Core Function {} audit event", core.function)),
     })?;
+    let mut artifacts = writes.artifacts.clone();
+    artifacts.push(audit_artifact_id.clone());
     workspace.append_operation(&OperationRecord {
         operation_id: operation_id.clone(),
         adapter_id: "ida".to_string(),
@@ -72,7 +86,7 @@ pub(super) fn record_successful_reverse_core_operation(
         status: OperationStatus::Success,
         created_at: now,
         summary: format!("IDA Core Function {} completed", core.function),
-        artifacts: vec![artifact_id.clone()],
+        artifacts: artifacts.clone(),
         raw_output: None,
     })?;
 
@@ -82,7 +96,7 @@ pub(super) fn record_successful_reverse_core_operation(
         Some(session_id.clone()),
         "reverse core function completed",
     );
-    operation.artifacts = vec![artifact_id.clone()];
+    operation.artifacts = artifacts.clone();
     let mut state = host.lock_state()?;
     state
         .operations
@@ -90,20 +104,21 @@ pub(super) fn record_successful_reverse_core_operation(
     if let Some(session) = state.sessions.get_mut(session_id.id.as_str()) {
         session.updated_at = now;
         session.last_operation = Some(operation_id.clone());
-        session.artifacts.push(artifact_id.clone());
+        session.artifacts.extend(artifacts.clone());
     }
 
     let mut response = json!({
         "session_id": session_id,
         "operation_id": operation_id,
         "operation_status": "success",
-        "artifact_refs": [artifact_id],
+        "artifact_refs": artifacts,
         "function": core.function,
-        "result": response_result,
+        "result": core.result.value,
+        "result_delivery": delivery,
         "warnings": core.warnings,
         "operation": {
             "status": "success",
-            "artifact_refs": [artifact_id],
+            "artifact_refs": artifacts,
             "raw_output_ref": null
         }
     });
@@ -112,43 +127,6 @@ pub(super) fn record_successful_reverse_core_operation(
         response["address_warnings"] = Value::Array(Vec::new());
     }
     Ok(response)
-}
-
-pub(super) fn reverse_core_response_result(
-    core: &ReverseCoreFunctionResult,
-    artifact_id: &ArtifactRef,
-    artifact_byte_len: u64,
-) -> Result<Value, ServiceError> {
-    if core.function != "decompile"
-        || serde_json::to_vec(&core.result)?.len() <= MAX_INLINE_REVERSE_RESULT_BYTES
-    {
-        return Ok(core.result.clone());
-    }
-
-    let mut result = core.result.clone();
-    if let Value::Object(object) = &mut result {
-        if let Some(Value::String(pseudocode)) = object.get_mut("pseudocode") {
-            if pseudocode.len() > MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES {
-                *pseudocode =
-                    truncate_utf8_bytes(pseudocode, MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES)
-                        .to_string();
-            }
-        }
-        object.insert("pseudocode_truncated".to_string(), json!(true));
-        object.insert(
-            "full_result_artifact_ref".to_string(),
-            serde_json::to_value(artifact_id)?,
-        );
-        object.insert("full_result_byte_len".to_string(), json!(artifact_byte_len));
-        return Ok(result);
-    }
-
-    Ok(json!({
-        "pseudocode_truncated": true,
-        "preview": result,
-        "full_result_artifact_ref": artifact_id,
-        "full_result_byte_len": artifact_byte_len,
-    }))
 }
 
 pub(super) fn collect_normalized_addresses(value: &Value) -> Vec<Value> {
@@ -174,17 +152,6 @@ pub(super) fn collect_normalized_addresses(value: &Value) -> Vec<Value> {
     let mut addresses = Vec::new();
     visit(value, &mut addresses);
     addresses
-}
-
-pub(super) fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 pub(super) fn recording_response(

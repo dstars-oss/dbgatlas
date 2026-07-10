@@ -6,6 +6,8 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub const DEFAULT_INLINE_RESULT_BYTE_LIMIT: usize = 64 * 1024;
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("invalid DbgAtlas id: {reason}")]
 pub struct InvalidId {
@@ -170,6 +172,47 @@ define_ref!(ArtifactRef);
 define_ref!(OperationRef);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultPreview<T> {
+    pub value: T,
+    pub truncated: bool,
+    pub full_byte_len: u64,
+    pub inline_byte_limit: u64,
+}
+
+impl ResultPreview<String> {
+    pub fn utf8(text: &str, byte_limit: usize) -> Self {
+        let full_byte_len = text.len() as u64;
+        if text.len() <= byte_limit {
+            return Self {
+                value: text.to_string(),
+                truncated: false,
+                full_byte_len,
+                inline_byte_limit: byte_limit as u64,
+            };
+        }
+
+        let mut end = byte_limit;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self {
+            value: text[..end].to_string(),
+            truncated: true,
+            full_byte_len,
+            inline_byte_limit: byte_limit as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultDelivery {
+    pub truncated: bool,
+    pub full_byte_len: u64,
+    pub inline_byte_limit: u64,
+    pub full_artifact_ref: ArtifactRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorContext {
     pub code: String,
     pub message: String,
@@ -221,5 +264,22 @@ mod tests {
             serde_json::to_value(session).unwrap(),
             serde_json::json!({"id":"session-001"})
         );
+    }
+
+    #[test]
+    fn utf8_result_preview_respects_byte_boundary() {
+        let preview = ResultPreview::utf8("你你你", 5);
+        assert_eq!(preview.value, "你");
+        assert!(preview.truncated);
+        assert_eq!(preview.full_byte_len, 9);
+        assert_eq!(preview.inline_byte_limit, 5);
+    }
+
+    #[test]
+    fn small_result_preview_is_not_truncated() {
+        let preview = ResultPreview::utf8("hello", DEFAULT_INLINE_RESULT_BYTE_LIMIT);
+        assert_eq!(preview.value, "hello");
+        assert!(!preview.truncated);
+        assert_eq!(preview.full_byte_len, 5);
     }
 }

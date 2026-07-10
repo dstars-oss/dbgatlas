@@ -50,12 +50,14 @@ pub(super) fn write_recording_start_artifacts(
         WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, &metadata_snapshot),
             kind: "recording.metadata".to_string(),
+            role: None,
             byte_len: metadata_len,
             description: Some("recording start metadata snapshot".to_string()),
         },
         WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, "events/process.jsonl"),
             kind: "recording.events.process".to_string(),
+            role: None,
             byte_len: process_len,
             description: Some("recording process events".to_string()),
         },
@@ -95,6 +97,7 @@ pub(super) fn write_recording_stop_artifacts(
         writes.push(WorkerArtifactWrite {
             relative_path: recording_relative_path(&recording.recording_id, &suffix),
             kind: format!("recording.events.{}", preset.category()),
+            role: None,
             byte_len,
             description: Some(format!("recording {} events", preset.category())),
         });
@@ -139,6 +142,7 @@ pub(super) fn write_recording_terminal_trace_artifacts(
     writes.push(WorkerArtifactWrite {
         relative_path: recording_relative_path(&recording.recording_id, "trace.etl"),
         kind: "recording.trace".to_string(),
+        role: None,
         byte_len: trace_outcome.byte_len,
         description: Some(trace_outcome.description),
     });
@@ -223,6 +227,7 @@ pub(super) fn register_recording_event_writes(
         writes.push(WorkerArtifactWrite {
             relative_path: recording_relative_path(&recording.recording_id, &suffix),
             kind: format!("recording.events.{}", preset.category()),
+            role: None,
             byte_len: size_after,
             description: Some(format!("recording {} events", preset.category())),
         });
@@ -328,6 +333,7 @@ pub(super) fn write_recording_terminal_metadata(
     Ok(vec![WorkerArtifactWrite {
         relative_path: recording_relative_path(&recording.recording_id, "recording.json"),
         kind: "recording.metadata".to_string(),
+        role: None,
         byte_len: metadata_len,
         description: Some("recording metadata".to_string()),
     }])
@@ -1012,24 +1018,28 @@ pub(super) fn ttd_recording_writes(
         WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, "recording.json"),
             kind: "recording.metadata".to_string(),
+            role: None,
             byte_len: metadata_len,
             description: Some("TTD recording metadata".to_string()),
         },
         WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, "events.jsonl"),
             kind: "recording.events.ttd".to_string(),
+            role: None,
             byte_len: file_len_or_zero(&artifact_dir.join("events.jsonl"))?,
             description: Some("TTD recording events".to_string()),
         },
         WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, "recorder.stdout.txt"),
             kind: "recording.recorder_output".to_string(),
+            role: None,
             byte_len: file_len_or_zero(&artifact_dir.join("recorder.stdout.txt"))?,
             description: Some("TTD recorder stdout".to_string()),
         },
         WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, "recorder.stderr.txt"),
             kind: "recording.recorder_output".to_string(),
+            role: None,
             byte_len: file_len_or_zero(&artifact_dir.join("recorder.stderr.txt"))?,
             description: Some("TTD recorder stderr".to_string()),
         },
@@ -1038,6 +1048,7 @@ pub(super) fn ttd_recording_writes(
         writes.push(WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, "recorder-stop.stdout.txt"),
             kind: "recording.recorder_output".to_string(),
+            role: None,
             byte_len: file_len_or_zero(&artifact_dir.join("recorder-stop.stdout.txt"))?,
             description: Some("TTD recorder stop stdout".to_string()),
         });
@@ -1046,6 +1057,7 @@ pub(super) fn ttd_recording_writes(
         writes.push(WorkerArtifactWrite {
             relative_path: recording_relative_path(recording_id, "recorder-stop.stderr.txt"),
             kind: "recording.recorder_output".to_string(),
+            role: None,
             byte_len: file_len_or_zero(&artifact_dir.join("recorder-stop.stderr.txt"))?,
             description: Some("TTD recorder stop stderr".to_string()),
         });
@@ -1119,6 +1131,7 @@ pub(super) fn discovered_ttd_write(
             &relative_to_recording.to_string_lossy(),
         ),
         kind: kind.to_string(),
+        role: None,
         byte_len: fs::metadata(path)?.len(),
         description: Some(description.to_string()),
     })

@@ -37,6 +37,16 @@ pub enum DbgEngError {
     EmptyMemoryRead,
     #[error("input contains interior nul byte")]
     InteriorNul(#[from] std::ffi::NulError),
+    #[error("artifact I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactCommandOutput {
+    pub preview: String,
+    pub full_byte_len: u64,
+    pub inline_byte_limit: u64,
+    pub truncated: bool,
 }
 
 #[cfg(windows)]
@@ -288,8 +298,83 @@ impl DbgEngSession {
         text_view_to_string(view)
     }
 
+    #[cfg(windows)]
+    pub fn execute_to_artifact(
+        &self,
+        command: &str,
+        output_path: &Path,
+        inline_byte_limit: usize,
+    ) -> Result<ArtifactCommandOutput, DbgEngError> {
+        let command = command_to_cstring(command)?;
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut part_name = output_path.as_os_str().to_os_string();
+        part_name.push(".part");
+        let part_path = std::path::PathBuf::from(part_name);
+        let _ = std::fs::remove_file(&part_path);
+        let part_path_c = path_to_cstring(&part_path)?;
+        let mut result = dbgatlas_dbgeng_sys::DA_DbgEngArtifactResult {
+            struct_size: std::mem::size_of::<dbgatlas_dbgeng_sys::DA_DbgEngArtifactResult>() as u32,
+            ..Default::default()
+        };
+        let status = unsafe {
+            dbgatlas_dbgeng_sys::da_dbgeng_session_execute_to_file(
+                self.handle,
+                command.as_ptr(),
+                part_path_c.as_ptr(),
+                inline_byte_limit as u64,
+                &mut result,
+            )
+        };
+        if let Err(error) = status_to_result(status) {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(error);
+        }
+        let preview = match text_view_to_string(result.preview) {
+            Ok(preview) => preview,
+            Err(error) => {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(error);
+            }
+        };
+        let actual_len = std::fs::metadata(&part_path)?.len();
+        if actual_len != result.full_byte_len {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "native artifact length mismatch: reported {}, actual {actual_len}",
+                    result.full_byte_len
+                ),
+            )
+            .into());
+        }
+        if let Err(error) = std::fs::rename(&part_path, output_path) {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(error.into());
+        }
+        Ok(ArtifactCommandOutput {
+            preview,
+            full_byte_len: result.full_byte_len,
+            inline_byte_limit: result.inline_byte_limit,
+            truncated: result.truncated != 0,
+        })
+    }
+
     #[cfg(not(windows))]
     pub fn execute(&self, command: &str) -> Result<String, DbgEngError> {
+        command_to_cstring(command)?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(windows))]
+    pub fn execute_to_artifact(
+        &self,
+        command: &str,
+        _output_path: &Path,
+        _inline_byte_limit: usize,
+    ) -> Result<ArtifactCommandOutput, DbgEngError> {
         command_to_cstring(command)?;
         Err(DbgEngError::UnsupportedPlatform)
     }
@@ -310,8 +395,86 @@ impl DbgEngSession {
         text_view_to_string(view)
     }
 
+    #[cfg(windows)]
+    pub fn add_symbols_to_artifact(
+        &self,
+        symbol_path: &str,
+        reload: bool,
+        output_path: &Path,
+        inline_byte_limit: usize,
+    ) -> Result<ArtifactCommandOutput, DbgEngError> {
+        let symbol_path = symbol_path_to_cstring(symbol_path)?;
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut part_name = output_path.as_os_str().to_os_string();
+        part_name.push(".part");
+        let part_path = std::path::PathBuf::from(part_name);
+        let _ = std::fs::remove_file(&part_path);
+        let part_path_c = path_to_cstring(&part_path)?;
+        let mut result = dbgatlas_dbgeng_sys::DA_DbgEngArtifactResult {
+            struct_size: std::mem::size_of::<dbgatlas_dbgeng_sys::DA_DbgEngArtifactResult>() as u32,
+            ..Default::default()
+        };
+        let status = unsafe {
+            dbgatlas_dbgeng_sys::da_dbgeng_session_add_symbols_to_file(
+                self.handle,
+                symbol_path.as_ptr(),
+                i32::from(reload),
+                part_path_c.as_ptr(),
+                inline_byte_limit as u64,
+                &mut result,
+            )
+        };
+        if let Err(error) = status_to_result(status) {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(error);
+        }
+        let preview = match text_view_to_string(result.preview) {
+            Ok(preview) => preview,
+            Err(error) => {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(error);
+            }
+        };
+        let actual_len = std::fs::metadata(&part_path)?.len();
+        if actual_len != result.full_byte_len {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "native artifact length mismatch: reported {}, actual {actual_len}",
+                    result.full_byte_len
+                ),
+            )
+            .into());
+        }
+        if let Err(error) = std::fs::rename(&part_path, output_path) {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(error.into());
+        }
+        Ok(ArtifactCommandOutput {
+            preview,
+            full_byte_len: result.full_byte_len,
+            inline_byte_limit: result.inline_byte_limit,
+            truncated: result.truncated != 0,
+        })
+    }
+
     #[cfg(not(windows))]
     pub fn add_symbols(&self, symbol_path: &str, _reload: bool) -> Result<String, DbgEngError> {
+        symbol_path_to_cstring(symbol_path)?;
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(windows))]
+    pub fn add_symbols_to_artifact(
+        &self,
+        symbol_path: &str,
+        _reload: bool,
+        _output_path: &Path,
+        _inline_byte_limit: usize,
+    ) -> Result<ArtifactCommandOutput, DbgEngError> {
         symbol_path_to_cstring(symbol_path)?;
         Err(DbgEngError::UnsupportedPlatform)
     }
@@ -690,9 +853,28 @@ mod tests {
         let session = DbgEngSession::open_file(&dump_path, None).unwrap();
         let output = session.execute(".echo dbgatlas-probe").unwrap();
         assert!(output.contains("dbgatlas-probe"));
+        let artifact_path = temp.path().join("command.txt");
+        let captured = session
+            .execute_to_artifact(".echo dbgatlas-artifact-probe", &artifact_path, 8)
+            .unwrap();
+        assert!(captured.truncated);
+        assert!(captured.preview.len() <= 8);
+        let full = std::fs::read_to_string(artifact_path).unwrap();
+        assert!(full.contains("dbgatlas-artifact-probe"));
+        assert_eq!(captured.full_byte_len, full.len() as u64);
 
         let symbol_output = session.add_symbols(r"cache*C:\symbols", false).unwrap();
         assert!(symbol_output.contains("symbol path appended"));
+        let symbol_artifact_path = temp.path().join("symbols.txt");
+        let symbol_artifact = session
+            .add_symbols_to_artifact(r"cache*C:\symbols", false, &symbol_artifact_path, 8)
+            .unwrap();
+        assert!(symbol_artifact.truncated);
+        assert_eq!(symbol_artifact.preview, "symbol p");
+        assert_eq!(
+            std::fs::read_to_string(symbol_artifact_path).unwrap(),
+            "symbol path appended\n"
+        );
 
         let bytes = session
             .read_memory(marker_address, size_of::<u64>() as u32)

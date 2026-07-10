@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include "dbgatlas_dbgeng.h"
 
 #ifdef _WIN32
@@ -133,6 +134,78 @@ private:
     volatile LONG refs_ = 1;
     std::string output_;
 };
+
+class FileOutputCallbacks final : public IDebugOutputCallbacks {
+public:
+    FileOutputCallbacks(HANDLE file, size_t preview_limit)
+        : file_(file), preview_limit_(preview_limit) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (object == nullptr) return E_POINTER;
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IDebugOutputCallbacks)) {
+            *object = static_cast<IDebugOutputCallbacks*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        return static_cast<ULONG>(InterlockedDecrement(&refs_));
+    }
+
+    HRESULT STDMETHODCALLTYPE Output(ULONG, PCSTR text) override {
+        if (text == nullptr || error_ != ERROR_SUCCESS) return error_ == ERROR_SUCCESS ? S_OK : E_FAIL;
+        const size_t len = std::strlen(text);
+        size_t written_total = 0;
+        while (written_total < len) {
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(len - written_total, MAXDWORD));
+            DWORD written = 0;
+            if (!WriteFile(file_, text + written_total, chunk, &written, nullptr) || written != chunk) {
+                error_ = GetLastError();
+                if (error_ == ERROR_SUCCESS) error_ = ERROR_WRITE_FAULT;
+                return E_FAIL;
+            }
+            written_total += written;
+        }
+        full_byte_len_ += static_cast<uint64_t>(len);
+        if (preview_.size() < preview_limit_) {
+            preview_.append(text, std::min(len, preview_limit_ - preview_.size()));
+        }
+        return S_OK;
+    }
+
+    const std::string& preview() const noexcept { return preview_; }
+    uint64_t full_byte_len() const noexcept { return full_byte_len_; }
+    DWORD error() const noexcept { return error_; }
+
+private:
+    volatile LONG refs_ = 1;
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    size_t preview_limit_ = 0;
+    std::string preview_;
+    uint64_t full_byte_len_ = 0;
+    DWORD error_ = ERROR_SUCCESS;
+};
+
+std::string utf8_safe_preview(const std::string& preview) {
+    size_t size = preview.size();
+    while (size > 0) {
+        if (MultiByteToWideChar(
+                CP_UTF8,
+                MB_ERR_INVALID_CHARS,
+                preview.data(),
+                static_cast<int>(size),
+                nullptr,
+                0) > 0) {
+            return preview.substr(0, size);
+        }
+        --size;
+    }
+    return {};
+}
 
 class BreakingEventCallbacks final : public DebugBaseEventCallbacks {
 public:
@@ -402,6 +475,15 @@ void clear_text_view(DA_DbgEngTextView* out) noexcept {
     out->owner = nullptr;
 }
 
+void clear_artifact_result(DA_DbgEngArtifactResult* out) noexcept {
+    out->struct_size = sizeof(DA_DbgEngArtifactResult);
+    out->flags = 0;
+    clear_text_view(&out->preview);
+    out->full_byte_len = 0;
+    out->inline_byte_limit = 0;
+    out->truncated = 0;
+}
+
 int32_t set_output(DA_DbgEngTextView* out, const char* data, size_t len) {
     auto owner = std::make_unique<BufferOwner>();
     owner->bytes.assign(data, data + len);
@@ -573,6 +655,65 @@ int32_t execute_command(DbgEngSession& session, const char* command_utf8, DA_Dbg
     return set_output(out, callbacks.output());
 }
 
+int32_t execute_command_to_file(
+    DbgEngSession& session,
+    const char* command_utf8,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_DbgEngArtifactResult* out,
+    const char* initial_output = nullptr) {
+    const std::wstring output_path = utf8_to_wide(output_path_utf8);
+    HANDLE file = CreateFileW(
+        output_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return fail(DA_DBGENG_ERR_INTERNAL, "CreateFile(output artifact) failed: " + windows_error_message(GetLastError()));
+    }
+    const size_t preview_limit = inline_byte_limit > static_cast<uint64_t>(SIZE_MAX)
+        ? SIZE_MAX
+        : static_cast<size_t>(inline_byte_limit);
+    FileOutputCallbacks callbacks(file, preview_limit);
+    IDebugOutputCallbacks* previous = nullptr;
+    HRESULT get_hr = S_OK;
+    HRESULT set_hr = S_OK;
+    HRESULT execute_hr = S_OK;
+    HRESULT restore_hr = S_OK;
+    bool callback_installed = false;
+    if (initial_output != nullptr && initial_output[0] != '\0') {
+        callbacks.Output(DEBUG_OUTPUT_NORMAL, initial_output);
+    }
+    if (callbacks.error() == ERROR_SUCCESS && command_utf8 != nullptr) {
+        get_hr = session.client->GetOutputCallbacks(&previous);
+        if (SUCCEEDED(get_hr)) {
+            set_hr = session.client->SetOutputCallbacks(&callbacks);
+            callback_installed = SUCCEEDED(set_hr);
+        }
+        if (callback_installed) {
+            execute_hr = session.control->Execute(
+                DEBUG_OUTCTL_THIS_CLIENT, command_utf8, DEBUG_EXECUTE_DEFAULT);
+            restore_hr = session.client->SetOutputCallbacks(previous);
+        }
+    }
+    if (previous != nullptr) previous->Release();
+    const BOOL flush_ok = FlushFileBuffers(file);
+    const BOOL close_ok = CloseHandle(file);
+    if (callbacks.error() != ERROR_SUCCESS) {
+        return fail(DA_DBGENG_ERR_INTERNAL, "WriteFile(output artifact) failed: " + windows_error_message(callbacks.error()));
+    }
+    if (FAILED(get_hr)) return fail_hr("IDebugClient::GetOutputCallbacks", get_hr);
+    if (FAILED(set_hr)) return fail_hr("IDebugClient::SetOutputCallbacks", set_hr);
+    if (FAILED(execute_hr)) return fail_hr("IDebugControl::Execute", execute_hr);
+    if (FAILED(restore_hr)) return fail_hr("IDebugClient::SetOutputCallbacks(restore)", restore_hr);
+    if (!flush_ok || !close_ok) {
+        return fail(DA_DBGENG_ERR_INTERNAL, "failed to flush or close output artifact");
+    }
+    const std::string preview = utf8_safe_preview(callbacks.preview());
+    out->full_byte_len = callbacks.full_byte_len();
+    out->inline_byte_limit = inline_byte_limit;
+    out->truncated = callbacks.full_byte_len() > preview.size() ? 1 : 0;
+    return set_output(&out->preview, preview);
+}
+
 #endif
 
 } // namespace
@@ -586,7 +727,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out) {
         out->struct_size = sizeof(DA_DbgEngVersion);
         out->flags = 0;
         out->abi_major = 0;
-        out->abi_minor = 3;
+        out->abi_minor = 5;
         out->abi_patch = 0;
         g_last_error.clear();
         return DA_DBGENG_OK;
@@ -781,6 +922,31 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_execute(
     });
 }
 
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_execute_to_file(
+    DA_DbgEngSessionHandle* handle,
+    const char* command_utf8,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_DbgEngArtifactResult* out) {
+    return guard([&]() -> int32_t {
+        if (out == nullptr || out->struct_size < sizeof(DA_DbgEngArtifactResult)) {
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "artifact result buffer is invalid");
+        }
+        clear_artifact_result(out);
+        if (handle == nullptr) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "session handle is null");
+        if (command_utf8 == nullptr || command_utf8[0] == '\0') return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "debug command is empty");
+        if (output_path_utf8 == nullptr || output_path_utf8[0] == '\0') return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "output path is empty");
+#ifndef _WIN32
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#else
+        int32_t status = execute_command_to_file(
+            *session_from_handle(handle), command_utf8, output_path_utf8, inline_byte_limit, out);
+        if (status == DA_DBGENG_OK) g_last_error.clear();
+        return status;
+#endif
+    });
+}
+
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_add_symbols(
     DA_DbgEngSessionHandle* handle,
     const char* symbol_path_utf8,
@@ -828,6 +994,48 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_add_symbols(
 
         g_last_error.clear();
         return set_output(out, output);
+#endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_add_symbols_to_file(
+    DA_DbgEngSessionHandle* handle,
+    const char* symbol_path_utf8,
+    int32_t reload,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_DbgEngArtifactResult* out) {
+    return guard([&]() -> int32_t {
+        if (out == nullptr || out->struct_size < sizeof(DA_DbgEngArtifactResult)) {
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "artifact result buffer is invalid");
+        }
+        clear_text_view(&out->preview);
+        out->full_byte_len = 0;
+        out->inline_byte_limit = inline_byte_limit;
+        out->truncated = 0;
+        if (handle == nullptr) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "session handle is null");
+        if (symbol_path_utf8 == nullptr || symbol_path_utf8[0] == '\0') {
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "symbol path is empty");
+        }
+        if (output_path_utf8 == nullptr || output_path_utf8[0] == '\0') {
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "output path is empty");
+        }
+#ifndef _WIN32
+        (void)reload;
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#else
+        auto& session = *session_from_handle(handle);
+        const HRESULT hr = session.symbols->AppendSymbolPath(symbol_path_utf8);
+        if (FAILED(hr)) return fail_hr("IDebugSymbols::AppendSymbolPath", hr);
+        const int32_t status = execute_command_to_file(
+            session,
+            reload != 0 ? ".reload" : nullptr,
+            output_path_utf8,
+            inline_byte_limit,
+            out,
+            "symbol path appended\n");
+        if (status == DA_DBGENG_OK) g_last_error.clear();
+        return status;
 #endif
     });
 }

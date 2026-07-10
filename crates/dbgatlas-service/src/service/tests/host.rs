@@ -177,7 +177,7 @@ fn session_id_is_enough_after_create() {
 
     assert!(eval.error.is_none(), "{:?}", eval.error);
     assert!(
-        eval.result.unwrap()["output"]
+        eval.result.unwrap()["result"]
             .as_str()
             .unwrap()
             .contains(".echo hello")
@@ -194,16 +194,21 @@ fn debug_eval_truncates_inline_output_and_keeps_raw_artifact() {
 
     assert!(eval.error.is_none(), "{:?}", eval.error);
     let result = eval.result.unwrap();
-    assert_eq!(result["output_truncated"], true);
+    assert_eq!(result["result_delivery"]["truncated"], true);
     assert_eq!(
-        result["output"].as_str().unwrap().len(),
-        DEFAULT_INLINE_TEXT_BYTE_LIMIT
+        result["result"].as_str().unwrap().len(),
+        DEFAULT_INLINE_RESULT_BYTE_LIMIT
     );
     assert_eq!(
-        result["full_output_byte_len"],
-        json!(DEFAULT_INLINE_TEXT_BYTE_LIMIT + 100)
+        result["result_delivery"]["full_byte_len"],
+        json!(DEFAULT_INLINE_RESULT_BYTE_LIMIT + 100)
     );
-    assert_eq!(result["full_output_artifact_ref"], result["raw_output_ref"]);
+    assert_eq!(
+        result["result_delivery"]["full_artifact_ref"],
+        result["raw_output_ref"]
+    );
+    assert!(result.get("output").is_none());
+    assert!(result.get("output_truncated").is_none());
 
     let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
     let raw_ref: ArtifactRef = serde_json::from_value(result["raw_output_ref"].clone()).unwrap();
@@ -213,11 +218,68 @@ fn debug_eval_truncates_inline_output_and_keeps_raw_artifact() {
         .unwrap();
     assert_eq!(
         fs::read_to_string(raw_path).unwrap().len(),
-        DEFAULT_INLINE_TEXT_BYTE_LIMIT + 100
+        DEFAULT_INLINE_RESULT_BYTE_LIMIT + 100
     );
 
     let close = close_request(&host, session_id);
     assert!(close.error.is_none(), "{:?}", close.error);
+}
+
+#[test]
+fn debug_eval_recovers_complete_artifact_after_transport_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::new(Arc::new(ArtifactThenTransportFailureSupervisor));
+    let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+    let eval = eval_request(&host, session_id, ".echo recovery");
+    assert!(eval.error.is_some());
+
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let artifact = workspace
+        .list_artifacts()
+        .unwrap()
+        .into_iter()
+        .find(|artifact| artifact.kind == "debug.raw_output")
+        .expect("completed raw output is recovered");
+    let path = workspace
+        .resolve_artifact_relative_path(artifact.relative_path)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "complete output before transport failure"
+    );
+    assert!(!PathBuf::from(format!("{}.part", path.display())).exists());
+}
+
+#[test]
+fn debug_eval_removes_partial_artifact_after_transport_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::new(Arc::new(ArtifactThenTransportFailureSupervisor));
+    let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+    let eval = eval_request(&host, session_id, ".echo partial-only");
+    assert!(eval.error.is_some());
+
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    assert!(
+        workspace
+            .list_artifacts()
+            .unwrap()
+            .iter()
+            .all(|artifact| artifact.kind != "debug.raw_output")
+    );
+    let raw_dir = workspace
+        .root()
+        .join("artifacts")
+        .join("sessions")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("raw");
+    assert!(raw_dir.read_dir().unwrap().next().is_none());
 }
 
 #[test]
@@ -245,7 +307,7 @@ fn debug_eval_steps_runs_commands_in_order() {
     assert_eq!(result["operation_status"], "success");
     assert_eq!(result["steps"].as_array().unwrap().len(), 3);
     assert!(
-        result["steps"][0]["output"]
+        result["steps"][0]["result"]
             .as_str()
             .unwrap()
             .contains(".exepath")
@@ -312,8 +374,15 @@ fn debug_eval_steps_propagates_internal_step_errors() {
         })),
     });
 
-    let error = response.error.unwrap();
-    assert!(error.message.contains("artifact path"));
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["operation_status"], "failed");
+    assert!(
+        result["steps"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("artifact path")
+    );
     let state = host.lock_state().unwrap();
     assert!(state.operations.values().any(|operation| {
         operation.capability == "debug.eval_steps.step"
@@ -322,6 +391,36 @@ fn debug_eval_steps_propagates_internal_step_errors() {
     assert!(state.operations.values().any(|operation| {
         operation.capability == "debug.eval_steps"
             && operation.status == ServiceOperationStatus::Failed
+    }));
+}
+
+#[test]
+fn debug_eval_artifact_registration_failure_finalizes_operation() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::new(Arc::new(BadEvalWriteSupervisor));
+    let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+
+    let response = eval_request(&host, session_id, ".echo invalid artifact");
+    assert!(response.error.unwrap().message.contains("artifact path"));
+
+    let state = host.lock_state().unwrap();
+    assert!(state.operations.values().any(|operation| {
+        operation.capability == "debug.eval" && operation.status == ServiceOperationStatus::Failed
+    }));
+    drop(state);
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    assert!(
+        workspace
+            .list_operations()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation.capability == "debug.eval"
+                    && matches!(operation.status, OperationStatus::Failed)
+            })
+    );
+    assert!(workspace.list_command_audit().unwrap().iter().any(|audit| {
+        audit.capability == "debug.eval" && matches!(audit.status, OperationStatus::Failed)
     }));
 }
 

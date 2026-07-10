@@ -1,17 +1,20 @@
 use dbgatlas_debug::{
-    AddSymbolsRequest, CreateDebugSession, DEFAULT_INLINE_TEXT_BYTE_LIMIT, DebugCommandResult,
-    DebugMemoryResult, DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
-    inline_text_preview,
+    AddSymbolsRequest, CreateDebugSession, DebugCommandResult, DebugMemoryResult,
+    DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
 };
-use dbgatlas_model::{ArtifactRef, Id, OperationRef, RecordingRef, SessionRef, Timestamp};
+use dbgatlas_model::{
+    ArtifactRef, DEFAULT_INLINE_RESULT_BYTE_LIMIT, Id, OperationRef, RecordingRef, ResultDelivery,
+    ResultPreview, SessionRef, Timestamp,
+};
 use dbgatlas_recording::{
     RecordTtd, RecordingPreset, RecordingState, RecordingTarget, StartRecording,
     TtdRecordingOptions, TtdTarget, build_ttd_args, ttd_stop_target,
 };
 use dbgatlas_runtime::{RuntimeConfig, resolve_store_windbg_dbgeng_dir};
 use dbgatlas_worker_protocol::{
-    ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
-    WorkerProtocolError, WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
+    ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactRole,
+    WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError, WorkerRequest, WorkerResponse,
+    decode_jsonl, encode_jsonl, json_result_preview, write_atomic_bytes,
 };
 use dbgatlas_workspace::{
     ArtifactMetadata, CommandAuditRecord, OperationRecord, OperationStatus, Workspace,
@@ -59,8 +62,6 @@ pub use rpc_http::{
 pub const INTERNAL_WORKSPACE_DIR: &str = "dbgatlas";
 pub const DEFAULT_SERVICE_PORT: u16 = 7331;
 pub const MAX_MEMORY_READ_LENGTH: u64 = 16 * 1024 * 1024;
-const MAX_INLINE_REVERSE_RESULT_BYTES: usize = 128 * 1024;
-const MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES: usize = 32 * 1024;
 const MAX_WORKER_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
 const DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS: u64 = 5_000;
 const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);

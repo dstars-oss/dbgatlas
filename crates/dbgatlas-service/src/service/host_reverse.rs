@@ -466,13 +466,15 @@ impl ServiceHost {
                 &session.worker,
                 WorkerRequest::ReverseCoreFunction {
                     session_id: params.session_id.clone(),
+                    operation_id: operation_id.clone(),
                     function: function.to_string(),
                     arguments: arguments.clone(),
+                    artifact_dir: session.artifact_dir.clone(),
                 },
             )
         };
-        let core = match core {
-            Ok(WorkerResponse::ReverseCoreFunction { result, .. }) => result,
+        let (core, writes) = match core {
+            Ok(WorkerResponse::ReverseCoreFunction { result, writes }) => (result, writes),
             Ok(WorkerResponse::Failed { code, message, .. }) => {
                 let error = worker_failed_message(code, message);
                 let artifacts = record_failed_reverse_operation(
@@ -535,6 +537,63 @@ impl ServiceHost {
             }
             Err(error) => {
                 let message = error.to_string();
+                let final_result_path = session
+                    .artifact_dir
+                    .join("results")
+                    .join(format!("{}.json", operation_id.id.as_str()));
+                if let Err(cleanup_error) = cleanup_partial_result_write(&final_result_path) {
+                    append_service_diagnostic_log(&format!(
+                        "reverse_partial_cleanup_failed session_id={} operation_id={} error={}",
+                        sanitize_log_value(params.session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(&cleanup_error.to_string())
+                    ));
+                }
+                let recovered = recover_full_result_write(
+                    &workspace,
+                    &operation_id,
+                    &final_result_path,
+                    reverse_relative_path(
+                        &params.session_id,
+                        &format!("results/{}.json", operation_id.id.as_str()),
+                    ),
+                    "reverse.result",
+                    "recovered complete IDA Core Function result",
+                )?;
+                let mut artifacts = recovered.artifacts;
+                artifacts.extend(record_failed_reverse_operation(
+                    &workspace,
+                    &params.session_id,
+                    &session.artifact_dir,
+                    &operation_id,
+                    &capability,
+                    &message,
+                )?);
+                workspace.append_operation(&OperationRecord {
+                    operation_id: operation_id.clone(),
+                    adapter_id: "ida".to_string(),
+                    capability: capability.clone(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: message.clone(),
+                    artifacts: artifacts.clone(),
+                    raw_output: None,
+                })?;
+                self.record_failed_operation_in_memory(
+                    &operation_id,
+                    &capability,
+                    Some(params.session_id.clone()),
+                    message,
+                    artifacts,
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+        let registered = match register_worker_writes(&workspace, &operation_id, &writes) {
+            Ok(registered) => registered,
+            Err(error) => {
+                let message = format!("worker artifact registration failed: {error}");
                 let artifacts = record_failed_reverse_operation(
                     &workspace,
                     &params.session_id,
@@ -573,6 +632,7 @@ impl ServiceHost {
             &capability,
             arguments,
             core,
+            registered,
         )
     }
 

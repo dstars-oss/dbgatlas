@@ -1153,27 +1153,35 @@ std::string core_disasm(const Json& args) {
             {"warnings", Json::array({"function not found"})}
         }.dump();
     }
-    std::ostringstream out;
-    out << "{\"found\":true,\"function\":" << function_json(function)
-        << ",\"normalized_address\":" << address_resolution_json(normalized).dump()
-        << ",\"arguments\":[],\"stack_frame\":{\"size\":" << json_u64(static_cast<uint64_t>(get_frame_size(function)))
-        << "},\"instructions\":[";
-    bool first = true;
-    size_t emitted = 0;
-    for (ea_t ea = function->start_ea; ea < function->end_ea && emitted < 256;) {
+    Json instructions = Json::array();
+    Json warnings = Json::array();
+    func_item_iterator_t iterator;
+    for (bool ok = iterator.set(function); ok; ok = iterator.next_code()) {
+        ea_t ea = iterator.current();
         qstring line;
         if (generate_disasm_line(&line, ea, GENDSM_REMOVE_TAGS)) {
-            if (!first) out << ",";
-            first = false;
-            out << "{\"ea\":" << json_u64(static_cast<uint64_t>(ea))
-                << ",\"text\":" << json_string(qstring_to_string(line)) << "}";
-            ++emitted;
+            instructions.push_back(Json{
+                {"ea", static_cast<uint64_t>(ea)},
+                {"text", qstring_to_string(line)}
+            });
+        } else {
+            instructions.push_back(Json{
+                {"ea", static_cast<uint64_t>(ea)},
+                {"text", nullptr}
+            });
+            warnings.push_back("failed to generate a disassembly line for one function item");
         }
-        asize_t size = dbgatlas_get_item_size(ea);
-        ea += size == 0 ? 1 : size;
     }
-    out << "]}";
-    return out.str();
+    return Json{
+        {"found", true},
+        {"function", Json::parse(function_json(function))},
+        {"normalized_address", address_resolution_json(normalized)},
+        {"arguments", Json::array()},
+        {"stack_frame", Json{{"size", static_cast<uint64_t>(get_frame_size(function))}}},
+        {"instruction_count", instructions.size()},
+        {"instructions", std::move(instructions)},
+        {"warnings", std::move(warnings)}
+    }.dump();
 }
 
 std::string core_xrefs_to(const Json& args) {
@@ -2142,6 +2150,63 @@ std::string execute_core_function(IdaSessionHandleImpl* handle, const std::strin
     throw std::invalid_argument("unsupported IDA Core Function `" + function + "`");
 }
 
+void write_utf8_file(const char* output_path_utf8, const std::string& bytes) {
+    const std::wstring output_path = utf8_to_wide(output_path_utf8, "output_path");
+    HANDLE file = CreateFileW(
+        output_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("CreateFile(output artifact) failed with error " + std::to_string(GetLastError()));
+    }
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - offset, MAXDWORD));
+        DWORD written = 0;
+        if (!WriteFile(file, bytes.data() + offset, chunk, &written, nullptr) || written != chunk) {
+            DWORD error = GetLastError();
+            CloseHandle(file);
+            throw std::runtime_error("WriteFile(output artifact) failed with error " + std::to_string(error));
+        }
+        offset += written;
+    }
+    const BOOL flush_ok = FlushFileBuffers(file);
+    const BOOL close_ok = CloseHandle(file);
+    if (!flush_ok || !close_ok) {
+        throw std::runtime_error("failed to flush or close output artifact");
+    }
+}
+
+std::string bounded_core_preview(const std::string& function, const std::string& result_json, size_t byte_limit) {
+    if (result_json.size() <= byte_limit) return result_json;
+    Json result = Json::parse(result_json);
+    if (function == "decompile" && result.is_object() && result.contains("pseudocode") && result["pseudocode"].is_string()) {
+        const std::string pseudocode = result["pseudocode"].get<std::string>();
+        size_t end = std::min(pseudocode.size(), byte_limit);
+        for (;;) {
+            while (end > 0 && end < pseudocode.size()
+                && (static_cast<unsigned char>(pseudocode[end]) & 0xC0) == 0x80) --end;
+            result["pseudocode"] = pseudocode.substr(0, end);
+            std::string preview = result.dump();
+            if (preview.size() <= byte_limit) return preview;
+            if (end == 0) break;
+            end -= std::max<size_t>(end / 8, 1);
+        }
+    } else if (function == "disasm" && result.is_object() && result.contains("instructions") && result["instructions"].is_array()) {
+        Json full_instructions = result["instructions"];
+        result["instructions"] = Json::array();
+        for (const auto& instruction : full_instructions) {
+            result["instructions"].push_back(instruction);
+            if (result.dump().size() > byte_limit) {
+                result["instructions"].erase(result["instructions"].end() - 1);
+                break;
+            }
+        }
+        std::string preview = result.dump();
+        if (preview.size() <= byte_limit) return preview;
+    }
+    return "null";
+}
+
 void ensure_owner_thread(IdaSessionHandleImpl* handle) {
     if (handle->owner_thread != std::this_thread::get_id()) {
         throw std::runtime_error("IDA session used from a different thread");
@@ -2176,7 +2241,7 @@ DA_IDA_EXPORT int32_t da_ida_abi_version(DA_IdaVersion* out) {
     }
     out->flags = 0;
     out->abi_major = 0;
-    out->abi_minor = 1;
+    out->abi_minor = 2;
     out->abi_patch = 0;
     out->ida_major = 0;
     out->ida_minor = 0;
@@ -2337,6 +2402,42 @@ DA_IDA_EXPORT int32_t da_ida_core_function(
     }
 }
 
+DA_IDA_EXPORT int32_t da_ida_core_function_to_file(
+    DA_IdaSessionHandle* handle,
+    const char* function_utf8,
+    const char* arguments_json_utf8,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_IdaArtifactResult* out) {
+    if (handle == nullptr || function_utf8 == nullptr || arguments_json_utf8 == nullptr
+        || output_path_utf8 == nullptr || out == nullptr
+        || out->struct_size < sizeof(DA_IdaArtifactResult)) {
+        return fail(DA_IDA_ERR_INVALID_ARGUMENT, "artifact core function arguments are invalid");
+    }
+    try {
+        auto* impl = reinterpret_cast<IdaSessionHandleImpl*>(handle);
+        ensure_owner_thread(impl);
+        std::string function = utf8_string(function_utf8, "function");
+        std::string arguments_json = utf8_string(arguments_json_utf8, "arguments_json");
+        std::string result_json = execute_core_function(impl, function, arguments_json);
+        write_utf8_file(output_path_utf8, result_json);
+        const size_t preview_limit = inline_byte_limit > static_cast<uint64_t>(SIZE_MAX)
+            ? SIZE_MAX
+            : static_cast<size_t>(inline_byte_limit);
+        std::string preview_json = bounded_core_preview(function, result_json, preview_limit);
+        out->flags = 0;
+        out->preview_json = make_text_view(preview_json);
+        out->full_byte_len = static_cast<uint64_t>(result_json.size());
+        out->inline_byte_limit = inline_byte_limit;
+        out->truncated = result_json.size() > preview_json.size() || preview_json != result_json ? 1 : 0;
+        return DA_IDA_OK;
+    } catch (const std::invalid_argument& error) {
+        return fail(DA_IDA_ERR_INVALID_ARGUMENT, error.what());
+    } catch (const std::exception& error) {
+        return fail(DA_IDA_ERR_INTERNAL, error.what());
+    }
+}
+
 DA_IDA_EXPORT int32_t da_ida_session_close(DA_IdaSessionHandle* handle) {
     std::lock_guard<std::mutex> guard(g_session_mutex);
     return close_session(reinterpret_cast<IdaSessionHandleImpl*>(handle));
@@ -2350,7 +2451,7 @@ DA_IDA_EXPORT int32_t da_ida_abi_version(DA_IdaVersion* out) {
     }
     out->flags = 0;
     out->abi_major = 0;
-    out->abi_minor = 1;
+    out->abi_minor = 2;
     out->abi_patch = 0;
     out->ida_major = 0;
     out->ida_minor = 0;
@@ -2407,6 +2508,22 @@ DA_IDA_EXPORT int32_t da_ida_core_function(
     (void)handle;
     (void)function_utf8;
     (void)arguments_json_utf8;
+    (void)out;
+    return DA_IDA_ERR_IDA;
+}
+
+DA_IDA_EXPORT int32_t da_ida_core_function_to_file(
+    DA_IdaSessionHandle* handle,
+    const char* function_utf8,
+    const char* arguments_json_utf8,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_IdaArtifactResult* out) {
+    (void)handle;
+    (void)function_utf8;
+    (void)arguments_json_utf8;
+    (void)output_path_utf8;
+    (void)inline_byte_limit;
     (void)out;
     return DA_IDA_ERR_IDA;
 }

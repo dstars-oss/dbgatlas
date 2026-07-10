@@ -76,10 +76,14 @@ pub(super) fn mock_worker_response(request: WorkerRequest) -> Result<WorkerRespo
             })
         }
         WorkerRequest::ReverseCoreFunction {
+            session_id,
+            operation_id,
             function,
             arguments,
-            ..
-        } => mock_reverse_core_response(function, arguments),
+            artifact_dir,
+        } => {
+            mock_reverse_core_response(session_id, operation_id, function, arguments, artifact_dir)
+        }
         WorkerRequest::CloseReverseSession { .. } => Ok(WorkerResponse::Ok {
             summary: "reverse session closed by mock worker".to_string(),
             writes: Vec::new(),
@@ -100,8 +104,11 @@ pub(super) fn mock_worker_response(request: WorkerRequest) -> Result<WorkerRespo
 }
 
 pub(super) fn mock_reverse_core_response(
+    session_id: SessionRef,
+    operation_id: OperationRef,
     function: String,
     arguments: Value,
+    artifact_dir: PathBuf,
 ) -> Result<WorkerResponse, ServiceError> {
     let result = match function.as_str() {
         "lookup_funcs" => mock_lookup_funcs(&arguments)?,
@@ -139,13 +146,32 @@ pub(super) fn mock_reverse_core_response(
             });
         }
     };
+    let bytes = serde_json::to_vec(&result)?;
+    let result_path = artifact_dir
+        .join("results")
+        .join(format!("{}.json", operation_id.id.as_str()));
+    write_atomic_bytes(&result_path, &bytes)?;
+    let preview = json_result_preview(
+        &result,
+        bytes.len() as u64,
+        DEFAULT_INLINE_RESULT_BYTE_LIMIT,
+    )?;
     Ok(WorkerResponse::ReverseCoreFunction {
         result: ReverseCoreFunctionResult {
             function,
-            result,
+            result: preview,
             warnings: Vec::new(),
         },
-        writes: Vec::new(),
+        writes: vec![WorkerArtifactWrite {
+            relative_path: reverse_relative_path(
+                &session_id,
+                &format!("results/{}.json", operation_id.id.as_str()),
+            ),
+            kind: "reverse.result".to_string(),
+            role: Some(WorkerArtifactRole::FullResult),
+            byte_len: bytes.len() as u64,
+            description: Some("complete mock IDA Core Function result".to_string()),
+        }],
     })
 }
 
@@ -363,19 +389,40 @@ pub(super) fn mock_get_int(arguments: &Value) -> Result<Value, ServiceError> {
 pub(super) fn mock_decompile(arguments: &Value) -> Result<Value, ServiceError> {
     let (addr, normalized) = required_mock_code_address_argument(arguments, "addr")?;
     let start = addr & !0xff;
+    let pseudocode = if addr == 0x1400_ffff0 {
+        "x".repeat(2 * 1024 * 1024)
+    } else {
+        format!("int mock_function_{start:x}(void) {{\n    return 0;\n}}")
+    };
     Ok(json!({
         "addr": addr,
         "normalized_address": normalized,
         "function_start": start,
         "function_name": format!("mock_function_{start:x}"),
         "language": "c",
-        "pseudocode": format!("int mock_function_{start:x}(void) {{\n    return 0;\n}}")
+        "pseudocode": pseudocode
     }))
 }
 
 pub(super) fn mock_disasm(arguments: &Value) -> Result<Value, ServiceError> {
     let (addr, normalized) = required_mock_code_address_argument(arguments, "addr")?;
     let start = addr & !0xff;
+    let instructions = if addr == 0x1400_ffee0 {
+        (0..5_000u64)
+            .map(|index| {
+                json!({
+                    "ea": start + index,
+                    "text": format!("mov rax, qword ptr [rcx+0x{index:x}]")
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![
+            json!({ "ea": start, "text": "push rbp" }),
+            json!({ "ea": start + 1, "text": "mov rbp, rsp" }),
+            json!({ "ea": start + 4, "text": "ret" }),
+        ]
+    };
     Ok(json!({
         "addr": addr,
         "normalized_address": normalized,
@@ -383,11 +430,8 @@ pub(super) fn mock_disasm(arguments: &Value) -> Result<Value, ServiceError> {
         "function_name": format!("mock_function_{start:x}"),
         "arguments": [{ "name": "arg_0", "location": "rcx", "type": "uint64_t" }],
         "stack_frame": { "size": 0x40, "locals": [{ "name": "var_8", "offset": -8, "size": 8 }] },
-        "instructions": [
-            { "ea": start, "text": "push rbp" },
-            { "ea": start + 1, "text": "mov rbp, rsp" },
-            { "ea": start + 4, "text": "ret" }
-        ]
+        "instruction_count": instructions.len(),
+        "instructions": instructions
     }))
 }
 
@@ -1057,14 +1101,14 @@ pub(super) fn write_mock_eval_response(
         fs::create_dir_all(parent)?;
     }
     let output = if command == ".mock_long_output" {
-        "x".repeat(DEFAULT_INLINE_TEXT_BYTE_LIMIT + 100)
+        "x".repeat(DEFAULT_INLINE_RESULT_BYTE_LIMIT + 100)
     } else {
         format!(
             "mock debug worker accepted eval command; real DbgEng execution is not wired yet\ncommand: {}\n",
             command
         )
     };
-    fs::write(&raw_path, &output)?;
+    write_atomic_bytes(&raw_path, output.as_bytes())?;
     let transcript = format!("> {}\n{}\n", command, output);
     let mut transcript_file = OpenOptions::new()
         .create(true)
@@ -1087,46 +1131,37 @@ pub(super) fn write_mock_eval_response(
         }),
     )?;
     events_file.write_all(b"\n")?;
-    let preview = inline_text_preview(&output, DEFAULT_INLINE_TEXT_BYTE_LIMIT);
-    let mut warnings = vec!["mock worker: real DbgEng execution is not wired yet".to_string()];
-    if preview.truncated {
-        warnings.push(format!(
-            "output truncated to {} bytes inline; full output saved to raw output artifact",
-            preview.inline_byte_limit
-        ));
-    }
+    let preview = ResultPreview::utf8(&output, DEFAULT_INLINE_RESULT_BYTE_LIMIT);
 
     Ok(WorkerResponse::DebugCommand {
         result: DebugCommandResult {
             session_id,
             operation_id: None,
             command,
-            output: preview.text,
-            output_truncated: preview.truncated,
-            full_output_byte_len: Some(preview.full_byte_len),
-            inline_output_byte_limit: Some(preview.inline_byte_limit),
+            result: preview,
             final_state: Some(DebugSessionState::Ready),
-            raw_output: None,
-            full_output_artifact_ref: None,
-            warnings,
+            warnings: vec!["mock worker: real DbgEng execution is not wired yet".to_string()],
             error: None,
         },
         writes: vec![
             WorkerArtifactWrite {
                 relative_path: raw_relative_path,
                 kind: "debug.raw_output".to_string(),
+                role: Some(WorkerArtifactRole::FullResult),
                 byte_len: output.len() as u64,
                 description: Some("mock debug eval raw output".to_string()),
             },
             WorkerArtifactWrite {
                 relative_path: transcript_relative_path,
                 kind: "debug.transcript".to_string(),
+                role: None,
                 byte_len: transcript.len() as u64,
                 description: Some("debug session transcript".to_string()),
             },
             WorkerArtifactWrite {
                 relative_path: events_relative_path,
                 kind: "debug.events".to_string(),
+                role: None,
                 byte_len: output.len() as u64,
                 description: Some("debug session events".to_string()),
             },
@@ -1170,6 +1205,7 @@ pub(super) fn write_mock_memory_response(
         writes: vec![WorkerArtifactWrite {
             relative_path,
             kind: "debug.memory".to_string(),
+            role: None,
             byte_len: length as u64,
             description: Some("mock debug memory read".to_string()),
         }],

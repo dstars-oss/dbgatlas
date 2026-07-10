@@ -252,6 +252,12 @@ fn http_mcp_debug_workflow_uses_service_results_with_refs() {
     assert_eq!(eval["operation_status"], "success");
     assert!(eval["raw_output_ref"].get("id").is_some());
     assert_eq!(eval["artifact_refs"].as_array().unwrap().len(), 3);
+    assert_eq!(eval["result_delivery"]["truncated"], false);
+    assert_eq!(
+        eval["result_delivery"]["full_artifact_ref"],
+        eval["raw_output_ref"]
+    );
+    assert!(eval.get("output").is_none());
     server.stop();
 }
 
@@ -290,8 +296,9 @@ fn http_mcp_reverse_core_function_uses_service_results_with_refs() {
 
     assert_eq!(result["operation_status"], "success");
     assert_eq!(result["function"], "list_funcs");
-    assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 1);
+    assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 2);
     assert_eq!(result["result"]["count"], 1);
+    assert_eq!(result["result_delivery"]["truncated"], false);
     server.stop();
 }
 

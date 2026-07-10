@@ -1,11 +1,11 @@
 use dbgatlas_debug::{DebugCommandResult, DebugMemoryResult, DebugTarget};
-use dbgatlas_model::{OperationRef, SessionRef, Timestamp};
+use dbgatlas_model::{OperationRef, ResultPreview, SessionRef, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 3;
+pub const WORKER_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerEnvelope<T> {
@@ -65,8 +65,10 @@ pub enum WorkerRequest {
     },
     ReverseCoreFunction {
         session_id: SessionRef,
+        operation_id: OperationRef,
         function: String,
         arguments: Value,
+        artifact_dir: PathBuf,
     },
     CloseReverseSession {
         session_id: SessionRef,
@@ -121,11 +123,11 @@ impl WorkerRequest {
             WorkerRequest::EvalDebugCommand { operation_id, .. }
             | WorkerRequest::AddSymbols { operation_id, .. }
             | WorkerRequest::ReadMemory { operation_id, .. }
+            | WorkerRequest::ReverseCoreFunction { operation_id, .. }
             | WorkerRequest::CancelOperation { operation_id, .. } => Some(operation_id),
             WorkerRequest::StartDebugSession { .. }
             | WorkerRequest::OpenReverseSession { .. }
             | WorkerRequest::LookupReverseFunction { .. }
-            | WorkerRequest::ReverseCoreFunction { .. }
             | WorkerRequest::CloseReverseSession { .. }
             | WorkerRequest::CloseSession { .. }
             | WorkerRequest::KillSession { .. } => None,
@@ -205,7 +207,7 @@ impl WorkerResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReverseCoreFunctionResult {
     pub function: String,
-    pub result: Value,
+    pub result: ResultPreview<Value>,
     pub warnings: Vec<String>,
 }
 
@@ -226,8 +228,109 @@ pub struct ReverseFunctionLookupResult {
 pub struct WorkerArtifactWrite {
     pub relative_path: PathBuf,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<WorkerArtifactRole>,
     pub byte_len: u64,
     pub description: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerArtifactRole {
+    FullResult,
+}
+
+pub fn json_result_preview(
+    value: &Value,
+    full_byte_len: u64,
+    byte_limit: usize,
+) -> Result<ResultPreview<Value>, serde_json::Error> {
+    if serde_json::to_vec(value)?.len() <= byte_limit {
+        return Ok(ResultPreview {
+            value: value.clone(),
+            truncated: false,
+            full_byte_len,
+            inline_byte_limit: byte_limit as u64,
+        });
+    }
+
+    let preview = match value {
+        Value::Object(object) if object.get("pseudocode").is_some_and(Value::is_string) => {
+            let mut preview_object = object.clone();
+            let pseudocode = object["pseudocode"].as_str().unwrap_or_default();
+            let mut end = pseudocode.len().min(byte_limit);
+            let mut fits = false;
+            while end > 0 {
+                while end > 0 && !pseudocode.is_char_boundary(end) {
+                    end -= 1;
+                }
+                preview_object.insert(
+                    "pseudocode".to_string(),
+                    Value::String(pseudocode[..end].to_string()),
+                );
+                if serde_json::to_vec(&preview_object)?.len() <= byte_limit {
+                    fits = true;
+                    break;
+                }
+                end = end.saturating_sub((end / 8).max(1));
+            }
+            if !fits {
+                preview_object.insert("pseudocode".to_string(), Value::String(String::new()));
+                fits = serde_json::to_vec(&preview_object)?.len() <= byte_limit;
+            }
+            if fits {
+                Value::Object(preview_object)
+            } else {
+                Value::Null
+            }
+        }
+        Value::Object(object) if object.get("instructions").is_some_and(Value::is_array) => {
+            let mut preview_object = object.clone();
+            let instructions = object["instructions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            preview_object.insert("instructions".to_string(), Value::Array(Vec::new()));
+            let mut included = Vec::new();
+            for instruction in instructions {
+                included.push(instruction);
+                preview_object.insert("instructions".to_string(), Value::Array(included.clone()));
+                if serde_json::to_vec(&preview_object)?.len() > byte_limit {
+                    included.pop();
+                    break;
+                }
+            }
+            preview_object.insert("instructions".to_string(), Value::Array(included));
+            Value::Object(preview_object)
+        }
+        _ => Value::Null,
+    };
+
+    Ok(ResultPreview {
+        value: preview,
+        truncated: true,
+        full_byte_len,
+        inline_byte_limit: byte_limit as u64,
+    })
+}
+
+pub fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut part_name = path.as_os_str().to_os_string();
+    part_name.push(".part");
+    let part_path = PathBuf::from(part_name);
+    let result = (|| {
+        let mut file = std::fs::File::create(&part_path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&part_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part_path);
+    }
+    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,6 +454,7 @@ mod tests {
             "req-rev-core",
             WorkerRequest::ReverseCoreFunction {
                 session_id: SessionRef::new(Id::new("session-001").unwrap()),
+                operation_id: OperationRef::new(Id::new("op-001").unwrap()),
                 function: "rename".to_string(),
                 arguments: serde_json::json!({
                     "items": [{
@@ -359,6 +463,7 @@ mod tests {
                         "new_name": "dbgatlas_main"
                     }]
                 }),
+                artifact_dir: PathBuf::from("artifacts"),
             },
         );
 
@@ -399,15 +504,20 @@ mod tests {
             WorkerResponse::ReverseCoreFunction {
                 result: ReverseCoreFunctionResult {
                     function: "list_imports".to_string(),
-                    result: serde_json::json!({
-                        "offset": 0,
-                        "count": 1,
-                        "items": [{
-                            "module": "KERNEL32.dll",
-                            "name": "CreateFileW",
-                            "ordinal": null
-                        }]
-                    }),
+                    result: ResultPreview {
+                        value: serde_json::json!({
+                            "offset": 0,
+                            "count": 1,
+                            "items": [{
+                                "module": "KERNEL32.dll",
+                                "name": "CreateFileW",
+                                "ordinal": null
+                            }]
+                        }),
+                        truncated: false,
+                        full_byte_len: 100,
+                        inline_byte_limit: 64 * 1024,
+                    },
                     warnings: Vec::new(),
                 },
                 writes: Vec::new(),
@@ -479,8 +589,10 @@ mod tests {
             },
             WorkerRequest::ReverseCoreFunction {
                 session_id: session_id.clone(),
+                operation_id: operation_id.clone(),
                 function: "list_funcs".to_string(),
                 arguments: serde_json::json!({}),
+                artifact_dir: PathBuf::from("artifacts"),
             },
             WorkerRequest::CloseReverseSession {
                 session_id: session_id.clone(),
@@ -540,5 +652,43 @@ mod tests {
                 expected: WORKER_PROTOCOL_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn huge_json_result_produces_bounded_worker_response() {
+        let full = serde_json::json!({
+            "function": "huge",
+            "pseudocode": "x".repeat(2 * 1024 * 1024),
+        });
+        let full_len = serde_json::to_vec(&full).unwrap().len() as u64;
+        let preview = json_result_preview(&full, full_len, 64 * 1024).unwrap();
+        assert!(preview.truncated);
+        let response = WorkerEnvelope::new(
+            "req-huge",
+            WorkerResponse::ReverseCoreFunction {
+                result: ReverseCoreFunctionResult {
+                    function: "decompile".to_string(),
+                    result: preview,
+                    warnings: Vec::new(),
+                },
+                writes: vec![WorkerArtifactWrite {
+                    relative_path: PathBuf::from("artifacts/reverse_sessions/s/results/o.json"),
+                    kind: "reverse.result".to_string(),
+                    role: Some(WorkerArtifactRole::FullResult),
+                    byte_len: full_len,
+                    description: None,
+                }],
+            },
+        );
+        assert!(encode_jsonl(&response).unwrap().len() < 1024 * 1024);
+    }
+
+    #[test]
+    fn atomic_write_leaves_only_complete_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("results").join("result.json");
+        write_atomic_bytes(&path, b"{\"ok\":true}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"ok\":true}");
+        assert!(!PathBuf::from(format!("{}.part", path.display())).exists());
     }
 }

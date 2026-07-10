@@ -216,7 +216,8 @@ fn reverse_core_functions_record_artifacts_and_operations() {
         assert!(response.error.is_none(), "{method}: {:?}", response.error);
         let result = response.result.unwrap();
         assert_eq!(result["operation_status"], "success");
-        assert!(result["artifact_refs"].as_array().unwrap().len() == 1);
+        assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 2);
+        assert!(result["result_delivery"]["full_artifact_ref"]["id"].is_string());
         assert!(result.get("result").is_some());
         assert_eq!(
             result["function"],
@@ -235,6 +236,24 @@ fn reverse_core_functions_record_artifacts_and_operations() {
             .count()
             >= 25
     );
+    assert!(
+        artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "reverse.result")
+            .count()
+            >= 25
+    );
+    let audit = artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "reverse.core")
+        .unwrap();
+    let audit_path = workspace
+        .resolve_artifact_relative_path(&audit.relative_path)
+        .unwrap();
+    let audit_event: Value =
+        serde_json::from_str(&fs::read_to_string(audit_path).unwrap()).unwrap();
+    assert!(audit_event.get("result").is_none());
+    assert!(audit_event["result_artifact_ref"]["id"].is_string());
     let operations = workspace.list_operations().unwrap();
     for capability in [
         "reverse.lookup_funcs",
@@ -392,30 +411,148 @@ fn reverse_core_legacy_names_are_not_accepted() {
 
 #[test]
 fn reverse_decompile_large_result_returns_preview_with_artifact_ref() {
-    let artifact_id = ArtifactRef::new(Id::new("artifact-large-decompile").unwrap());
-    let core = ReverseCoreFunctionResult {
-        function: "decompile".to_string(),
-        result: json!({
-            "addr": 0x140001000u64,
-            "function_name": "big_function",
-            "language": "c",
-            "pseudocode": "x".repeat(MAX_INLINE_REVERSE_RESULT_BYTES + 1),
-        }),
-        warnings: Vec::new(),
-    };
+    let result = json!({
+        "addr": 0x140001000u64,
+        "function_name": "big_function",
+        "language": "c",
+        "pseudocode": "x".repeat(DEFAULT_INLINE_RESULT_BYTE_LIMIT * 2),
+    });
+    let full_byte_len = serde_json::to_vec(&result).unwrap().len() as u64;
+    let preview =
+        json_result_preview(&result, full_byte_len, DEFAULT_INLINE_RESULT_BYTE_LIMIT).unwrap();
 
-    let result = reverse_core_response_result(&core, &artifact_id, 200_000).unwrap();
+    assert!(preview.truncated);
+    assert_eq!(preview.full_byte_len, full_byte_len);
+    assert!(serde_json::to_vec(&preview.value).unwrap().len() <= DEFAULT_INLINE_RESULT_BYTE_LIMIT);
+    assert!(preview.value.get("pseudocode_truncated").is_none());
+    assert!(preview.value.get("full_result_artifact_ref").is_none());
+}
 
-    assert_eq!(result["pseudocode_truncated"], true);
-    assert_eq!(
-        result["pseudocode"].as_str().unwrap().len(),
-        MAX_INLINE_DECOMPILE_PSEUDOCODE_BYTES
+#[test]
+fn reverse_decompile_over_one_mib_uses_bounded_preview_and_complete_json_artifact() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::with_mock_workers();
+    let session_id = open_reverse_session(&host, temp.path());
+    let response = reverse_core_rpc(
+        &host,
+        "reverse.decompile",
+        session_id,
+        json!({ "addr": "0x1400ffff0" }),
     );
-    assert_eq!(
-        result["full_result_artifact_ref"]["id"],
-        "artifact-large-decompile"
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["result_delivery"]["truncated"], true);
+    assert!(serde_json::to_vec(&result).unwrap().len() < MAX_WORKER_RESPONSE_LINE_BYTES);
+
+    let artifact_ref: ArtifactRef =
+        serde_json::from_value(result["result_delivery"]["full_artifact_ref"].clone()).unwrap();
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let artifact = workspace.get_artifact(&artifact_ref).unwrap().unwrap();
+    assert_eq!(artifact.kind, "reverse.result");
+    let path = workspace
+        .resolve_artifact_relative_path(artifact.relative_path)
+        .unwrap();
+    let full: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(full["pseudocode"].as_str().unwrap().len(), 2 * 1024 * 1024);
+}
+
+#[test]
+fn reverse_disasm_keeps_all_instructions_in_artifact_and_bounds_inline_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::with_mock_workers();
+    let session_id = open_reverse_session(&host, temp.path());
+    let response = reverse_core_rpc(
+        &host,
+        "reverse.disasm",
+        session_id,
+        json!({ "addr": "0x1400ffee0" }),
     );
-    assert_eq!(result["full_result_byte_len"], 200_000);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["result_delivery"]["truncated"], true);
+    let inline_count = result["result"]["instructions"].as_array().unwrap().len();
+    assert!(inline_count > 256);
+    assert!(inline_count < 5_000);
+
+    let artifact_ref: ArtifactRef =
+        serde_json::from_value(result["result_delivery"]["full_artifact_ref"].clone()).unwrap();
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let artifact = workspace.get_artifact(&artifact_ref).unwrap().unwrap();
+    let path = workspace
+        .resolve_artifact_relative_path(artifact.relative_path)
+        .unwrap();
+    let full: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(full["instruction_count"], 5_000);
+    assert_eq!(full["instructions"].as_array().unwrap().len(), 5_000);
+}
+
+#[test]
+fn reverse_artifact_registration_failure_finalizes_operation() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::new(Arc::new(BadEvalWriteSupervisor));
+    let session_id = open_reverse_session(&host, temp.path());
+
+    let response = reverse_core_rpc(
+        &host,
+        "reverse.disasm",
+        session_id,
+        json!({ "addr": "0x140001000" }),
+    );
+    assert!(response.error.unwrap().message.contains("artifact path"));
+
+    let state = host.lock_state().unwrap();
+    assert!(state.operations.values().any(|operation| {
+        operation.capability == "reverse.disasm"
+            && operation.status == ServiceOperationStatus::Failed
+    }));
+    drop(state);
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    assert!(
+        workspace
+            .list_operations()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation.capability == "reverse.disasm"
+                    && matches!(operation.status, OperationStatus::Failed)
+            })
+    );
+}
+
+#[test]
+fn reverse_transport_failure_removes_partial_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::new(Arc::new(ArtifactThenTransportFailureSupervisor));
+    let session_id = open_reverse_session(&host, temp.path());
+
+    let response = reverse_core_rpc(
+        &host,
+        "reverse.disasm",
+        session_id,
+        json!({ "addr": "0x140001000" }),
+    );
+    assert!(response.error.is_some());
+
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    assert!(
+        workspace
+            .list_artifacts()
+            .unwrap()
+            .iter()
+            .all(|artifact| artifact.kind != "reverse.result")
+    );
+    let results = workspace
+        .root()
+        .join("artifacts")
+        .join("reverse_sessions")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("results");
+    assert!(results.read_dir().unwrap().next().is_none());
 }
 
 #[test]

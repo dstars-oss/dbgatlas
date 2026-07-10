@@ -45,11 +45,13 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 - `da_dbgeng_session_open_file(path_utf8, out_handle)`
 - `da_dbgeng_session_attach_process(pid, out_handle)`
 - `da_dbgeng_session_execute(handle, command_utf8, out_text)`
+- `da_dbgeng_session_execute_to_file(handle, command_utf8, output_path_utf8, inline_byte_limit, out_artifact)`
 - `da_dbgeng_session_add_symbols(handle, symbol_path_utf8, reload, out_text)`
+- `da_dbgeng_session_add_symbols_to_file(handle, symbol_path_utf8, reload, output_path_utf8, inline_byte_limit, out_artifact)`
 - `da_dbgeng_session_read_virtual(handle, address, length, out_bytes)`
 - `da_dbgeng_session_close(handle)`
 
-当前实现按自动 resolver 给出的 Store WinDbg / SDK / System32 候选目录动态加载 `dbgeng.dll`，通过 `DebugCreate` 建立 session。Rust worker 会在 `LoadLibrary` 失败时尝试下一个候选；一旦某个 `dbgeng.dll` 成功加载，native adapter 不在同一进程内切换版本。`.dmp`、`.run` 等 DbgEng 支持的文件统一通过 `da_dbgeng_session_open_file` 进入，内部使用 `OpenDumpFile` 打开；attach 使用非侵入 attach，不在 close 时终止目标进程。raw command 通过 `IDebugControl::Execute` 执行，并用 output callbacks 捕获输出。`add_symbols` 追加当前 session 的 symbol path，可选执行 `.reload`。`read_virtual` 用 `IDebugDataSpaces::ReadVirtual` 返回二进制 view。
+当前实现按自动 resolver 给出的 Store WinDbg / SDK / System32 候选目录动态加载 `dbgeng.dll`，通过 `DebugCreate` 建立 session。Rust worker 会在 `LoadLibrary` 失败时尝试下一个候选；一旦某个 `dbgeng.dll` 成功加载，native adapter 不在同一进程内切换版本。`.dmp`、`.run` 等 DbgEng 支持的文件统一通过 `da_dbgeng_session_open_file` 进入，内部使用 `OpenDumpFile` 打开；attach 使用非侵入 attach，不在 close 时终止目标进程。raw command 通过 `IDebugControl::Execute` 执行，并用 output callbacks 捕获输出。安装态 worker 使用 `*_to_file` ABI 将完整文本直接流式写入 `.part` 文件，仅跨 FFI 返回 bounded preview、完整 UTF-8 字节数和截断状态；旧内存返回 ABI 仅为兼容保留。`add_symbols` 追加当前 session 的 symbol path，可选执行 `.reload`。`read_virtual` 用 `IDebugDataSpaces::ReadVirtual` 返回二进制 view。
 
 ## IDA native adapter ABI
 
@@ -61,6 +63,7 @@ IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。Rust saf
 - `da_ida_session_open(install_dir_utf8, database_path_utf8, out_handle)`
 - `da_ida_lookup_function(handle, runtime_address, runtime_module_base, ida_image_base, out)`
 - `da_ida_core_function(handle, function_utf8, arguments_json_utf8, out)`
+- `da_ida_core_function_to_file(handle, function_utf8, arguments_json_utf8, output_path_utf8, inline_byte_limit, out_artifact)`
 - `da_ida_session_close(handle)`
 - `da_ida_last_error(buffer, buffer_len, required_len)`
 - `da_ida_release_view(owner)`

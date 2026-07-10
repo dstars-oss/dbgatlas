@@ -56,6 +56,17 @@ pub struct DA_IdaCoreResult {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_IdaArtifactResult {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub preview_json: DA_IdaTextView,
+    pub full_byte_len: u64,
+    pub inline_byte_limit: u64,
+    pub truncated: i32,
+}
+
+#[repr(C)]
 pub struct DA_IdaSessionHandle {
     _private: [u8; 0],
 }
@@ -72,5 +83,13 @@ pub type DaIdaCoreFunctionFn = unsafe extern "C" fn(
     *const c_char,
     *const c_char,
     *mut DA_IdaCoreResult,
+) -> i32;
+pub type DaIdaCoreFunctionToFileFn = unsafe extern "C" fn(
+    *mut DA_IdaSessionHandle,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    u64,
+    *mut DA_IdaArtifactResult,
 ) -> i32;
 pub type DaIdaSessionCloseFn = unsafe extern "C" fn(*mut DA_IdaSessionHandle) -> i32;

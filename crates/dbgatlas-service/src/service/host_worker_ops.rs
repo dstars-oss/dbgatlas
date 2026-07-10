@@ -187,7 +187,20 @@ impl ServiceHost {
     ) -> Result<Value, ServiceError> {
         match worker_response {
             Ok(WorkerResponse::DebugCommand { mut result, writes }) => {
-                let registered = register_worker_writes(workspace, &operation_id, &writes)?;
+                let registered = match register_worker_writes(workspace, &operation_id, &writes) {
+                    Ok(registered) => registered,
+                    Err(error) => {
+                        self.record_debug_artifact_registration_failure(
+                            session,
+                            workspace,
+                            &operation_id,
+                            capability,
+                            &audit_command,
+                            &error,
+                        )?;
+                        return Err(error);
+                    }
+                };
                 result.operation_id = Some(operation_id.clone());
                 let was_canceled =
                     self.operation_status(&operation_id)? == Some(ServiceOperationStatus::Canceled);
@@ -248,7 +261,7 @@ impl ServiceHost {
                     operation.events.push(ServiceEvent {
                         timestamp: Timestamp::now(),
                         kind: "output".to_string(),
-                        message: result.output.clone(),
+                        message: result.result.value.clone(),
                     });
                 }
                 if let Some(session) = state.sessions.get_mut(session.session_id.id.as_str()) {
@@ -263,7 +276,20 @@ impl ServiceHost {
                 message,
                 writes,
             }) => {
-                let registered = register_worker_writes(workspace, &operation_id, &writes)?;
+                let registered = match register_worker_writes(workspace, &operation_id, &writes) {
+                    Ok(registered) => registered,
+                    Err(error) => {
+                        self.record_debug_artifact_registration_failure(
+                            session,
+                            workspace,
+                            &operation_id,
+                            capability,
+                            &audit_command,
+                            &error,
+                        )?;
+                        return Err(error);
+                    }
+                };
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
@@ -350,6 +376,29 @@ impl ServiceHost {
                 } else {
                     OperationStatus::Failed
                 };
+                let final_output_path = session
+                    .artifact_dir
+                    .join("raw")
+                    .join(format!("{}.txt", operation_id.id.as_str()));
+                if let Err(cleanup_error) = cleanup_partial_result_write(&final_output_path) {
+                    append_service_diagnostic_log(&format!(
+                        "debug_partial_cleanup_failed session_id={} operation_id={} error={}",
+                        sanitize_log_value(session.session_id.id.as_str()),
+                        sanitize_log_value(operation_id.id.as_str()),
+                        sanitize_log_value(&cleanup_error.to_string())
+                    ));
+                }
+                let recovered = recover_full_result_write(
+                    workspace,
+                    &operation_id,
+                    &final_output_path,
+                    session_relative_path(
+                        &session.session_id,
+                        &format!("raw/{}.txt", operation_id.id.as_str()),
+                    ),
+                    "debug.raw_output",
+                    "recovered debug raw command output",
+                )?;
                 workspace.append_operation(&OperationRecord {
                     operation_id: operation_id.clone(),
                     adapter_id: "service".to_string(),
@@ -357,8 +406,8 @@ impl ServiceHost {
                     status: status.clone(),
                     created_at: Timestamp::now(),
                     summary: error.to_string(),
-                    artifacts: Vec::new(),
-                    raw_output: None,
+                    artifacts: recovered.artifacts.clone(),
+                    raw_output: recovered.raw_output.clone(),
                 })?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
@@ -367,16 +416,16 @@ impl ServiceHost {
                     command: audit_command,
                     created_at: Timestamp::now(),
                     status: status.clone(),
-                    artifacts: Vec::new(),
-                    raw_output: None,
+                    artifacts: recovered.artifacts.clone(),
+                    raw_output: recovered.raw_output.clone(),
                 })?;
                 if !was_canceled {
                     self.finish_operation_in_memory(
                         &operation_id,
                         ServiceOperationStatus::Failed,
                         error.to_string(),
-                        Vec::new(),
-                        None,
+                        recovered.artifacts.clone(),
+                        recovered.raw_output.clone(),
                     )?;
                 }
                 append_operation_diagnostic_log(
@@ -384,13 +433,62 @@ impl ServiceHost {
                     &session.session_id,
                     &operation_id,
                     &status,
-                    0,
-                    None,
+                    recovered.artifacts.len(),
+                    recovered.raw_output.as_ref(),
                     Some(&error.to_string()),
                 );
                 Err(error)
             }
         }
+    }
+
+    fn record_debug_artifact_registration_failure(
+        &self,
+        session: &ManagedSession,
+        workspace: &Workspace,
+        operation_id: &OperationRef,
+        capability: &str,
+        audit_command: &str,
+        error: &ServiceError,
+    ) -> Result<(), ServiceError> {
+        let message = format!("worker artifact registration failed: {error}");
+        workspace.append_operation(&OperationRecord {
+            operation_id: operation_id.clone(),
+            adapter_id: "service".to_string(),
+            capability: capability.to_string(),
+            status: OperationStatus::Failed,
+            created_at: Timestamp::now(),
+            summary: message.clone(),
+            artifacts: Vec::new(),
+            raw_output: None,
+        })?;
+        workspace.append_command_audit(&CommandAuditRecord {
+            operation_id: operation_id.clone(),
+            session_id: Some(session.session_id.clone()),
+            capability: capability.to_string(),
+            command: audit_command.to_string(),
+            created_at: Timestamp::now(),
+            status: OperationStatus::Failed,
+            artifacts: Vec::new(),
+            raw_output: None,
+        })?;
+        self.finish_operation_in_memory(
+            operation_id,
+            ServiceOperationStatus::Failed,
+            message.clone(),
+            Vec::new(),
+            None,
+        )?;
+        append_operation_diagnostic_log(
+            capability,
+            &session.session_id,
+            operation_id,
+            &OperationStatus::Failed,
+            0,
+            None,
+            Some(&message),
+        );
+        Ok(())
     }
 
     pub(super) fn request_worker_with_optional_timeout(

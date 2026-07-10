@@ -1,15 +1,14 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use dbgatlas_dbgeng::DbgEngSession;
-use dbgatlas_debug::{
-    DEFAULT_INLINE_TEXT_BYTE_LIMIT, DebugCommandResult, DebugMemoryResult, DebugSessionState,
-    DebugTarget, inline_text_preview,
+use dbgatlas_debug::{DebugCommandResult, DebugMemoryResult, DebugSessionState, DebugTarget};
+use dbgatlas_model::{
+    DEFAULT_INLINE_RESULT_BYTE_LIMIT, OperationRef, ResultPreview, SessionRef, Timestamp,
 };
-use dbgatlas_model::{OperationRef, SessionRef, Timestamp};
 use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
-    ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactWrite, WorkerEnvelope,
-    WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
+    ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactRole,
+    WorkerArtifactWrite, WorkerEnvelope, WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
 };
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -289,14 +288,17 @@ impl WorkerState {
                 command,
                 artifact_dir,
             } => self.with_session(|session| {
-                let output = session
-                    .execute(&command)
+                let raw_path = artifact_dir
+                    .join("raw")
+                    .join(format!("{}.txt", operation_id.id.as_str()));
+                let captured = session
+                    .execute_to_artifact(&command, &raw_path, DEFAULT_INLINE_RESULT_BYTE_LIMIT)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                write_command_response(
+                write_captured_command_response(
                     session_id,
                     operation_id,
                     command,
-                    output,
+                    captured,
                     &artifact_dir,
                     "debug raw command output",
                 )
@@ -308,19 +310,27 @@ impl WorkerState {
                 reload,
                 artifact_dir,
             } => self.with_session(|session| {
-                let output = session
-                    .add_symbols(&symbol_path, reload)
+                let raw_path = artifact_dir
+                    .join("raw")
+                    .join(format!("{}.txt", operation_id.id.as_str()));
+                let captured = session
+                    .add_symbols_to_artifact(
+                        &symbol_path,
+                        reload,
+                        &raw_path,
+                        DEFAULT_INLINE_RESULT_BYTE_LIMIT,
+                    )
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 let command = if reload {
                     format!("add_symbols {symbol_path} --reload")
                 } else {
                     format!("add_symbols {symbol_path}")
                 };
-                write_command_response(
+                write_captured_command_response(
                     session_id,
                     operation_id,
                     command,
-                    output,
+                    captured,
                     &artifact_dir,
                     "debug add_symbols output",
                 )
@@ -362,10 +372,12 @@ impl WorkerState {
                 ..
             } => self.lookup_reverse_function(runtime_address, runtime_module_base, ida_image_base),
             WorkerRequest::ReverseCoreFunction {
+                operation_id,
                 function,
                 arguments,
+                artifact_dir,
                 ..
-            } => self.reverse_core_function(function, arguments),
+            } => self.reverse_core_function(operation_id, function, arguments, &artifact_dir),
             WorkerRequest::CloseReverseSession { .. } => self.close_reverse_session(),
             WorkerRequest::CloseSession { .. } => {
                 self.session = None;
@@ -477,8 +489,10 @@ impl WorkerState {
 
     fn reverse_core_function(
         &mut self,
+        operation_id: OperationRef,
         function: String,
         arguments: serde_json::Value,
+        artifact_dir: &Path,
     ) -> WorkerResponse {
         let Some(session) = self.reverse_session.as_ref() else {
             return WorkerResponse::failed(
@@ -486,15 +500,59 @@ impl WorkerState {
                 "reverse session is not open",
             );
         };
-        match session.core_function(function, arguments) {
-            Ok(result) => WorkerResponse::ReverseCoreFunction {
-                result: ReverseCoreFunctionResult {
-                    function: result.function,
-                    result: result.result,
-                    warnings: result.warnings,
-                },
-                writes: Vec::new(),
-            },
+        let result_path = artifact_dir
+            .join("results")
+            .join(format!("{}.json", operation_id.id.as_str()));
+        match session.core_function_to_artifact(
+            function,
+            arguments,
+            &result_path,
+            DEFAULT_INLINE_RESULT_BYTE_LIMIT,
+        ) {
+            Ok(result) => {
+                let actual_len = match fs::metadata(&result_path) {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) => {
+                        return WorkerResponse::failed(
+                            "reverse_core_artifact_failed",
+                            error.to_string(),
+                        );
+                    }
+                };
+                if actual_len != result.full_byte_len {
+                    return WorkerResponse::failed(
+                        "reverse_core_artifact_failed",
+                        format!(
+                            "native artifact length mismatch: reported {}, actual {actual_len}",
+                            result.full_byte_len
+                        ),
+                    );
+                }
+                let preview = ResultPreview {
+                    value: result.preview,
+                    truncated: result.truncated,
+                    full_byte_len: result.full_byte_len,
+                    inline_byte_limit: result.inline_byte_limit,
+                };
+                WorkerResponse::ReverseCoreFunction {
+                    result: ReverseCoreFunctionResult {
+                        function: result.function,
+                        result: preview,
+                        warnings: result.warnings,
+                    },
+                    writes: vec![WorkerArtifactWrite {
+                        relative_path: PathBuf::from("artifacts")
+                            .join("reverse_sessions")
+                            .join(&self.expected_session_id)
+                            .join("results")
+                            .join(format!("{}.json", operation_id.id.as_str())),
+                        kind: "reverse.result".to_string(),
+                        role: Some(WorkerArtifactRole::FullResult),
+                        byte_len: result.full_byte_len,
+                        description: Some("complete IDA Core Function result".to_string()),
+                    }],
+                }
+            }
             Err(error) => WorkerResponse::failed("reverse_core_failed", error.to_string()),
         }
     }
@@ -513,16 +571,14 @@ impl WorkerState {
     }
 }
 
-fn write_command_response(
+fn write_captured_command_response(
     session_id: SessionRef,
     operation_id: OperationRef,
     command: String,
-    output: String,
+    captured: dbgatlas_dbgeng::ArtifactCommandOutput,
     artifact_dir: &Path,
     description: &str,
 ) -> Result<WorkerResponse, std::io::Error> {
-    // 每次命令同时写 raw output、transcript 和 events。service 会注册这些路径，
-    // 并把 artifact refs 返回给 CLI/MCP；worker 不直接修改 workspace 索引。
     let raw_relative_path = session_relative_path(
         &session_id,
         &format!("raw/{}.txt", operation_id.id.as_str()),
@@ -534,12 +590,14 @@ fn write_command_response(
         .join(format!("{}.txt", operation_id.id.as_str()));
     let transcript_path = artifact_dir.join("transcript.log");
     let events_path = artifact_dir.join("events.jsonl");
-    if let Some(parent) = raw_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&raw_path, &output)?;
-    let transcript = format!("> {}\n{}\n", command, output);
-    append_text(&transcript_path, &transcript)?;
+    let mut transcript = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&transcript_path)?;
+    let prefix = format!("> {}\n", command);
+    transcript.write_all(prefix.as_bytes())?;
+    let copied = std::io::copy(&mut fs::File::open(&raw_path)?, &mut transcript)?;
+    transcript.write_all(b"\n")?;
     append_event(
         &events_path,
         &serde_json::json!({
@@ -548,50 +606,47 @@ fn write_command_response(
             "operation_id": operation_id,
             "command": command,
             "timestamp": Timestamp::now(),
-            "byte_len": output.len(),
+            "byte_len": captured.full_byte_len,
         }),
     )?;
-    let preview = inline_text_preview(&output, DEFAULT_INLINE_TEXT_BYTE_LIMIT);
-    let mut warnings = Vec::new();
-    if preview.truncated {
-        warnings.push(format!(
-            "output truncated to {} bytes inline; full output saved to raw output artifact",
-            preview.inline_byte_limit
-        ));
-    }
-
+    let bounded = ResultPreview::utf8(&captured.preview, DEFAULT_INLINE_RESULT_BYTE_LIMIT);
+    let preview_byte_len = bounded.value.len() as u64;
+    let preview = ResultPreview {
+        value: bounded.value,
+        truncated: captured.truncated || captured.full_byte_len > preview_byte_len,
+        full_byte_len: captured.full_byte_len,
+        inline_byte_limit: captured.inline_byte_limit,
+    };
     Ok(WorkerResponse::DebugCommand {
         result: DebugCommandResult {
             session_id,
             operation_id: None,
             command,
-            output: preview.text,
-            output_truncated: preview.truncated,
-            full_output_byte_len: Some(preview.full_byte_len),
-            inline_output_byte_limit: Some(preview.inline_byte_limit),
+            result: preview,
             final_state: Some(DebugSessionState::Ready),
-            raw_output: None,
-            full_output_artifact_ref: None,
-            warnings,
+            warnings: Vec::new(),
             error: None,
         },
         writes: vec![
             WorkerArtifactWrite {
                 relative_path: raw_relative_path,
                 kind: "debug.raw_output".to_string(),
-                byte_len: output.len() as u64,
+                role: Some(WorkerArtifactRole::FullResult),
+                byte_len: captured.full_byte_len,
                 description: Some(description.to_string()),
             },
             WorkerArtifactWrite {
                 relative_path: transcript_relative_path,
                 kind: "debug.transcript".to_string(),
-                byte_len: transcript.len() as u64,
+                role: None,
+                byte_len: prefix.len() as u64 + copied + 1,
                 description: Some("debug session transcript".to_string()),
             },
             WorkerArtifactWrite {
                 relative_path: events_relative_path,
                 kind: "debug.events".to_string(),
-                byte_len: output.len() as u64,
+                role: None,
+                byte_len: captured.full_byte_len,
                 description: Some("debug session events".to_string()),
             },
         ],
@@ -632,6 +687,7 @@ fn write_memory_response(
         writes: vec![WorkerArtifactWrite {
             relative_path,
             kind: "debug.memory".to_string(),
+            role: None,
             byte_len: bytes.len() as u64,
             description: Some("debug memory read".to_string()),
         }],
@@ -659,6 +715,7 @@ fn write_session_event(
             .join(session_id)
             .join("events.jsonl"),
         kind: "debug.events".to_string(),
+        role: None,
         byte_len: 0,
         description: Some("debug session events".to_string()),
     })
@@ -669,11 +726,6 @@ fn session_relative_path(session_id: &SessionRef, suffix: &str) -> PathBuf {
         .join("sessions")
         .join(session_id.id.as_str())
         .join(suffix)
-}
-
-fn append_text(path: &Path, text: &str) -> Result<(), std::io::Error> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(text.as_bytes())
 }
 
 fn append_event(path: &Path, event: &serde_json::Value) -> Result<(), std::io::Error> {

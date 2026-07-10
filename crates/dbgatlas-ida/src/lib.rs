@@ -19,6 +19,8 @@ pub enum IdaError {
     DynamicLoad(String),
     #[error("IDA session worker stopped")]
     WorkerStopped,
+    #[error("artifact I/O failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +50,16 @@ pub struct FunctionLookup {
 pub struct CoreFunctionResult {
     pub function: String,
     pub result: Value,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoreFunctionArtifactResult {
+    pub function: String,
+    pub preview: Value,
+    pub full_byte_len: u64,
+    pub inline_byte_limit: u64,
+    pub truncated: bool,
     pub warnings: Vec<String>,
 }
 
@@ -125,6 +137,28 @@ impl IdaSession {
         reply_rx.recv().map_err(|_| IdaError::WorkerStopped)?
     }
 
+    pub fn core_function_to_artifact(
+        &self,
+        function: impl Into<String>,
+        arguments: Value,
+        output_path: impl AsRef<Path>,
+        inline_byte_limit: usize,
+    ) -> Result<CoreFunctionArtifactResult, IdaError> {
+        let function = function.into();
+        let output_path = output_path.as_ref().to_path_buf();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.commands
+            .send(Command::CoreToArtifact {
+                function,
+                arguments,
+                output_path,
+                inline_byte_limit,
+                reply: reply_tx,
+            })
+            .map_err(|_| IdaError::WorkerStopped)?;
+        reply_rx.recv().map_err(|_| IdaError::WorkerStopped)?
+    }
+
     pub fn close(mut self) -> Result<(), IdaError> {
         self.close_inner()
     }
@@ -166,6 +200,13 @@ enum Command {
         arguments: Value,
         reply: mpsc::Sender<Result<CoreFunctionResult, IdaError>>,
     },
+    CoreToArtifact {
+        function: String,
+        arguments: Value,
+        output_path: PathBuf,
+        inline_byte_limit: usize,
+        reply: mpsc::Sender<Result<CoreFunctionArtifactResult, IdaError>>,
+    },
     Close {
         reply: mpsc::Sender<Result<(), IdaError>>,
     },
@@ -179,6 +220,7 @@ struct AdapterApi {
     session_open: dbgatlas_ida_sys::DaIdaSessionOpenFn,
     lookup_function: dbgatlas_ida_sys::DaIdaLookupFunctionFn,
     core_function: dbgatlas_ida_sys::DaIdaCoreFunctionFn,
+    core_function_to_file: dbgatlas_ida_sys::DaIdaCoreFunctionToFileFn,
     session_close: dbgatlas_ida_sys::DaIdaSessionCloseFn,
 }
 
@@ -253,6 +295,7 @@ impl AdapterLibrary {
                     session_open: bind_symbol(module, b"da_ida_session_open\0")?,
                     lookup_function: bind_symbol(module, b"da_ida_lookup_function\0")?,
                     core_function: bind_symbol(module, b"da_ida_core_function\0")?,
+                    core_function_to_file: bind_symbol(module, b"da_ida_core_function_to_file\0")?,
                     session_close: bind_symbol(module, b"da_ida_session_close\0")?,
                 })
             })();
@@ -264,6 +307,22 @@ impl AdapterLibrary {
                 }
             }
         };
+
+        let mut version = dbgatlas_ida_sys::DA_IdaVersion {
+            struct_size: std::mem::size_of::<dbgatlas_ida_sys::DA_IdaVersion>() as u32,
+            ..Default::default()
+        };
+        let version_status = unsafe { (api._abi_version)(&mut version) };
+        if version_status != dbgatlas_ida_sys::DA_IDA_OK
+            || version.abi_major != 0
+            || version.abi_minor < 2
+        {
+            unsafe { windows_sys::Win32::Foundation::FreeLibrary(module) };
+            return Err(IdaError::DynamicLoad(format!(
+                "dbgatlas_ida ABI {}.{} is incompatible; expected at least 0.2",
+                version.abi_major, version.abi_minor
+            )));
+        }
 
         Ok(Self {
             module,
@@ -292,7 +351,7 @@ pub fn native_version() -> Result<NativeVersion, IdaError> {
     {
         Ok(NativeVersion {
             abi_major: 0,
-            abi_minor: 1,
+            abi_minor: 2,
             abi_patch: 0,
             ida_major: 0,
             ida_minor: 0,
@@ -382,6 +441,22 @@ fn run_native_session(
             } => {
                 let _ = reply.send(native_core(&adapter, handle, function, arguments));
             }
+            Command::CoreToArtifact {
+                function,
+                arguments,
+                output_path,
+                inline_byte_limit,
+                reply,
+            } => {
+                let _ = reply.send(native_core_to_artifact(
+                    &adapter,
+                    handle,
+                    function,
+                    arguments,
+                    &output_path,
+                    inline_byte_limit,
+                ));
+            }
             Command::Close { reply } => {
                 let status = unsafe { (adapter.api.session_close)(handle) };
                 handle = std::ptr::null_mut();
@@ -450,6 +525,79 @@ fn native_core(
     Ok(CoreFunctionResult {
         function,
         result,
+        warnings,
+    })
+}
+
+#[cfg(windows)]
+fn native_core_to_artifact(
+    adapter: &AdapterLibrary,
+    handle: *mut dbgatlas_ida_sys::DA_IdaSessionHandle,
+    function: String,
+    arguments: Value,
+    output_path: &Path,
+    inline_byte_limit: usize,
+) -> Result<CoreFunctionArtifactResult, IdaError> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut part_name = output_path.as_os_str().to_os_string();
+    part_name.push(".part");
+    let part_path = PathBuf::from(part_name);
+    let _ = std::fs::remove_file(&part_path);
+    let function_c = std::ffi::CString::new(function.clone())
+        .map_err(|_| IdaError::NulByte { field: "function" })?;
+    let arguments_json = serde_json::to_string(&arguments).map_err(|error| IdaError::Native {
+        status: 1,
+        message: error.to_string(),
+    })?;
+    let arguments_c = std::ffi::CString::new(arguments_json)
+        .map_err(|_| IdaError::NulByte { field: "arguments" })?;
+    let output_path_c = path_to_cstring(&part_path, "output_path")?;
+    let mut result = dbgatlas_ida_sys::DA_IdaArtifactResult {
+        struct_size: std::mem::size_of::<dbgatlas_ida_sys::DA_IdaArtifactResult>() as u32,
+        ..Default::default()
+    };
+    let status = unsafe {
+        (adapter.api.core_function_to_file)(
+            handle,
+            function_c.as_ptr(),
+            arguments_c.as_ptr(),
+            output_path_c.as_ptr(),
+            inline_byte_limit as u64,
+            &mut result,
+        )
+    };
+    if status != dbgatlas_ida_sys::DA_IDA_OK {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(native_error(adapter, status));
+    }
+    let preview_json = take_text_view(adapter, result.preview_json)?;
+    let preview: Value = serde_json::from_str(&preview_json).map_err(|error| IdaError::Native {
+        status: 1,
+        message: format!("native IDA preview is not valid JSON: {error}"),
+    })?;
+    if let Err(error) = std::fs::rename(&part_path, output_path) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(error.into());
+    }
+    let warnings = preview
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(CoreFunctionArtifactResult {
+        function,
+        preview,
+        full_byte_len: result.full_byte_len,
+        inline_byte_limit: result.inline_byte_limit,
+        truncated: result.truncated != 0,
         warnings,
     })
 }

@@ -6,7 +6,7 @@ This repository contains the tool implementation. Real investigation data belong
 
 Current implementation includes:
 
-- A `0.2.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
+- A `0.3.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
 - A Rust workspace split into `model`, `workspace`, `adapter`, `core`, `cli`, and a minimal `dbgeng` native wrapper.
 - Debug session lifecycle, per-session worker supervision, named-pipe worker transport, and a minimal real DbgEng loop.
 - Runtime configuration types in `dbgatlas-runtime`, kept separate from workspace manifests.

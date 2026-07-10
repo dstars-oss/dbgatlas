@@ -4,6 +4,7 @@ pub(super) struct RegisteredWorkerWrites {
     pub(super) artifacts: Vec<ArtifactRef>,
     pub(super) raw_output: Option<ArtifactRef>,
     pub(super) raw_output_byte_len: Option<u64>,
+    pub(super) full_result: Option<ArtifactRef>,
     pub(super) memory: Option<ArtifactRef>,
 }
 
@@ -11,37 +12,9 @@ pub(super) fn finalize_debug_command_result(
     result: &mut DebugCommandResult,
     writes: &RegisteredWorkerWrites,
 ) {
-    result.raw_output = writes.raw_output.clone();
-    if result.full_output_artifact_ref.is_none() {
-        result.full_output_artifact_ref = writes.raw_output.clone();
-    }
-    let full_output_byte_len = result
-        .full_output_byte_len
-        .or(writes.raw_output_byte_len)
-        .unwrap_or(result.output.len() as u64);
-    result.full_output_byte_len = Some(full_output_byte_len);
-    result
-        .inline_output_byte_limit
-        .get_or_insert(DEFAULT_INLINE_TEXT_BYTE_LIMIT as u64);
-
-    if result.output.len() > DEFAULT_INLINE_TEXT_BYTE_LIMIT {
-        let preview = inline_text_preview(&result.output, DEFAULT_INLINE_TEXT_BYTE_LIMIT);
-        result.output = preview.text;
-        result.output_truncated = true;
-    }
-    if full_output_byte_len > DEFAULT_INLINE_TEXT_BYTE_LIMIT as u64 {
-        result.output_truncated = true;
-    }
-    if result.output_truncated
-        && !result
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("output truncated"))
-    {
-        result.warnings.push(format!(
-            "output truncated to {} bytes inline; full output saved to raw output artifact",
-            DEFAULT_INLINE_TEXT_BYTE_LIMIT
-        ));
+    if let Some(full_byte_len) = writes.raw_output_byte_len {
+        result.result.full_byte_len = full_byte_len;
+        result.result.truncated = full_byte_len > result.result.value.len() as u64;
     }
 }
 
@@ -50,7 +23,28 @@ pub(super) fn command_result_response(
     status: OperationStatus,
     writes: &RegisteredWorkerWrites,
 ) -> Result<Value, ServiceError> {
-    let mut value = serde_json::to_value(result)?;
+    let full_artifact_ref = writes
+        .full_result
+        .clone()
+        .or_else(|| writes.raw_output.clone())
+        .ok_or_else(|| {
+            ServiceError::Worker("debug command did not produce a full result artifact".to_string())
+        })?;
+    let mut value = json!({
+        "session_id": result.session_id,
+        "operation_id": result.operation_id,
+        "command": result.command,
+        "result": result.result.value,
+        "result_delivery": ResultDelivery {
+            truncated: result.result.truncated,
+            full_byte_len: result.result.full_byte_len,
+            inline_byte_limit: result.result.inline_byte_limit,
+            full_artifact_ref,
+        },
+        "final_state": result.final_state,
+        "warnings": result.warnings,
+        "error": result.error,
+    });
     add_operation_refs(&mut value, status, writes, None)?;
     Ok(value)
 }
@@ -108,12 +102,27 @@ pub(super) fn register_worker_writes(
     let mut artifacts = Vec::new();
     let mut raw_output = None;
     let mut raw_output_byte_len = None;
+    let mut full_result = None;
     let mut memory = None;
     for write in writes {
+        if write.role == Some(WorkerArtifactRole::FullResult) {
+            let path = workspace.resolve_artifact_relative_path(&write.relative_path)?;
+            let actual_len = fs::metadata(&path)?.len();
+            if actual_len != write.byte_len {
+                return Err(ServiceError::Worker(format!(
+                    "full result artifact length mismatch for {}: reported {}, actual {actual_len}",
+                    write.relative_path.display(),
+                    write.byte_len
+                )));
+            }
+        }
         let artifact_id = next_artifact_ref();
         if write.kind == "debug.raw_output" {
             raw_output = Some(artifact_id.clone());
             raw_output_byte_len = Some(write.byte_len);
+        }
+        if write.role == Some(WorkerArtifactRole::FullResult) {
+            full_result = Some(artifact_id.clone());
         }
         if write.kind == "debug.memory" {
             memory = Some(artifact_id.clone());
@@ -133,6 +142,67 @@ pub(super) fn register_worker_writes(
         artifacts,
         raw_output,
         raw_output_byte_len,
+        full_result,
         memory,
     })
+}
+
+pub(super) fn recover_full_result_write(
+    workspace: &Workspace,
+    operation_id: &OperationRef,
+    absolute_path: &Path,
+    relative_path: PathBuf,
+    kind: &str,
+    description: &str,
+) -> Result<RegisteredWorkerWrites, ServiceError> {
+    if !absolute_path.is_file() {
+        return Ok(RegisteredWorkerWrites {
+            artifacts: Vec::new(),
+            raw_output: None,
+            raw_output_byte_len: None,
+            full_result: None,
+            memory: None,
+        });
+    }
+    register_worker_writes(
+        workspace,
+        operation_id,
+        &[WorkerArtifactWrite {
+            relative_path,
+            kind: kind.to_string(),
+            role: Some(WorkerArtifactRole::FullResult),
+            byte_len: fs::metadata(absolute_path)?.len(),
+            description: Some(description.to_string()),
+        }],
+    )
+}
+
+pub(super) fn cleanup_partial_result_write(absolute_final_path: &Path) -> std::io::Result<()> {
+    let mut part_name = absolute_final_path.as_os_str().to_os_string();
+    part_name.push(".part");
+    let part_path = PathBuf::from(part_name);
+    match fs::remove_file(part_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_partial_result_removes_only_the_part_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let final_path = temp.path().join("result.json");
+        let part_path = temp.path().join("result.json.part");
+        fs::write(&final_path, b"complete").unwrap();
+        fs::write(&part_path, b"partial").unwrap();
+
+        cleanup_partial_result_write(&final_path).unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), b"complete");
+        assert!(!part_path.exists());
+    }
 }

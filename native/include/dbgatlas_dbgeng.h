@@ -42,6 +42,15 @@ typedef struct DA_DbgEngTextView {
     void* owner;
 } DA_DbgEngTextView;
 
+typedef struct DA_DbgEngArtifactResult {
+    uint32_t struct_size;
+    uint32_t flags;
+    DA_DbgEngTextView preview;
+    uint64_t full_byte_len;
+    uint64_t inline_byte_limit;
+    int32_t truncated;
+} DA_DbgEngArtifactResult;
+
 typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out);
@@ -64,11 +73,24 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_execute(
     DA_DbgEngSessionHandle* handle,
     const char* command_utf8,
     DA_DbgEngTextView* out);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_execute_to_file(
+    DA_DbgEngSessionHandle* handle,
+    const char* command_utf8,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_DbgEngArtifactResult* out);
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_add_symbols(
     DA_DbgEngSessionHandle* handle,
     const char* symbol_path_utf8,
     int32_t reload,
     DA_DbgEngTextView* out);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_add_symbols_to_file(
+    DA_DbgEngSessionHandle* handle,
+    const char* symbol_path_utf8,
+    int32_t reload,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_DbgEngArtifactResult* out);
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_read_virtual(
     DA_DbgEngSessionHandle* handle,
     uint64_t address,

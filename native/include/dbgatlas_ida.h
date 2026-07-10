@@ -68,6 +68,15 @@ typedef struct DA_IdaCoreResult {
     DA_IdaTextView result_json;
 } DA_IdaCoreResult;
 
+typedef struct DA_IdaArtifactResult {
+    uint32_t struct_size;
+    uint32_t flags;
+    DA_IdaTextView preview_json;
+    uint64_t full_byte_len;
+    uint64_t inline_byte_limit;
+    int32_t truncated;
+} DA_IdaArtifactResult;
+
 typedef struct DA_IdaSessionHandle DA_IdaSessionHandle;
 
 DA_IDA_EXPORT int32_t da_ida_abi_version(DA_IdaVersion* out);
@@ -91,4 +100,11 @@ DA_IDA_EXPORT int32_t da_ida_core_function(
     const char* function_utf8,
     const char* arguments_json_utf8,
     DA_IdaCoreResult* out);
+DA_IDA_EXPORT int32_t da_ida_core_function_to_file(
+    DA_IdaSessionHandle* handle,
+    const char* function_utf8,
+    const char* arguments_json_utf8,
+    const char* output_path_utf8,
+    uint64_t inline_byte_limit,
+    DA_IdaArtifactResult* out);
 DA_IDA_EXPORT int32_t da_ida_session_close(DA_IdaSessionHandle* handle);
