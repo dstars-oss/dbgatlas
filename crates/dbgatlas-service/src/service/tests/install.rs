@@ -591,23 +591,6 @@ fn install_token_treats_blank_values_as_missing() {
 }
 
 #[test]
-fn service_capabilities_read_ida_py_eval_runtime_policy() {
-    let runtime = RuntimeConfig::from_toml_str(
-        r#"
-version = 1
-
-[tools.ida]
-allow_py_eval = true
-"#,
-    )
-    .unwrap();
-
-    let capabilities = ServiceCapabilities::from_runtime_config(&runtime);
-
-    assert!(capabilities.ida_py_eval);
-}
-
-#[test]
 fn install_runtime_config_does_not_persist_auto_debug_stack() {
     let temp = tempfile::tempdir().unwrap();
     let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));

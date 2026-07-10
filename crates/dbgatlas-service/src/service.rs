@@ -326,7 +326,6 @@ pub struct ServiceHost {
 
 #[derive(Clone, Debug, Default)]
 pub struct ServiceCapabilities {
-    pub ida_py_eval: bool,
     pub dbgeng_dirs: Vec<PathBuf>,
     pub ttd_dir: Option<PathBuf>,
 }
@@ -340,7 +339,7 @@ mod host_worker_ops;
 impl ServiceCapabilities {
     pub fn from_runtime_config(runtime: &RuntimeConfig) -> Self {
         let tools = runtime.resolve_tool_paths();
-        Self::from_runtime_config_and_resolved_tools(runtime, tools)
+        Self::from_resolved_tools(tools)
     }
 
     pub fn from_runtime_config_with_install_paths(
@@ -349,15 +348,11 @@ impl ServiceCapabilities {
     ) -> Self {
         let tools =
             runtime.resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(&paths.windbg_runtime_dir);
-        Self::from_runtime_config_and_resolved_tools(runtime, tools)
+        Self::from_resolved_tools(tools)
     }
 
-    fn from_runtime_config_and_resolved_tools(
-        runtime: &RuntimeConfig,
-        tools: dbgatlas_runtime::ResolvedToolPaths,
-    ) -> Self {
+    fn from_resolved_tools(tools: dbgatlas_runtime::ResolvedToolPaths) -> Self {
         Self {
-            ida_py_eval: runtime.tools.ida.allow_py_eval,
             dbgeng_dirs: tools
                 .dbgeng_candidates
                 .iter()

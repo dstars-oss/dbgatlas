@@ -114,6 +114,7 @@ fn http_mcp_tools_list_returns_current_tools() {
         "reverse.inspect_item",
         "reverse.force_recompile",
         "reverse.idb_save",
+        "reverse.py_eval",
         "reverse.find_bytes",
         "reverse.search_text",
         "reverse.query_xrefs",
@@ -153,64 +154,35 @@ fn http_mcp_tools_list_returns_current_tools() {
         );
     }
     assert!(!tools.iter().any(|tool| tool["name"] == "workspace.facts"));
-    assert!(!tools.iter().any(|tool| tool["name"] == "reverse.py_eval"));
     server.stop();
 }
 
 #[test]
-fn http_mcp_tools_list_includes_py_eval_when_enabled() {
-    let server =
-        start_mock_http_service_with_host(ServiceHost::with_mock_workers().with_ida_py_eval(true));
-    let response = post_json(
-        server.endpoint,
-        "/mcp",
-        Some("test-token"),
-        None,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }),
-    );
-
-    assert_eq!(http_status(&response), 200);
-    let body = http_body_json(&response);
-    let tools = body["result"]["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|tool| tool["name"] == "reverse.py_eval"));
-    server.stop();
-}
-
-#[test]
-fn http_mcp_py_eval_call_is_disabled_by_default() {
+fn http_mcp_py_eval_is_available_without_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("sample.exe");
+    fs::write(&database, b"sample").unwrap();
     let server = start_mock_http_service();
-    let response = post_json(
+    let open = mcp_tool_call(
         server.endpoint,
-        "/mcp",
-        Some("test-token"),
-        None,
+        "reverse.session.open",
         json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "reverse.py_eval",
-                "arguments": {
-                    "session_id": { "kind": "reverse", "id": "reverse-1" },
-                    "code": "print('should not run')"
-                }
-            }
+            "project_root": temp.path(),
+            "database_path": database
+        }),
+    );
+    let result = mcp_tool_call(
+        server.endpoint,
+        "reverse.py_eval",
+        json!({
+            "session_id": open["session_id"],
+            "code": "print('runs without an opt-in')"
         }),
     );
 
-    assert_eq!(http_status(&response), 200);
-    let body = http_body_json(&response);
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("disabled by runtime policy")
-    );
+    assert_eq!(result["operation_status"], "success");
+    assert_eq!(result["function"], "py_eval");
+    assert!(result.get("result").is_some());
     server.stop();
 }
 

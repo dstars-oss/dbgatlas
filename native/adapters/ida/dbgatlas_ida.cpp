@@ -1687,8 +1687,8 @@ std::string core_py_eval(const Json& args) {
         throw std::invalid_argument("code is required");
     }
 
-    // Native only executes and captures stdout/stderr/traceback. The Rust
-    // service runtime policy owns the security opt-in for this high-privilege path.
+    // Native executes the snippet and captures stdout/stderr/traceback. Access to
+    // this path uses the same authenticated service boundary as other reverse tools.
     extlang_object_t python = find_extlang_by_name("Python");
     if (python == nullptr) {
         python = find_extlang_by_ext("py");

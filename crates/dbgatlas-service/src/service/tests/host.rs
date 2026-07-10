@@ -507,7 +507,7 @@ fn write_complete_windbg_runtime(root: &Path) {
 
 #[test]
 fn mcp_tool_schemas_expose_structured_targets_and_write_items() {
-    let tools = mcp_tool_descriptors(ServiceCapabilities::default());
+    let tools = mcp_tool_descriptors();
     let debug = tools
         .iter()
         .find(|tool| tool["name"] == "debug.session.create")
@@ -744,10 +744,7 @@ fn mcp_tool_schemas_expose_structured_targets_and_write_items() {
 
 #[test]
 fn mcp_tool_input_schemas_are_top_level_objects() {
-    let tools = mcp_tool_descriptors(ServiceCapabilities {
-        ida_py_eval: true,
-        ..ServiceCapabilities::default()
-    });
+    let tools = mcp_tool_descriptors();
 
     for tool in tools {
         assert_eq!(

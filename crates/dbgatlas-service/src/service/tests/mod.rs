@@ -106,8 +106,41 @@ fn post_json_with_authorization_header(
     }
     write!(stream, "\r\n{body}").unwrap();
     let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
+    if let Err(error) = stream.read_to_string(&mut response)
+        && (error.kind() != std::io::ErrorKind::ConnectionReset
+            || !http_response_is_complete(&response))
+    {
+        panic!("failed to read HTTP response: {error}");
+    }
     response
+}
+
+fn http_response_is_complete(response: &str) -> bool {
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let Some(content_length) = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("Content-Length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    body.len() >= content_length
+}
+
+#[test]
+fn http_response_completeness_rejects_truncated_bodies() {
+    assert!(http_response_is_complete(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+    ));
+    assert!(!http_response_is_complete(
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n{}"
+    ));
+    assert!(!http_response_is_complete(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}"
+    ));
 }
 
 fn http_status(response: &str) -> u16 {

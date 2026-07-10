@@ -1,4 +1,4 @@
-use super::{DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, ServiceCapabilities, ServiceError};
+use super::DEFAULT_SERVICE_UPDATE_TIMEOUT_MS;
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 
@@ -16,43 +16,11 @@ pub(super) enum MethodRoute {
     Audit,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CapabilityGate {
-    Always,
-    IdaPyEval,
-}
-
-impl CapabilityGate {
-    fn is_enabled(self, capabilities: &ServiceCapabilities) -> bool {
-        match self {
-            Self::Always => true,
-            Self::IdaPyEval => capabilities.ida_py_eval,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(super) struct MethodSpec {
     pub(super) name: String,
     pub(super) route: MethodRoute,
-    pub(super) capability_gate: CapabilityGate,
     pub(super) descriptor: Value,
-}
-
-impl MethodSpec {
-    pub(super) fn ensure_available(
-        &self,
-        capabilities: &ServiceCapabilities,
-    ) -> Result<(), ServiceError> {
-        if self.capability_gate.is_enabled(capabilities) {
-            Ok(())
-        } else {
-            Err(ServiceError::Rpc(format!(
-                "{} is disabled by runtime policy",
-                self.name
-            )))
-        }
-    }
 }
 
 pub(super) fn method_spec(name: &str) -> Option<MethodSpec> {
@@ -62,43 +30,31 @@ pub(super) fn method_spec(name: &str) -> Option<MethodSpec> {
         .cloned()
 }
 
-pub(super) fn method_specs(capabilities: ServiceCapabilities) -> Vec<MethodSpec> {
-    registered_method_specs()
-        .iter()
-        .filter(|spec| spec.capability_gate.is_enabled(&capabilities))
-        .cloned()
-        .collect()
+pub(super) fn method_specs() -> Vec<MethodSpec> {
+    registered_method_specs().to_vec()
 }
 
 fn registered_method_specs() -> &'static [MethodSpec] {
     METHOD_SPECS.get_or_init(|| {
-        registered_method_descriptors(ServiceCapabilities {
-            ida_py_eval: true,
-            ..ServiceCapabilities::default()
-        })
-        .into_iter()
-        .map(|descriptor| {
-            let name = descriptor["name"]
-                .as_str()
-                .expect("registered method name is a string")
-                .to_string();
-            MethodSpec {
-                route: method_route(&name),
-                capability_gate: if name == "reverse.py_eval" {
-                    CapabilityGate::IdaPyEval
-                } else {
-                    CapabilityGate::Always
-                },
-                name,
-                descriptor,
-            }
-        })
-        .collect()
+        registered_method_descriptors()
+            .into_iter()
+            .map(|descriptor| {
+                let name = descriptor["name"]
+                    .as_str()
+                    .expect("registered method name is a string")
+                    .to_string();
+                MethodSpec {
+                    route: method_route(&name),
+                    name,
+                    descriptor,
+                }
+            })
+            .collect()
     })
 }
 
-pub(super) fn mcp_tool_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
-    method_specs(capabilities)
+pub(super) fn mcp_tool_descriptors() -> Vec<Value> {
+    method_specs()
         .into_iter()
         .map(|spec| spec.descriptor)
         .collect()
@@ -118,8 +74,8 @@ fn method_route(name: &str) -> MethodRoute {
     }
 }
 
-fn registered_method_descriptors(capabilities: ServiceCapabilities) -> Vec<Value> {
-    let mut tools = vec![
+fn registered_method_descriptors() -> Vec<Value> {
+    let tools = vec![
         mcp_tool(
             "service.health",
             "Return DbgAtlas service health.",
@@ -528,6 +484,11 @@ fn registered_method_descriptors(capabilities: ServiceCapabilities) -> Vec<Value
             })),
         ),
         mcp_tool(
+            "reverse.py_eval",
+            "Execute Python code in the IDA context.",
+            mcp_reverse_core_schema_required(json!({ "code": { "type": "string" } }), &["code"]),
+        ),
+        mcp_tool(
             "reverse.find_bytes",
             "Find byte patterns in the IDA database.",
             mcp_reverse_core_schema_required(
@@ -673,18 +634,6 @@ fn registered_method_descriptors(capabilities: ServiceCapabilities) -> Vec<Value
             project_root_schema(),
         ),
     ];
-    if capabilities.ida_py_eval {
-        let py_eval = mcp_tool(
-            "reverse.py_eval",
-            "Execute Python code in the IDA context.",
-            mcp_reverse_core_schema_required(json!({ "code": { "type": "string" } }), &["code"]),
-        );
-        let insert_at = tools
-            .iter()
-            .position(|tool| tool["name"] == "reverse.find_bytes")
-            .unwrap_or(tools.len());
-        tools.insert(insert_at, py_eval);
-    }
     tools
 }
 
@@ -1049,11 +998,7 @@ mod tests {
 
     #[test]
     fn registered_methods_are_unique_and_have_object_schemas() {
-        let capabilities = ServiceCapabilities {
-            ida_py_eval: true,
-            ..ServiceCapabilities::default()
-        };
-        let specs = method_specs(capabilities);
+        let specs = method_specs();
         let mut names = HashSet::new();
         for spec in &specs {
             assert!(names.insert(spec.name.clone()), "duplicate {}", spec.name);
@@ -1063,12 +1008,12 @@ mod tests {
     }
 
     #[test]
-    fn capability_gate_only_hides_py_eval_from_mcp_inventory() {
-        let names = method_specs(ServiceCapabilities::default())
+    fn canonical_inventory_includes_py_eval_and_excludes_removed_methods() {
+        let names = method_specs()
             .into_iter()
             .map(|spec| spec.name)
             .collect::<HashSet<_>>();
-        assert!(!names.contains("reverse.py_eval"));
+        assert!(names.contains("reverse.py_eval"));
         assert!(method_spec("reverse.py_eval").is_some());
         assert!(!names.contains("workspace.facts"));
         for name in [

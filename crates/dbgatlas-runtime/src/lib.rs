@@ -138,8 +138,6 @@ pub struct IdaRuntimeConfig {
     pub python_executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_src_dir: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_py_eval: bool,
 }
 
 impl IdaRuntimeConfig {
@@ -259,10 +257,6 @@ fn validate_text_value(value: &str, field: &'static str) -> Result<(), RuntimeCo
         return Err(RuntimeConfigError::ControlCharacters { field });
     }
     Ok(())
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,7 +570,6 @@ mode = "none"
             config.tools.symbol_path.as_deref(),
             Some("srv*C:\\symbols*https://msdl.microsoft.com/download/symbols")
         );
-        assert!(!config.tools.ida.allow_py_eval);
         let encoded = toml::to_string(&config).unwrap();
         assert!(!encoded.contains("workspace_id"));
         assert!(!encoded.contains("dbgatlas-workspace"));
@@ -603,23 +596,6 @@ symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
         let encoded = toml::to_string(&config).unwrap();
         assert!(!encoded.contains("dbgeng_dir"));
         assert!(!encoded.contains("ttd_dir"));
-    }
-
-    #[test]
-    fn parses_ida_py_eval_opt_in() {
-        let config = RuntimeConfig::from_toml_str(
-            r#"
-version = 1
-
-[tools.ida]
-allow_py_eval = true
-"#,
-        )
-        .unwrap();
-
-        assert!(config.tools.ida.allow_py_eval);
-        let encoded = toml::to_string(&config).unwrap();
-        assert!(encoded.contains("allow_py_eval = true"));
     }
 
     #[test]

@@ -109,7 +109,7 @@ fn reverse_lookup_records_session_lookup_and_workspace_facts() {
 #[test]
 fn reverse_core_functions_record_artifacts_and_operations() {
     let temp = tempfile::tempdir().unwrap();
-    let host = ServiceHost::with_mock_workers().with_ida_py_eval(true);
+    let host = ServiceHost::with_mock_workers();
     let session_id = open_reverse_session(&host, temp.path());
     let calls = [
         (
@@ -388,22 +388,6 @@ fn reverse_core_legacy_names_are_not_accepted() {
             error
         );
     }
-}
-
-#[test]
-fn reverse_py_eval_is_disabled_by_default() {
-    let temp = tempfile::tempdir().unwrap();
-    let host = ServiceHost::with_mock_workers();
-    let session_id = open_reverse_session(&host, temp.path());
-    let response = reverse_core_rpc(
-        &host,
-        "reverse.py_eval",
-        session_id,
-        json!({ "code": "print('should not run')" }),
-    );
-
-    let error = response.error.expect("reverse.py_eval is rejected");
-    assert!(error.message.contains("disabled by runtime policy"));
 }
 
 #[test]

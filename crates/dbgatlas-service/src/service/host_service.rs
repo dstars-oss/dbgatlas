@@ -30,11 +30,6 @@ impl ServiceHost {
         )))
     }
 
-    pub fn with_ida_py_eval(mut self, enabled: bool) -> Self {
-        self.capabilities.ida_py_eval = enabled;
-        self
-    }
-
     pub fn with_capabilities(mut self, capabilities: ServiceCapabilities) -> Self {
         self.capabilities = capabilities;
         self
@@ -219,7 +214,6 @@ impl ServiceHost {
                 "reverse.session.open" => self.reverse_session_open(params),
                 "reverse.lookup_function" => self.reverse_lookup_function(params),
                 "reverse.session.close" => self.reverse_session_close(params),
-                "reverse.py_eval" => self.reverse_py_eval(params),
                 _ => self.reverse_core_function(
                     name.strip_prefix("reverse.")
                         .expect("reverse method has reverse namespace"),
@@ -293,7 +287,7 @@ impl ServiceHost {
             })),
             "ping" => Ok(json!({})),
             "notifications/initialized" => Ok(json!(null)),
-            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors(self.capabilities.clone()) })),
+            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors() })),
             "tools/call" => {
                 let params: ToolCallParams =
                     serde_json::from_value(request.params.unwrap_or_else(|| json!({})))?;
@@ -321,7 +315,6 @@ impl ServiceHost {
     ) -> Result<ToolCallOutput, ServiceError> {
         let spec = method_spec(name)
             .ok_or_else(|| ServiceError::Rpc(format!("unknown DbgAtlas tool `{name}`")))?;
-        spec.ensure_available(&self.capabilities)?;
         self.call_mcp_service_tool(&spec.name, arguments)
     }
 
@@ -350,21 +343,6 @@ impl ServiceHost {
             output.set_operation_id(operation_id);
         }
         Ok(output)
-    }
-
-    pub(super) fn reverse_py_eval(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        self.ensure_ida_py_eval_enabled()?;
-        self.reverse_core_function("py_eval", params)
-    }
-
-    pub(super) fn ensure_ida_py_eval_enabled(&self) -> Result<(), ServiceError> {
-        if self.capabilities.ida_py_eval {
-            Ok(())
-        } else {
-            Err(ServiceError::Rpc(
-                "reverse.py_eval is disabled by runtime policy".to_string(),
-            ))
-        }
     }
 
     pub(super) fn service_health(&self) -> Result<Value, ServiceError> {

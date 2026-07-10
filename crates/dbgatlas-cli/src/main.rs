@@ -106,8 +106,6 @@ enum ServiceCommand {
         config: Option<PathBuf>,
         #[arg(long, hide = true)]
         token_file: Option<PathBuf>,
-        #[arg(long)]
-        allow_ida_py_eval: bool,
     },
     Health {
         #[arg(long)]
@@ -508,7 +506,6 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
             install_root,
             config,
             token_file,
-            allow_ida_py_eval,
         } => {
             if windows_service {
                 let config_path = config.ok_or_else(|| {
@@ -541,10 +538,7 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
                 );
                 println!("DbgAtlas MCP listening on http://{}/mcp", config.bind);
             }
-            run_http_service(
-                config,
-                ServiceHost::with_process_workers()?.with_ida_py_eval(allow_ida_py_eval),
-            )?;
+            run_http_service(config, ServiceHost::with_process_workers()?)?;
         }
         ServiceCommand::Health { endpoint, token } => {
             let response = call_service(endpoint, token, "service.health", json!({}))?;

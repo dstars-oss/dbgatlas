@@ -88,14 +88,11 @@ the legacy `writes_idb: false` field for compatibility and also records
 `open_operation_writes_idb: false` plus `session_write_capable: true` to make it
 explicit that later calls in the same reverse session may write to the database.
 
-`reverse.py_eval` is a prototype high-privilege escape hatch that executes
-Python code in the open IDA context through IDAPython's external language
-interface. It captures `stdout`, `stderr`, and traceback text in the tool result,
-and is disabled by default at the service layer. Hosts must explicitly enable the
-IDA `py_eval` capability before this RPC is accepted or listed through MCP. In
-installed service mode this is controlled by `[tools.ida] allow_py_eval = true`
-in `runtime.toml`; in development service mode it is controlled by
-`dbgatlas service run --allow-ida-py-eval`.
+`reverse.py_eval` executes Python code in the open IDA context through
+IDAPython's external language interface. It captures `stdout`, `stderr`, and
+traceback text in the tool result. The method is always registered for RPC and
+MCP and requires no method-specific runtime opt-in; it uses the same loopback,
+bearer-token, and Origin access controls as other service methods.
 
 `reverse.search_text` performs case-insensitive substring search over `strings`,
 `names`, `disasm`, `comments`, or `all`. `reverse.find_bytes` supports byte

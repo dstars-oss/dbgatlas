@@ -28,7 +28,6 @@ analysis-workspace/
 - `tools.ida.install_dir`
 - `tools.ida.python_executable`
 - `tools.ida.vendor_src_dir`（历史兼容配置；IDA native adapter 现在使用仓库内固定的 IDA SDK header 快照构建，运行时打开 reverse session 不依赖该配置路径）
-- `tools.ida.allow_py_eval`（默认 `false`；显式开启高权限 `reverse.py_eval` / IDAPython 执行能力）
 - `process.child_identity`
 - `process.fallback_child_identity`
 - `process.elevate_if_admin`
@@ -64,7 +63,7 @@ SCM 注册的 `DbgAtlas` service 指向 `<install-root>\bin\dbgatlas.exe`，不�
 
 安装态 service 日志写入 `<install-root>\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 
-开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 install root。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。开发态如需暴露高权限 IDAPython 执行能力，必须显式传入 `--allow-ida-py-eval`。
+开发态 `dbgatlas service run --bind ... --token ...` 仍直接使用当前进程和当前目录，不注册 SCM，也不写入 install root。同一个 HTTP listener 暴露 `/rpc` 和 `/mcp`；二者复用同一个 bearer token。`reverse.py_eval` 与其他 reverse 方法使用相同的服务访问边界，无需额外的运行时开关。
 
 DbgEng / TTD 路径解析不读取 runtime config 或环境变量中的本地安装路径。安装态 debug worker 默认使用 LocalSystem，由 service 启动参数中的 install root 显式解析 DbgAtlas 受控 runtime，并按当前机器状态自动发现候选，避免把 Store WinDbg 的版本化 WindowsApps 路径写死到 `runtime.toml`。当安装/更新阶段成功复制 Store WinDbg runtime 后，运行时会优先使用 `<install-root>\bin\rt\windbg\<arch>`，因此相关 DbgEng 候选和 TTD recorder 目录会一起切换到 DbgAtlas 受控目录。当 `.run` replay、用户目录 dump 或 live launch 需要交互用户权限时，调用方可在 `debug.session.create` 传入 `worker_identity: "active_interactive_user"`；如果当前交互用户是 UAC split admin，active interactive worker 会优先使用 linked elevated token。TTD `.run` replay 的 target 仍使用 `{ "kind": "file", "path": "trace.run" }`。
 
