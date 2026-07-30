@@ -460,8 +460,22 @@ fn registered_method_descriptors() -> Vec<Value> {
         ),
         mcp_tool(
             "reverse.declare_type",
-            "Declare C types in the IDA local type library. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
-            mcp_reverse_core_schema_required(json!({ "decls": {} }), &["decls"]),
+            "Atomically declare one C declaration block or an array of blocks in the IDA local type library. The complete input is validated before any declarations are committed. This mutates the IDB on success; call reverse.idb_save to persist changes when needed.",
+            mcp_reverse_core_schema_required(
+                json!({
+                    "decls": {
+                        "oneOf": [
+                            { "type": "string" },
+                            {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            }
+                        ],
+                        "description": "A complete C declaration block or an array of complete declaration blocks. Commas inside function prototypes are preserved."
+                    }
+                }),
+                &["decls"],
+            ),
         ),
         mcp_tool(
             "reverse.inspect_item",

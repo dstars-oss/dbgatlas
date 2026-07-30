@@ -855,7 +855,7 @@ fn mcp_tool_input_schemas_are_top_level_objects() {
 }
 
 #[test]
-fn repeated_close_is_rejected_after_session_is_terminal() {
+fn repeated_close_reports_removed_session() {
     let temp = tempfile::tempdir().unwrap();
     let host = ServiceHost::with_mock_workers();
     let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
@@ -874,7 +874,7 @@ fn repeated_close_is_rejected_after_session_is_terminal() {
         method: "debug.session.close".to_string(),
         params: Some(json!({ "session_id": session_id })),
     });
-    assert_eq!(second.error.unwrap().code, -32013);
+    assert_eq!(second.error.unwrap().code, -32010);
 }
 
 #[test]
@@ -965,15 +965,26 @@ fn debug_eval_timeout_kills_worker_and_marks_session_error() {
     let error = eval.error.unwrap();
     assert!(error.message.contains("timed out after 10 ms"));
 
-    let state = host.lock_state().unwrap();
-    let session = state.sessions.values().next().unwrap();
-    assert_eq!(session.state, DebugSessionState::Error);
-    let operation = state
-        .operations
-        .values()
-        .find(|operation| operation.capability == "debug.eval")
-        .unwrap();
-    assert_eq!(operation.status, ServiceOperationStatus::Failed);
+    {
+        let state = host.lock_state().unwrap();
+        let session = state.sessions.values().next().unwrap();
+        assert_eq!(session.state, DebugSessionState::Error);
+        let operation = state
+            .operations
+            .values()
+            .find(|operation| operation.capability == "debug.eval")
+            .unwrap();
+        assert_eq!(operation.status, ServiceOperationStatus::Failed);
+    }
+
+    let cleanup = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(3)),
+        method: "debug.session.kill".to_string(),
+        params: Some(json!({ "session_id": session_id })),
+    });
+    assert!(cleanup.error.is_none(), "{:?}", cleanup.error);
+    assert!(host.lock_state().unwrap().sessions.is_empty());
 }
 
 #[test]
@@ -1139,6 +1150,7 @@ fn kill_does_not_wait_for_running_session_request() {
     assert!(kill.error.is_none(), "{:?}", kill.error);
     assert_eq!(kill.result.unwrap()["state"], "Closed");
     let _ = eval_thread.join().unwrap();
+    assert!(host.lock_state().unwrap().sessions.is_empty());
 }
 
 #[test]
@@ -1159,18 +1171,18 @@ fn concurrent_close_rechecks_latest_session_state() {
         .iter()
         .filter(|response| response.error.is_none())
         .count();
-    let terminal_count = responses
+    let missing_count = responses
         .iter()
         .filter(|response| {
             response
                 .error
                 .as_ref()
-                .is_some_and(|error| error.code == -32013)
+                .is_some_and(|error| error.code == -32010)
         })
         .count();
 
     assert_eq!(success_count, 1);
-    assert_eq!(terminal_count, 1);
+    assert_eq!(missing_count, 1);
 }
 
 #[test]
@@ -1188,7 +1200,7 @@ fn eval_after_concurrent_close_rechecks_latest_session_state() {
     std::thread::sleep(Duration::from_millis(10));
     let eval = std::thread::spawn(move || eval_request(&eval_host, eval_session, ".echo late"));
     assert!(close.join().unwrap().error.is_none());
-    assert_eq!(eval.join().unwrap().error.unwrap().code, -32012);
+    assert_eq!(eval.join().unwrap().error.unwrap().code, -32010);
 }
 
 #[test]

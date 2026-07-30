@@ -284,26 +284,30 @@ struct DbgEngSession final {
     }
 };
 
+std::string wide_to_utf8(const std::wstring& text);
+
 std::string hresult_message(HRESULT hr) {
-    char buffer[256] = {};
-    const auto written = FormatMessageA(
+    wchar_t buffer[256] = {};
+    const auto written = FormatMessageW(
         FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr,
         static_cast<DWORD>(hr),
         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
         buffer,
-        static_cast<DWORD>(sizeof(buffer)),
+        static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])),
         nullptr);
     std::string message = "HRESULT 0x";
     char hr_text[16] = {};
     std::snprintf(hr_text, sizeof(hr_text), "%08X", static_cast<unsigned int>(hr));
     message += hr_text;
     if (written > 0) {
-        message += ": ";
-        message += buffer;
-        while (!message.empty() && (message.back() == '\r' || message.back() == '\n')) {
-            message.pop_back();
+        std::wstring system_message(buffer, written);
+        while (!system_message.empty() &&
+               (system_message.back() == L'\r' || system_message.back() == L'\n')) {
+            system_message.pop_back();
         }
+        message += ": ";
+        message += wide_to_utf8(system_message);
     }
     return message;
 }
@@ -328,23 +332,23 @@ std::wstring utf8_to_wide(const char* text) {
 }
 
 std::string windows_error_message(DWORD error) {
-    char buffer[256] = {};
-    const auto written = FormatMessageA(
+    wchar_t buffer[256] = {};
+    const auto written = FormatMessageW(
         FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr,
         error,
         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
         buffer,
-        static_cast<DWORD>(sizeof(buffer)),
+        static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])),
         nullptr);
     if (written == 0) {
         return "Win32 error " + std::to_string(error);
     }
-    std::string message(buffer, written);
-    while (!message.empty() && (message.back() == '\r' || message.back() == '\n')) {
+    std::wstring message(buffer, written);
+    while (!message.empty() && (message.back() == L'\r' || message.back() == L'\n')) {
         message.pop_back();
     }
-    return message;
+    return wide_to_utf8(message);
 }
 
 std::string wide_to_utf8(const std::wstring& text) {

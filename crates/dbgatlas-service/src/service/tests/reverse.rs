@@ -375,16 +375,45 @@ fn reverse_write_results_include_diagnostics() {
     assert!(declare.error.is_none(), "{:?}", declare.error);
     let declare = declare.result.unwrap();
     assert_eq!(declare["result"]["ok"], false);
-    assert_eq!(declare["result"]["changed_count"], 1);
+    assert_eq!(declare["result"]["atomic"], true);
+    assert_eq!(declare["result"]["changed_count"], 0);
     assert_eq!(declare["result"]["errors"], 1);
-    assert_eq!(declare["result"]["items"][0]["ok"], true);
+    assert_eq!(declare["result"]["items"][0]["ok"], false);
+    assert_eq!(declare["result"]["items"][0]["committed"], false);
     assert_eq!(declare["result"]["items"][1]["ok"], false);
     assert!(
         declare["result"]["items"][1]["hint"]
             .as_str()
             .unwrap()
-            .contains("failed to parse")
+            .contains("no declarations were committed")
     );
+}
+
+#[test]
+fn reverse_declare_type_preserves_function_pointer_parameter_commas() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::with_mock_workers();
+    let session_id = open_reverse_session(&host, temp.path());
+    let declaration = r#"typedef unsigned int (__fastcall *CEVA_ApiHandler_t)(
+        void *engine_ctx,
+        const unsigned int *args,
+        CEVA_GuestCpuState32_t *guest,
+        const CEVA_ApiCallContext_t *call_ctx);"#;
+
+    let response = reverse_core_rpc(
+        &host,
+        "reverse.declare_type",
+        session_id,
+        json!({ "decls": declaration }),
+    );
+
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = &response.result.unwrap()["result"];
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["atomic"], true);
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["changed_count"], 1);
+    assert_eq!(result["items"][0]["decl"], declaration);
 }
 
 #[test]

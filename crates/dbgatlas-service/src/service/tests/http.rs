@@ -60,6 +60,41 @@ fn http_mcp_initialize_returns_capabilities() {
 }
 
 #[test]
+fn http_handler_waits_for_a_delayed_request_body() {
+    let server = start_mock_http_service();
+    let body = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    }))
+    .unwrap();
+    let mut stream = TcpStream::connect(server.endpoint).unwrap();
+    write!(
+        stream,
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        server.endpoint,
+        body.len()
+    )
+    .unwrap();
+    stream.flush().unwrap();
+
+    // Give the accept loop time to hand the partially received request to a
+    // handler. The handler must block for the remaining body bytes.
+    std::thread::sleep(Duration::from_millis(150));
+    stream.write_all(body.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+
+    assert_eq!(http_status(&response), 200);
+    assert_eq!(
+        http_body_json(&response)["result"]["serverInfo"]["name"],
+        "dbgatlas-mcp"
+    );
+    server.stop();
+}
+
+#[test]
 fn http_mcp_tools_list_returns_current_tools() {
     let server = start_mock_http_service();
     let response = post_json(

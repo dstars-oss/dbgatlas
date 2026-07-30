@@ -637,6 +637,20 @@ pub fn run_http_service_until(
             }
             Err(error) => return Err(error.into()),
         };
+        // On Windows an accepted socket can inherit the listener's nonblocking
+        // mode. Request handlers use blocking reads, so restore blocking mode
+        // before handing the stream to a worker thread.
+        if let Err(error) = stream.set_nonblocking(false) {
+            append_http_diagnostic_log(
+                "configure_stream",
+                &DiagnosticContext {
+                    remote_addr: Some(peer_addr.to_string()),
+                    ..Default::default()
+                },
+                &error.to_string(),
+            );
+            continue;
+        }
         let config = config.clone();
         let host = host.clone();
         shutdown.handler_started();

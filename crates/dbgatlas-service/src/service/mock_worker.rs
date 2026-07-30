@@ -637,39 +637,66 @@ pub(super) fn mock_generated_decl(type_text: &str) -> String {
 }
 
 pub(super) fn mock_declare_type(arguments: &Value) -> Value {
-    let decls = normalize_core_list(arguments.get("decls").unwrap_or(&Value::Null));
+    let decls = normalize_declaration_blocks(arguments.get("decls").unwrap_or(&Value::Null));
+    let ok = decls
+        .iter()
+        .all(|decl| !decl.to_ascii_lowercase().contains("invalid"));
+    let errors = usize::from(!ok);
     let items: Vec<Value> = decls
         .iter()
         .enumerate()
         .map(|(index, decl)| {
-            let ok = !decl.to_ascii_lowercase().contains("invalid");
-            let errors = if ok { 0 } else { 1 };
             let mut item = json!({
                 "index": index,
                 "ok": ok,
+                "committed": ok,
                 "errors": errors,
                 "decl": decl
             });
             if !ok {
                 item["hint"] = json!(
-                    "IDA failed to parse this declaration; try declaring dependent typedefs separately or remove unsupported calling-convention syntax"
+                    "IDA failed to parse the declaration block; no declarations were committed"
                 );
             }
             item
         })
         .collect();
-    let errors = items
-        .iter()
-        .filter(|item| !item["ok"].as_bool().unwrap_or(false))
-        .count();
-    let changed_count = items.len().saturating_sub(errors);
     json!({
-        "ok": errors == 0,
+        "ok": ok,
+        "atomic": true,
         "count": decls.len(),
-        "changed_count": changed_count,
+        "changed_count": if ok { decls.len() } else { 0 },
         "errors": errors,
+        "diagnostics": if ok {
+            Vec::<String>::new()
+        } else {
+            vec!["mock parser: invalid declaration".to_string()]
+        },
         "items": items
     })
+}
+
+fn normalize_declaration_blocks(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(text) => text.trim().to_string(),
+                other => other.to_string(),
+            })
+            .filter(|item| !item.is_empty())
+            .collect(),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text.to_string()]
+            }
+        }
+        Value::Null => Vec::new(),
+        other => vec![other.to_string()],
+    }
 }
 
 pub(super) fn mock_inspect_item(arguments: &Value) -> Result<Value, ServiceError> {

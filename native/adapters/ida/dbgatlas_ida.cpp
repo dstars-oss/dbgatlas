@@ -5,6 +5,8 @@
 
 #include "dbgatlas_ida_runtime.h"
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 #ifdef _WIN32
@@ -29,6 +31,7 @@ namespace {
 using Json = nlohmann::json;
 
 thread_local std::string g_last_error;
+thread_local std::vector<std::string>* g_type_parse_diagnostics = nullptr;
 std::mutex g_session_mutex;
 bool g_active_session = false;
 
@@ -431,6 +434,40 @@ std::vector<std::string> json_list_value(const Json& value) {
 std::vector<std::string> json_list_arg(const Json& args, const char* key) {
     const Json* value = json_arg(args, key);
     return value == nullptr ? std::vector<std::string>() : json_list_value(*value);
+}
+
+int idaapi type_parse_printer(const char* format, ...) {
+    if (g_type_parse_diagnostics == nullptr || format == nullptr) {
+        return 0;
+    }
+    char buffer[4096] = {};
+    va_list args;
+    va_start(args, format);
+    const int written = std::vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    if (written > 0) {
+        const size_t length = std::min(static_cast<size_t>(written), sizeof(buffer) - 1);
+        std::string diagnostic = trim_copy(std::string(buffer, length));
+        if (!diagnostic.empty()) {
+            g_type_parse_diagnostics->push_back(std::move(diagnostic));
+        }
+    }
+    return written;
+}
+
+int parse_type_declaration_block(
+        const std::string& source,
+        int flags,
+        std::vector<std::string>* diagnostics) {
+    struct DiagnosticScope {
+        explicit DiagnosticScope(std::vector<std::string>* value) {
+            g_type_parse_diagnostics = value;
+        }
+        ~DiagnosticScope() {
+            g_type_parse_diagnostics = nullptr;
+        }
+    } scope(diagnostics);
+    return parse_decls(get_idati(), source.c_str(), type_parse_printer, flags);
 }
 
 std::vector<Json> json_items_arg(const Json& args, const char* key) {
@@ -1573,41 +1610,61 @@ std::string core_declare_type(const Json& args) {
     std::vector<std::string> decls;
     const Json* raw_decls = json_arg(args, "decls");
     if (raw_decls != nullptr) {
-        decls = json_list_value(*raw_decls);
+        if (raw_decls->is_array()) {
+            decls = json_list_value(*raw_decls);
+        } else if (!raw_decls->is_null()) {
+            std::string declaration_block = trim_copy(json_scalar_text(*raw_decls));
+            if (!declaration_block.empty()) {
+                decls.push_back(std::move(declaration_block));
+            }
+        }
     }
-    Json rows = Json::array();
-    size_t changed = 0;
-    int errors = 0;
-    for (size_t index = 0; index < decls.size(); ++index) {
-        std::string normalized = trim_copy(decls[index]);
+    std::string source;
+    for (const auto& decl : decls) {
+        std::string normalized = trim_copy(decl);
         if (!normalized.empty() && normalized.back() != ';') {
             normalized.push_back(';');
         }
-        normalized.push_back('\n');
-        int item_errors = parse_decls(get_idati(), normalized.c_str(), nullptr, HTI_DCL | HTI_NWR);
-        bool item_ok = item_errors == 0;
-        if (item_ok) {
-            ++changed;
-        } else {
-            errors += item_errors;
-        }
+        source += normalized;
+        source.push_back('\n');
+    }
+
+    std::vector<std::string> diagnostics;
+    int errors = source.empty()
+        ? 0
+        : parse_type_declaration_block(
+              source,
+              HTI_DCL | HTI_NWR | HTI_TST,
+              &diagnostics);
+    if (errors == 0 && !source.empty()) {
+        diagnostics.clear();
+        errors = parse_type_declaration_block(
+            source,
+            HTI_DCL | HTI_NWR,
+            &diagnostics);
+    }
+    const bool ok = errors == 0;
+    Json rows = Json::array();
+    for (size_t index = 0; index < decls.size(); ++index) {
         Json item = {
             {"index", index},
-            {"ok", item_ok},
-            {"errors", item_errors},
+            {"ok", ok},
+            {"committed", ok},
+            {"errors", ok ? 0 : errors},
             {"decl", decls[index]}
         };
-        if (!item_ok) {
-            item["hint"] = "IDA failed to parse this declaration; try declaring dependent typedefs separately or remove unsupported calling-convention syntax";
+        if (!ok) {
+            item["hint"] = "IDA failed to parse the declaration block; no declarations were committed";
         }
         rows.push_back(std::move(item));
     }
-    bool ok = errors == 0;
     return Json{
         {"ok", ok},
+        {"atomic", true},
         {"count", decls.size()},
-        {"changed_count", changed},
+        {"changed_count", ok ? decls.size() : 0},
         {"errors", errors},
+        {"diagnostics", diagnostics},
         {"items", rows}
     }.dump();
 }

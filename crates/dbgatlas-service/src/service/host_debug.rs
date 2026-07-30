@@ -161,7 +161,7 @@ impl ServiceHost {
                 .cloned()
                 .ok_or_else(|| ServiceError::SessionNotFound(params.session_id.to_string()))?
         };
-        if session.state.is_terminal() {
+        if session.state == DebugSessionState::Closed {
             return Err(ServiceError::SessionAlreadyTerminal(
                 params.session_id.to_string(),
             ));
@@ -189,7 +189,7 @@ impl ServiceHost {
                 .cloned()
                 .ok_or_else(|| ServiceError::SessionNotFound(params.session_id.to_string()))?
         };
-        if session.state.is_terminal() {
+        if session.state == DebugSessionState::Closed {
             return Err(ServiceError::SessionAlreadyTerminal(
                 params.session_id.to_string(),
             ));
@@ -201,48 +201,54 @@ impl ServiceHost {
             )));
         }
         let operation_id = next_operation_ref();
-        match mode {
-            SessionFinishMode::Close => {
-                let close_response = self.supervisor.request_worker(
-                    &session.worker,
-                    WorkerRequest::CloseSession {
-                        session_id: session.session_id.clone(),
-                    },
-                );
-                match close_response {
-                    Err(error) => {
-                        let cleanup = self.supervisor.kill_worker(&session.worker);
-                        self.mark_debug_session_error(&session.session_id)?;
-                        let cleanup_message = match cleanup {
-                            Ok(()) => "worker was killed after close failure".to_string(),
-                            Err(cleanup_error) => format!(
-                                "worker cleanup also failed: {cleanup_error}; use debug.session.kill"
-                            ),
-                        };
-                        return Err(ServiceError::Worker(format!(
-                            "debug.session.close could not complete cooperatively: {error}; {cleanup_message}"
-                        )));
-                    }
-                    Ok(WorkerResponse::Ok { .. }) => {
-                        self.supervisor.close_worker(&session.worker)?
-                    }
-                    Ok(WorkerResponse::Failed { code, message, .. }) => {
-                        return Err(ServiceError::Worker(format!(
-                            "{code}: {message}; use debug.session.kill if the worker is stuck"
-                        )));
-                    }
-                    Ok(other) => {
-                        return Err(ServiceError::Worker(format!(
-                            "unexpected close response: {other:?}; use debug.session.kill if the worker is stuck"
-                        )));
+        if session.state != DebugSessionState::Error {
+            match mode {
+                SessionFinishMode::Close => {
+                    let close_response = self.supervisor.request_worker(
+                        &session.worker,
+                        WorkerRequest::CloseSession {
+                            session_id: session.session_id.clone(),
+                        },
+                    );
+                    match close_response {
+                        Err(error) => {
+                            let cleanup = self.supervisor.kill_worker(&session.worker);
+                            self.mark_debug_session_error(&session.session_id)?;
+                            let cleanup_message = match cleanup {
+                                Ok(()) => "worker was killed after close failure".to_string(),
+                                Err(cleanup_error) => format!(
+                                    "worker cleanup also failed: {cleanup_error}; use debug.session.kill"
+                                ),
+                            };
+                            return Err(ServiceError::Worker(format!(
+                                "debug.session.close could not complete cooperatively: {error}; {cleanup_message}"
+                            )));
+                        }
+                        Ok(WorkerResponse::Ok { .. }) => {
+                            self.supervisor.close_worker(&session.worker)?
+                        }
+                        Ok(WorkerResponse::Failed { code, message, .. }) => {
+                            return Err(ServiceError::Worker(format!(
+                                "{code}: {message}; use debug.session.kill if the worker is stuck"
+                            )));
+                        }
+                        Ok(other) => {
+                            return Err(ServiceError::Worker(format!(
+                                "unexpected close response: {other:?}; use debug.session.kill if the worker is stuck"
+                            )));
+                        }
                     }
                 }
+                SessionFinishMode::Kill => self.supervisor.kill_worker(&session.worker)?,
             }
-            SessionFinishMode::Kill => self.supervisor.kill_worker(&session.worker)?,
         }
         session.state = DebugSessionState::Closed;
         session.updated_at = Timestamp::now();
         session.last_operation = Some(operation_id.clone());
+        {
+            let mut state = self.lock_state()?;
+            state.sessions.remove(session.session_id.id.as_str());
+        }
         let workspace = Workspace::open(&session.internal_workspace_root)?;
         let capability = match mode {
             SessionFinishMode::Close => "debug.session.close",
@@ -269,9 +275,6 @@ impl ServiceHost {
         state
             .operations
             .insert(operation_id.id.as_str().to_string(), operation);
-        state
-            .sessions
-            .insert(session.session_id.id.as_str().to_string(), session.clone());
         Ok(json!({
             "session_id": session.session_id,
             "state": session.state,
