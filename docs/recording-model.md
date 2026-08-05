@@ -36,6 +36,7 @@ CLI 方向与 service capability 对齐：
 ```powershell
 dbgatlas recording start --project-root <path> --launch <exe> [-- <args>]
 dbgatlas recording start --project-root <path> --attach <pid>
+dbgatlas recording start --project-root <path> --attach <pid> --preset cpu --cpu-interval-us 1000 --cpu-max-trace-size-mb 512
 dbgatlas recording status <recording-id>
 dbgatlas recording stop <recording-id>
 dbgatlas recording cancel <recording-id>
@@ -46,7 +47,7 @@ dbgatlas recording ttd --project-root <path> --attach <pid> --timeout-ms <ms> --
 dbgatlas recording ttd --project-root <path> --monitor <program> --timeout-ms <ms>
 ```
 
-`launch` 和 `attach` 都以 process tree 为过滤核心。`attach` 不回填历史状态，只记录 `recording.start` 之后观察到的事件，并在 `recording.json` 中标明 attach mode、root pid 和 start timestamp。
+`launch` 和 `attach` 都以 process tree 为过滤核心。`attach` 不回填历史事件，只记录 `recording.start` 之后观察到的事件；CPU preset 会在启动 consumer 前用 Toolhelp 预填当时已有的子进程、线程和模块表，作为后续样本过滤和 `module+RVA` 解析上下文。
 
 ## Collection
 
@@ -64,8 +65,9 @@ Recording 采用 C++ ETW adapter + Rust safe wrapper 的边界：
 - `file`
 - `registry`
 - `network`
+- `cpu`（opt-in，不进入默认 presets）
 
-后续可以在不破坏 preset 主路径的前提下增加高级 override，但 recording 主路径和验收不依赖用户自定义 provider。
+`cpu_sampling` 只能与 `cpu` preset 同时使用。`interval_us` 默认 `1000`，范围 `125..=1_000_000`；`max_trace_size_mb` 默认 `512`，范围 `64..=4096`。CPU recording 使用 system logger 的 `SampledProfile`、process/thread/image 和 Profile StackWalk；服务内同时只允许一个活动 CPU recording。普通开发态进程权限不足时启动直接失败，不自动提权。
 
 ## Artifact Layout
 
@@ -77,6 +79,7 @@ artifacts/
     <recording_id>/
       recording.json
       trace.etl
+      # CPU ETL 过滤失败时改名为 trace.unfiltered.etl
       events/
         process.jsonl
         thread.jsonl
@@ -84,6 +87,10 @@ artifacts/
         file.jsonl
         registry.jsonl
         network.jsonl
+        cpu.jsonl
+      cpu/
+        hotspots.json
+        stacks.folded
       traces/
         sample.run
         sample.idx
@@ -105,9 +112,11 @@ artifacts/
 - `adapter` 和 runtime 摘要。
 - `operation_id` 和主要 artifact refs。
 
-`trace.etl` 是过滤后的 ETL artifact。它不是完整 system-wide 原始 ETL，而是由 recording worker 根据 process tree 和 preset 过滤后的可复现材料。
+`trace.etl` 是过滤后的 ETL artifact。CPU preset 使用有 `max_trace_size_mb` 上限的 circular ETL；过滤失败时保留为 `trace.unfiltered.etl`，并在 `recording.json.trace.target_filtered=false` 及 warnings 中明确标记，不能声称为目标专属 trace。
 
 `events/*.jsonl` 是按 category 拆分的低层事件流。每一行是一条规范化事件，同时保留 ETW provenance 和 raw payload，方便后续审计和重新解释。
+
+CPU 的实时 `events/cpu.jsonl` 是完整目标样本的权威数据，stop 后只在实时 consumer 失败时才从 ETL 离线回退，避免重复追加。`cpu/hotspots.json` 保存确定性排序的 top 100 frame/stack、样本占比、估算 CPU time 及进程/线程分布；`cpu/stacks.folded` 保存全部唯一 root-to-leaf 栈，可直接交给 FlameGraph 工具。`recording.stop/status` 的 `cpu_summary` 只内联 top 20；running 状态为 `null`。
 
 TTD recording 使用同一 `artifacts/recordings/<recording_id>/` namespace。`recording.json` 的 `adapter.kind` 为 `ttd`，`traces/*.run` / `traces/*.idx` 登记为 `recording.ttd.trace` / `recording.ttd.index`，recorder stdout/stderr 登记为 `recording.recorder_output`，事件审计写入 `events.jsonl`。`recording.ttd` tool result 也会直接返回 `primary_trace_path`、`trace_paths`、`trace_index_paths` 和 `.run` 对应的 `trace_artifacts`，便于后续用 `debug.session.create` 的 `{ "kind": "file", "path": "<trace.run>" }` replay。
 
@@ -172,12 +181,15 @@ Category-specific normalized fields:
 - `file.jsonl`：file create/open/read/write/close/delete/rename、path、operation、status、byte count。
 - `registry.jsonl`：key/value create/open/query/set/delete、key path、value name、value type、status。
 - `network.jsonl`：connect/accept/send/receive/close、protocol、local/remote endpoint、status、byte count。
+- `cpu.jsonl`：SampledProfile 的 pid/tid、processor、IP、applied interval、地址、`module+RVA` 与 leaf-to-root StackWalk；未匹配 StackWalk 时保留 sampled IP 的 leaf-only 样本并计入质量告警。
 
 FileIo 事件使用 best-effort completion 合并。read/write/create 等 begin-side 事件如果带有 `IrpPtr`，adapter 可暂存该事件，直到匹配的 `OpEnd` 到达后把 `nt_status`、`extra_info` 和 `completion_*` 字段合并到同一行；未匹配的 `OpEnd` 不作为独立低层事实输出，而是在 `recording.json.event_extraction` 的 counters/warnings 中说明。文件路径优先来自事件直接 path 字段；若缺失，可通过 `FileObject` / `FileKey` 路径缓存恢复，并在 `file.path_source` 中标明来源。无法恢复时保留 raw pointer 字段，不推断 path。
 
 ETW recording 默认尽力为写入 `events/*.jsonl` 的事件补充调用堆栈。`stack.frames` 是字符串数组，输出为常见调用栈展示顺序：当前执行点/叶子帧在前，调用者在后。frame 格式优先使用 `module_name+0xoffset`；模块归属仅来自 ETW image load/unload 事件维护的进程内模块表，不读取 PDB、不调用 DIA/DbgHelp、不解析函数名。若某帧找不到模块归属，则保留原始指令地址字符串。adapter 可以同时使用 event extended data 和独立 StackWalk event，并按 timestamp、pid、thread 做 best-effort 关联；未匹配或因 bounded cache 丢弃的 StackWalk 只进入 `recording.json.event_extraction` counters/warnings。若系统、provider 或事件本身不提供 stack 数据，则省略 `stack` 字段，并在 `recording.json` 的 `stack_trace` / `event_extraction` metadata 中以 best-effort 状态和 warnings 说明降级。
 
 `recording.json.event_extraction` 记录 adapter 对过滤后 ETL 抽取 JSONL 的质量摘要，包括写出事件数、文件数、跳过数、stack frame resolved/unresolved 计数、FileIo path resolved/unresolved 计数、OpEnd 匹配/未匹配计数、未完成 IO、IRP 复用和 dropped StackWalk。它是审计和降级说明，不替代 `events/*.jsonl` 中的事实行。
+
+`recording.json.cpu_sampling` 记录 requested/applied/previous interval、条件恢复结果、ETL 上限、样本/StackWalk 配对计数、buffer/event loss 以及过滤和降级 warnings。DbgAtlas 仅在停止时观察到当前 interval 仍等于自身 applied 值时恢复 previous 值，避免覆盖外部 profiler 的后续修改。
 
 字段缺失时应显式省略或使用 `null`，不能用推断值伪装为 ETW 事实。解释、假设和结论仍写入 `analysis/` Markdown。
 

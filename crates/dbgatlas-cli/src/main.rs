@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use dbgatlas_debug::DebugTarget;
 use dbgatlas_recording::{
-    RecordingTarget, TtdRecordMode, TtdRecordingOptions, TtdReplayCpuSupport, TtdTarget,
+    DEFAULT_CPU_SAMPLING_INTERVAL_US, DEFAULT_CPU_TRACE_SIZE_MB, RecordingPreset, RecordingTarget,
+    TtdRecordMode, TtdRecordingOptions, TtdReplayCpuSupport, TtdTarget,
 };
 use dbgatlas_service::{
     DEFAULT_SERVICE_UPDATE_TIMEOUT_MS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
@@ -290,6 +291,12 @@ enum RecordingCommand {
         launch: Option<PathBuf>,
         #[arg(long)]
         attach: Option<u32>,
+        #[arg(long = "preset")]
+        presets: Vec<String>,
+        #[arg(long)]
+        cpu_interval_us: Option<u32>,
+        #[arg(long)]
+        cpu_max_trace_size_mb: Option<u32>,
         #[arg(last = true)]
         args: Vec<String>,
         #[arg(long)]
@@ -759,6 +766,9 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
             project_root,
             launch,
             attach,
+            presets,
+            cpu_interval_us,
+            cpu_max_trace_size_mb,
             args,
             endpoint,
             token,
@@ -777,15 +787,25 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
                 }
                 _ => anyhow::bail!("provide exactly one of --launch or --attach"),
             };
-            let response = call_service(
-                endpoint,
-                token,
-                "recording.start",
-                json!({
-                    "project_root": project_root,
-                    "target": target,
-                }),
-            )?;
+            let mut params = json!({
+                "project_root": project_root,
+                "target": target,
+            });
+            if !presets.is_empty() {
+                params["presets"] = serde_json::to_value(
+                    presets
+                        .iter()
+                        .map(|preset| parse_recording_preset(preset))
+                        .collect::<Result<Vec<_>>>()?,
+                )?;
+            }
+            if cpu_interval_us.is_some() || cpu_max_trace_size_mb.is_some() {
+                params["cpu_sampling"] = json!({
+                    "interval_us": cpu_interval_us.unwrap_or(DEFAULT_CPU_SAMPLING_INTERVAL_US),
+                    "max_trace_size_mb": cpu_max_trace_size_mb.unwrap_or(DEFAULT_CPU_TRACE_SIZE_MB),
+                });
+            }
+            let response = call_service(endpoint, token, "recording.start", params)?;
             print_rpc_response(response, as_json)
         }
         RecordingCommand::Ttd {
@@ -983,6 +1003,21 @@ fn resolve_client_connection(
     })
 }
 
+fn parse_recording_preset(value: &str) -> Result<RecordingPreset> {
+    match value {
+        "process" => Ok(RecordingPreset::Process),
+        "thread" => Ok(RecordingPreset::Thread),
+        "image" => Ok(RecordingPreset::Image),
+        "file" => Ok(RecordingPreset::File),
+        "registry" => Ok(RecordingPreset::Registry),
+        "network" => Ok(RecordingPreset::Network),
+        "cpu" => Ok(RecordingPreset::Cpu),
+        _ => anyhow::bail!(
+            "unsupported recording preset `{value}`; expected process, thread, image, file, registry, network, or cpu"
+        ),
+    }
+}
+
 fn parse_ttd_record_mode(value: &str) -> Result<TtdRecordMode> {
     match value {
         "automatic" => Ok(TtdRecordMode::Automatic),
@@ -1140,4 +1175,48 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
         return Ok(path);
     }
     Ok(std::env::current_dir()?.join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_repeatable_cpu_recording_options() {
+        let cli = Cli::try_parse_from([
+            "dbgatlas",
+            "recording",
+            "start",
+            "--project-root",
+            ".",
+            "--attach",
+            "42",
+            "--preset",
+            "process",
+            "--preset",
+            "cpu",
+            "--cpu-interval-us",
+            "2000",
+            "--cpu-max-trace-size-mb",
+            "256",
+        ])
+        .unwrap();
+        let Commands::Recording {
+            command:
+                RecordingCommand::Start {
+                    presets,
+                    cpu_interval_us,
+                    cpu_max_trace_size_mb,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected recording start command");
+        };
+        assert_eq!(presets, ["process", "cpu"]);
+        assert_eq!(cpu_interval_us, Some(2000));
+        assert_eq!(cpu_max_trace_size_mb, Some(256));
+        assert_eq!(parse_recording_preset("cpu").unwrap(), RecordingPreset::Cpu);
+        assert!(parse_recording_preset("unknown").is_err());
+    }
 }

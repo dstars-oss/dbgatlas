@@ -45,6 +45,7 @@ ETW recording artifact 目录为：
 artifacts/recordings/<recording_id>/
   recording.json
   trace.etl
+  # CPU 过滤失败时为 trace.unfiltered.etl
   events/
     process.jsonl
     thread.jsonl
@@ -52,9 +53,13 @@ artifacts/recordings/<recording_id>/
     file.jsonl
     registry.jsonl
     network.jsonl
+    cpu.jsonl
+  cpu/
+    hotspots.json
+    stacks.folded
 ```
 
-`recording.json` 保存 target、mode、process tree filter、presets、start/stop timestamp、adapter/runtime 摘要和 operation/artifact refs。`trace.etl` 保存过滤后的 ETL。`events/*.jsonl` 保存按 category 拆分的低层 ETW-derived event records，不生成全局 `timeline.jsonl`。
+`recording.json` 保存 target、mode、process tree filter、presets、start/stop timestamp、adapter/runtime 摘要和 operation/artifact refs。`trace.etl` 保存过滤后的 ETL；CPU 过滤失败时明确保留为 `trace.unfiltered.etl`。`events/*.jsonl` 保存按 category 拆分的低层 ETW-derived event records；CPU 额外生成 hotspot 与 folded stack 产物，不生成全局 `timeline.jsonl`。
 
 ## Manifest
 

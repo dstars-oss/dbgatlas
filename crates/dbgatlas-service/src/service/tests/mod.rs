@@ -4,6 +4,157 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug)]
+enum MockEtwMode {
+    Success,
+    StartFailure,
+    ConsumerFailure,
+    ZeroSamples,
+}
+
+#[derive(Debug)]
+struct MockEtwController {
+    mode: MockEtwMode,
+    stop_count: Arc<AtomicU64>,
+}
+
+impl EtwController for MockEtwController {
+    fn start(
+        &self,
+        _session_name: &str,
+        trace_path: &Path,
+        _presets: dbgatlas_etw::EtwPresetFlags,
+        cpu_sampling: Option<CpuSamplingOptions>,
+    ) -> Result<Box<dyn EtwSessionControl>, dbgatlas_etw::EtwError> {
+        if matches!(self.mode, MockEtwMode::StartFailure) {
+            return Err(dbgatlas_etw::EtwError::Native {
+                status: 5,
+                message: "mock profile privilege denied".to_string(),
+            });
+        }
+        fs::write(trace_path, b"mock-etl").map_err(|error| dbgatlas_etw::EtwError::Native {
+            status: -1,
+            message: error.to_string(),
+        })?;
+        Ok(Box::new(MockEtwSession {
+            mode: self.mode,
+            cpu_sampling,
+            stop_count: self.stop_count.clone(),
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct MockEtwSession {
+    mode: MockEtwMode,
+    cpu_sampling: Option<CpuSamplingOptions>,
+    stop_count: Arc<AtomicU64>,
+}
+
+impl EtwSessionControl for MockEtwSession {
+    fn stack_trace_status(
+        &self,
+    ) -> Result<dbgatlas_etw::EtwStackTraceStatus, dbgatlas_etw::EtwError> {
+        Ok(dbgatlas_etw::EtwStackTraceStatus {
+            requested: true,
+            enabled: true,
+            kernel_stack_enabled: true,
+            ..Default::default()
+        })
+    }
+
+    fn cpu_sampling_status(
+        &self,
+    ) -> Result<dbgatlas_etw::EtwCpuSamplingStatus, dbgatlas_etw::EtwError> {
+        let cpu = self.cpu_sampling.unwrap_or_default();
+        Ok(dbgatlas_etw::EtwCpuSamplingStatus {
+            requested: true,
+            enabled: true,
+            stack_enabled: true,
+            requested_interval_us: cpu.interval_us,
+            applied_interval_us: cpu.interval_us,
+            previous_interval_us: 10_000,
+            maximum_trace_size_mb: cpu.max_trace_size_mb,
+            warning_count: 0,
+        })
+    }
+
+    fn start_realtime_consumer(
+        &mut self,
+        events_dir: PathBuf,
+        _presets: dbgatlas_etw::EtwPresetFlags,
+        root_pid: Option<u32>,
+    ) -> Result<(), dbgatlas_etw::EtwError> {
+        if matches!(self.mode, MockEtwMode::ConsumerFailure) {
+            return Err(dbgatlas_etw::EtwError::Native {
+                status: 5,
+                message: "mock realtime consumer failed".to_string(),
+            });
+        }
+        fs::create_dir_all(&events_dir).unwrap();
+        if matches!(self.mode, MockEtwMode::ZeroSamples) {
+            fs::write(events_dir.join("cpu.jsonl"), "").unwrap();
+            return Ok(());
+        }
+        let pid = root_pid.unwrap_or(1);
+        let samples = [
+            json!({
+                "schema_version": 1, "category": "cpu", "event_type": "sampled_profile",
+                "pid": pid, "tid": 11, "interval_us": 1000, "frame": "busy.exe+0x10",
+                "module": { "name": "busy.exe", "path": "C:\\busy.exe", "rva": 16 },
+                "stacked": true, "cache_flushed": false,
+                "stack": { "order": "leaf_to_root", "frames": ["busy.exe+0x10", "kernel32.dll+0x20"] }
+            }),
+            json!({
+                "schema_version": 1, "category": "cpu", "event_type": "sampled_profile",
+                "pid": pid, "tid": 11, "interval_us": 1000, "frame": "busy.exe+0x10",
+                "module": { "name": "busy.exe", "path": "C:\\busy.exe", "rva": 16 },
+                "stacked": true, "cache_flushed": false,
+                "stack": { "order": "leaf_to_root", "frames": ["busy.exe+0x10", "kernel32.dll+0x20"] }
+            }),
+            json!({
+                "schema_version": 1, "category": "cpu", "event_type": "sampled_profile",
+                "pid": pid, "tid": 12, "interval_us": 1000, "frame": "busy.exe+0x30",
+                "module": { "name": "busy.exe", "path": "C:\\busy.exe", "rva": 48 },
+                "stacked": false, "cache_flushed": true,
+                "stack": { "order": "leaf_to_root", "frames": ["busy.exe+0x30"] }
+            }),
+        ];
+        let text = samples
+            .iter()
+            .map(|sample| serde_json::to_string(sample).unwrap() + "\n")
+            .collect::<String>();
+        fs::write(events_dir.join("cpu.jsonl"), text).unwrap();
+        Ok(())
+    }
+
+    fn stop(self: Box<Self>) -> Result<dbgatlas_etw::EtwSessionStopResult, dbgatlas_etw::EtwError> {
+        self.stop_count.fetch_add(1, Ordering::SeqCst);
+        let has_samples = !matches!(self.mode, MockEtwMode::ZeroSamples);
+        Ok(dbgatlas_etw::EtwSessionStopResult {
+            events_lost: u32::from(has_samples),
+            buffers_written: 4,
+            interval_restore_attempted: true,
+            interval_restored: true,
+            events_written: if has_samples { 3 } else { 0 },
+            cpu_samples_written: if has_samples { 3 } else { 0 },
+            cpu_samples_with_stack: if has_samples { 2 } else { 0 },
+            cpu_samples_leaf_only: u32::from(has_samples),
+            cpu_samples_cache_flushed: u32::from(has_samples),
+            ..Default::default()
+        })
+    }
+}
+
+fn cpu_test_host(mode: MockEtwMode) -> (ServiceHost, Arc<AtomicU64>) {
+    let stop_count = Arc::new(AtomicU64::new(0));
+    let host = ServiceHost::with_mock_workers().with_etw_controller(Arc::new(MockEtwController {
+        mode,
+        stop_count: stop_count.clone(),
+    }));
+    (host, stop_count)
+}
+
 mod host;
 mod http;
 mod install;

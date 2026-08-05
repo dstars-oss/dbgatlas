@@ -135,8 +135,16 @@ fn registered_method_descriptors() -> Vec<Value> {
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["process", "thread", "image", "file", "registry", "network"]
+                            "enum": ["process", "thread", "image", "file", "registry", "network", "cpu"]
                         }
+                    },
+                    "cpu_sampling": {
+                        "type": "object",
+                        "properties": {
+                            "interval_us": { "type": "integer", "minimum": 125, "maximum": 1000000, "default": 1000 },
+                            "max_trace_size_mb": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 }
+                        },
+                        "additionalProperties": false
                     }
                 },
                 "required": ["project_root", "target"]

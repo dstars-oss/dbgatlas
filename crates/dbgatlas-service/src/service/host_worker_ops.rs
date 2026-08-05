@@ -810,6 +810,24 @@ impl ServiceHost {
         })
     }
 
+    pub(super) fn start_cpu_recording(
+        &self,
+        recording_id: RecordingRef,
+    ) -> Result<CpuActiveGuard, ServiceError> {
+        let mut state = self.lock_state()?;
+        if let Some(active) = &state.active_cpu_recording {
+            return Err(ServiceError::Rpc(format!(
+                "another CPU recording is already active: {active}"
+            )));
+        }
+        state.active_cpu_recording = Some(recording_id.clone());
+        Ok(CpuActiveGuard {
+            state: self.state.clone(),
+            recording_id,
+            committed: false,
+        })
+    }
+
     pub(super) fn resolve_ttd_exe(&self) -> Result<PathBuf, ServiceError> {
         let ttd_dir = self
             .capabilities

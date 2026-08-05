@@ -11,6 +11,7 @@
 #include <oleauto.h>
 #include <relogger.h>
 #include <tdh.h>
+#include <tlhelp32.h>
 #endif
 
 #ifdef _WIN32
@@ -28,6 +29,7 @@ DEFINE_GUID(DA_ClassicUdpIpGuid, 0xbf3a50c5, 0xa9c9, 0x4988, 0xa0, 0x05, 0x2d, 0
 DEFINE_GUID(DA_ClassicImageLoadGuid, 0x2cb15d1d, 0x5fc1, 0x11d2, 0xab, 0xe1, 0x00, 0xa0, 0xc9, 0x11, 0xf5, 0x18);
 DEFINE_GUID(DA_ClassicRegistryGuid, 0xae53722e, 0xc863, 0x11d2, 0x86, 0x59, 0x00, 0xc0, 0x4f, 0xa3, 0x21, 0xa1);
 DEFINE_GUID(DA_StackWalkGuid, 0xdef2fe46, 0x7bd6, 0x4b80, 0xbd, 0x94, 0xf5, 0x7f, 0xe2, 0x0d, 0x0c, 0xe3);
+DEFINE_GUID(DA_PerfInfoGuid, 0xce1dbfb4, 0x137e, 0x4da6, 0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc);
 #endif
 
 #include <algorithm>
@@ -36,6 +38,7 @@ DEFINE_GUID(DA_StackWalkGuid, 0xdef2fe46, 0x7bd6, 0x4b80, 0xbd, 0x94, 0xf5, 0x7f
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -43,6 +46,7 @@ DEFINE_GUID(DA_StackWalkGuid, 0xdef2fe46, 0x7bd6, 0x4b80, 0xbd, 0x94, 0xf5, 0x7f
 #include <iomanip>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
@@ -277,6 +281,9 @@ bool preset_enabled(uint32_t preset_flags, const char* category) {
     if (std::strcmp(category, "network") == 0) {
         return (preset_flags & DA_ETW_PRESET_NETWORK) != 0;
     }
+    if (std::strcmp(category, "cpu") == 0) {
+        return (preset_flags & DA_ETW_PRESET_CPU) != 0;
+    }
     return false;
 }
 
@@ -311,6 +318,19 @@ struct StackTraceRuntimeStatus final {
     bool enabled() const {
         return provider_stack_enabled || kernel_stack_enabled;
     }
+};
+
+struct CpuSamplingRuntimeStatus final {
+    bool requested = false;
+    bool enabled = false;
+    bool stack_enabled = false;
+    uint32_t requested_interval_us = 0;
+    uint32_t applied_interval_us = 0;
+    uint32_t previous_interval_us = 0;
+    uint32_t maximum_trace_size_mb = 0;
+    uint32_t warning_count = 0;
+    bool previous_interval_valid = false;
+    bool interval_changed = false;
 };
 
 std::string trace_info_string(PTRACE_EVENT_INFO info, ULONG offset) {
@@ -521,6 +541,35 @@ const char* event_category(const EventNames& names) {
     return category;
 }
 
+const char* event_category_for_record(PEVENT_RECORD record, const EventNames& names) {
+    if (const char* category = event_category(names); category != nullptr) {
+        return category;
+    }
+    if (record == nullptr) {
+        return nullptr;
+    }
+    if (IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicProcessGuid)) {
+        return "process";
+    }
+    if (IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicThreadGuid)) {
+        return "thread";
+    }
+    if (IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicImageLoadGuid)) {
+        return "image";
+    }
+    if (IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicFileIoGuid)) {
+        return "file";
+    }
+    if (IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicRegistryGuid)) {
+        return "registry";
+    }
+    if (IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicTcpIpGuid) ||
+        IsEqualGUID(record->EventHeader.ProviderId, DA_ClassicUdpIpGuid)) {
+        return "network";
+    }
+    return nullptr;
+}
+
 const char* classify_event(const EventNames& names, uint32_t preset_flags) {
     const char* category = event_category(names);
     if (category == nullptr || !preset_enabled(preset_flags, category)) {
@@ -562,8 +611,11 @@ constexpr uint32_t DA_FILE_IO_FS_CONTROL = 75;
 constexpr uint32_t DA_FILE_IO_OP_END = 76;
 constexpr uint32_t DA_FILE_IO_DIR_NOTIFY = 77;
 constexpr uint32_t DA_STACK_WALK_OPCODE = 32;
+constexpr uint32_t DA_SAMPLED_PROFILE_EVENT_TYPE = 46;
 constexpr size_t DA_MAX_PENDING_STACK_TIMESTAMPS = 4096;
 constexpr size_t DA_MAX_PENDING_STACKS_PER_TIMESTAMP = 32;
+constexpr size_t DA_MAX_PENDING_CPU_TIMESTAMPS = 8192;
+constexpr size_t DA_MAX_PENDING_CPU_SAMPLES_PER_TIMESTAMP = 64;
 
 struct ExtractionQuality final {
     uint32_t stack_frames_total = 0;
@@ -576,6 +628,11 @@ struct ExtractionQuality final {
     uint32_t incomplete_io = 0;
     uint32_t reused_irp = 0;
     uint32_t dropped_stack_walk = 0;
+    uint32_t cpu_samples_written = 0;
+    uint32_t cpu_samples_with_stack = 0;
+    uint32_t cpu_samples_leaf_only = 0;
+    uint32_t cpu_samples_out_of_scope = 0;
+    uint32_t cpu_samples_cache_flushed = 0;
 };
 
 struct DecodedStackWalkEvent final {
@@ -583,6 +640,17 @@ struct DecodedStackWalkEvent final {
     uint32_t stack_process = 0;
     uint32_t stack_thread = 0;
     std::vector<uint64_t> addresses;
+};
+
+struct PendingCpuSample final {
+    long long event_timestamp = 0;
+    long long unix_millis = 0;
+    uint32_t header_pid = 0;
+    uint32_t tid = 0;
+    uint32_t processor = 0;
+    uint64_t instruction_pointer = 0;
+    uint32_t stack_pid = 0;
+    std::vector<uint64_t> stack_addresses;
 };
 
 struct FileEventRecord final {
@@ -626,6 +694,7 @@ struct ExtractionContext final {
     uint32_t skipped_events = 0;
     std::unordered_set<std::string> files_written;
     std::unordered_set<uint32_t> process_tree_pids;
+    std::unordered_map<uint32_t, uint32_t> pid_by_tid;
     std::unordered_map<uint32_t, std::vector<ModuleInfo>> modules_by_pid;
     ExtractionQuality quality;
     uint32_t file_io_raw_sequence = 0;
@@ -635,11 +704,110 @@ struct ExtractionContext final {
     std::unordered_map<uint64_t, std::string> file_paths_by_key;
     std::unordered_map<long long, std::vector<DecodedStackWalkEvent>> pending_stacks_by_timestamp;
     std::deque<long long> pending_stack_timestamp_order;
+    std::unordered_map<long long, std::vector<PendingCpuSample>> pending_cpu_samples_by_timestamp;
+    std::deque<long long> pending_cpu_timestamp_order;
+    uint32_t cpu_sampling_interval_us = 0;
+    bool raw_timestamps = false;
+    bool raw_timestamp_clock_ready = false;
+    long long qpc_baseline = 0;
+    long long qpc_frequency = 0;
+    long long filetime_baseline = 0;
 };
 
+void initialize_raw_timestamp_clock(ExtractionContext& context) {
+    LARGE_INTEGER counter = {};
+    LARGE_INTEGER frequency = {};
+    FILETIME filetime = {};
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&counter)) {
+        return;
+    }
+    GetSystemTimePreciseAsFileTime(&filetime);
+    ULARGE_INTEGER filetime_value = {};
+    filetime_value.LowPart = filetime.dwLowDateTime;
+    filetime_value.HighPart = filetime.dwHighDateTime;
+    context.qpc_baseline = counter.QuadPart;
+    context.qpc_frequency = frequency.QuadPart;
+    context.filetime_baseline = static_cast<long long>(filetime_value.QuadPart);
+    context.raw_timestamp_clock_ready = true;
+}
+
+long long unix_millis_from_event_timestamp(const ExtractionContext& context, long long timestamp) {
+    if (!context.raw_timestamps || !context.raw_timestamp_clock_ready) {
+        return unix_millis_from_etw_timestamp_value(timestamp);
+    }
+    constexpr long long windows_epoch_delta = 116444736000000000LL;
+    const long double elapsed_filetime_ticks =
+        static_cast<long double>(timestamp - context.qpc_baseline) * 10000000.0L /
+        static_cast<long double>(context.qpc_frequency);
+    const long double filetime = static_cast<long double>(context.filetime_baseline) + elapsed_filetime_ticks;
+    if (filetime <= static_cast<long double>(windows_epoch_delta)) {
+        return 0;
+    }
+    return static_cast<long long>((filetime - static_cast<long double>(windows_epoch_delta)) / 10000.0L);
+}
+
 void initialize_process_tree(ExtractionContext& context) {
-    if (context.has_root_pid) {
-        context.process_tree_pids.insert(context.root_pid);
+    if (!context.has_root_pid) {
+        return;
+    }
+    context.process_tree_pids.insert(context.root_pid);
+
+    HANDLE process_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (process_snapshot != INVALID_HANDLE_VALUE) {
+        std::vector<std::pair<uint32_t, uint32_t>> processes;
+        PROCESSENTRY32W entry = {};
+        entry.dwSize = sizeof(entry);
+        if (Process32FirstW(process_snapshot, &entry)) {
+            do {
+                processes.emplace_back(entry.th32ProcessID, entry.th32ParentProcessID);
+            } while (Process32NextW(process_snapshot, &entry));
+        }
+        CloseHandle(process_snapshot);
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& [pid, parent_pid] : processes) {
+                if (context.process_tree_pids.find(parent_pid) != context.process_tree_pids.end()) {
+                    changed = context.process_tree_pids.insert(pid).second || changed;
+                }
+            }
+        }
+    }
+
+    HANDLE thread_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (thread_snapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 entry = {};
+        entry.dwSize = sizeof(entry);
+        if (Thread32First(thread_snapshot, &entry)) {
+            do {
+                if (context.process_tree_pids.find(entry.th32OwnerProcessID) != context.process_tree_pids.end()) {
+                    context.pid_by_tid[entry.th32ThreadID] = entry.th32OwnerProcessID;
+                }
+            } while (Thread32Next(thread_snapshot, &entry));
+        }
+        CloseHandle(thread_snapshot);
+    }
+
+    for (const uint32_t pid : context.process_tree_pids) {
+        HANDLE module_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (module_snapshot == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        MODULEENTRY32W entry = {};
+        entry.dwSize = sizeof(entry);
+        if (Module32FirstW(module_snapshot, &entry)) {
+            auto& modules = context.modules_by_pid[pid];
+            do {
+                ModuleInfo module;
+                module.base = reinterpret_cast<uint64_t>(entry.modBaseAddr);
+                module.size = entry.modBaseSize;
+                module.path = wide_to_utf8(entry.szExePath);
+                module.name = wide_to_utf8(entry.szModule);
+                modules.push_back(std::move(module));
+            } while (Module32NextW(module_snapshot, &entry));
+        }
+        CloseHandle(module_snapshot);
     }
 }
 
@@ -661,7 +829,8 @@ bool process_tree_allows_event(ExtractionContext& context, const EventMetadata& 
         return false;
     }
 
-    return context.process_tree_pids.find(event_pid) != context.process_tree_pids.end();
+    const uint32_t process_pid = metadata.process_pid.value_or(event_pid);
+    return context.process_tree_pids.find(process_pid) != context.process_tree_pids.end();
 }
 
 void update_module_map(ExtractionContext& context, const EventMetadata& metadata, const std::string& event_type, uint32_t pid) {
@@ -674,12 +843,10 @@ void update_module_map(ExtractionContext& context, const EventMetadata& metadata
     const uint64_t image_base = *base;
     const std::string lower_event_type = to_lower_ascii(event_type);
     if (contains_any(lower_event_type, {"unload", "stop", "end"})) {
-        modules.erase(
-            std::remove_if(
-                modules.begin(),
-                modules.end(),
-                [image_base](const ModuleInfo& module) { return module.base == image_base; }),
-            modules.end());
+        // CPU samples are deliberately buffered while matching StackWalk
+        // fragments. Keep the last mapping after unload/process exit so those
+        // historical addresses can still be rendered as module+RVA. A later
+        // load at the same base replaces it below.
         return;
     }
 
@@ -847,7 +1014,12 @@ void append_stack_addresses(std::vector<uint64_t>& target, const std::vector<uin
     }
 }
 
-std::vector<uint64_t> take_matching_pending_stack(ExtractionContext& context, long long timestamp, uint32_t pid, uint32_t tid) {
+std::vector<uint64_t> take_matching_pending_stack(
+    ExtractionContext& context,
+    long long timestamp,
+    uint32_t pid,
+    uint32_t tid,
+    uint32_t* matched_pid = nullptr) {
     // Standalone StackWalk events can arrive before their target events. Prefer
     // timestamp+pid+tid, then fall back to timestamp+pid to preserve stack clues.
     auto it = context.pending_stacks_by_timestamp.find(timestamp);
@@ -855,19 +1027,29 @@ std::vector<uint64_t> take_matching_pending_stack(ExtractionContext& context, lo
         return {};
     }
     auto& pending = it->second;
-    auto exact = std::find_if(pending.begin(), pending.end(), [pid, tid](const DecodedStackWalkEvent& stack) {
+    const bool has_exact = std::any_of(pending.begin(), pending.end(), [pid, tid](const DecodedStackWalkEvent& stack) {
         return stack.stack_process == pid && stack.stack_thread == tid;
     });
-    auto selected = exact != pending.end()
-                        ? exact
-                        : std::find_if(pending.begin(), pending.end(), [pid](const DecodedStackWalkEvent& stack) {
-                              return stack.stack_process == pid;
-                          });
-    if (selected == pending.end()) {
+    std::vector<uint64_t> addresses;
+    uint32_t selected_pid = 0;
+    for (auto selected = pending.begin(); selected != pending.end();) {
+        const bool matches = has_exact
+                                 ? selected->stack_process == pid && selected->stack_thread == tid
+                                 : selected->stack_process == pid;
+        if (!matches) {
+            ++selected;
+            continue;
+        }
+        selected_pid = selected->stack_process;
+        addresses.insert(addresses.end(), selected->addresses.begin(), selected->addresses.end());
+        selected = pending.erase(selected);
+    }
+    if (addresses.empty()) {
         return {};
     }
-    auto addresses = selected->addresses;
-    pending.erase(selected);
+    if (matched_pid != nullptr) {
+        *matched_pid = selected_pid;
+    }
     if (pending.empty()) {
         context.pending_stacks_by_timestamp.erase(it);
     }
@@ -900,8 +1082,12 @@ void cache_pending_stack(ExtractionContext& context, DecodedStackWalkEvent stack
 }
 
 struct StackFrameInfo final {
+    uint64_t address = 0;
     std::string text;
     bool resolved = false;
+    std::string module_name;
+    std::string module_path;
+    uint64_t module_offset = 0;
 };
 
 std::vector<StackFrameInfo> stack_frames_from_addresses(
@@ -911,10 +1097,16 @@ std::vector<StackFrameInfo> stack_frames_from_addresses(
     std::vector<StackFrameInfo> frames;
     for (const uint64_t address : addresses) {
         if (const auto* module = find_module(context, pid, address); module != nullptr && address >= module->base) {
-            frames.push_back(StackFrameInfo{module->name + "+" + hex_u64(address - module->base), true});
+            frames.push_back(StackFrameInfo{
+                address,
+                module->name + "+" + hex_u64(address - module->base),
+                true,
+                module->name,
+                module->path,
+                address - module->base});
             context.quality.stack_frames_resolved += 1;
         } else {
-            frames.push_back(StackFrameInfo{format_address(address), false});
+            frames.push_back(StackFrameInfo{address, format_address(address), false, {}, {}, 0});
             context.quality.stack_frames_unresolved += 1;
         }
         context.quality.stack_frames_total += 1;
@@ -1026,6 +1218,164 @@ void write_stack_json(std::ofstream& out, const std::vector<StackFrameInfo>& fra
         out << "\"" << json_escape(frames[index].text) << "\"";
     }
     out << "]}";
+}
+
+bool is_sampled_profile_event(PEVENT_RECORD record) {
+    return record != nullptr && IsEqualGUID(record->EventHeader.ProviderId, DA_PerfInfoGuid) &&
+           record->EventHeader.EventDescriptor.Opcode == DA_SAMPLED_PROFILE_EVENT_TYPE;
+}
+
+std::optional<PendingCpuSample> decode_sampled_profile_event(PEVENT_RECORD record) {
+    if (!is_sampled_profile_event(record) || record->UserData == nullptr) {
+        return std::nullopt;
+    }
+    const bool is_32_bit = (record->EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
+    const size_t pointer_size = is_32_bit ? sizeof(uint32_t) : sizeof(uint64_t);
+    if (record->UserDataLength < pointer_size + sizeof(uint32_t)) {
+        return std::nullopt;
+    }
+    const auto* data = static_cast<const unsigned char*>(record->UserData);
+    PendingCpuSample sample;
+    sample.event_timestamp = record->EventHeader.TimeStamp.QuadPart;
+    sample.header_pid = record->EventHeader.ProcessId;
+    sample.processor = record->BufferContext.ProcessorNumber;
+    if (is_32_bit) {
+        uint32_t ip = 0;
+        std::memcpy(&ip, data, sizeof(ip));
+        sample.instruction_pointer = ip;
+    } else {
+        std::memcpy(&sample.instruction_pointer, data, sizeof(sample.instruction_pointer));
+    }
+    std::memcpy(&sample.tid, data + pointer_size, sizeof(sample.tid));
+    return sample;
+}
+
+uint32_t cpu_sample_pid(const ExtractionContext& context, const PendingCpuSample& sample, uint32_t stack_pid) {
+    if (stack_pid != 0 && stack_pid != UINT32_MAX) {
+        return stack_pid;
+    }
+    if (const auto tid = context.pid_by_tid.find(sample.tid); tid != context.pid_by_tid.end()) {
+        return tid->second;
+    }
+    return sample.header_pid;
+}
+
+bool cpu_pid_in_scope(const ExtractionContext& context, uint32_t pid) {
+    return !context.has_root_pid || context.process_tree_pids.find(pid) != context.process_tree_pids.end();
+}
+
+void write_cpu_sample(
+    ExtractionContext& context,
+    const PendingCpuSample& sample,
+    uint32_t stack_pid,
+    const std::vector<uint64_t>& stack_addresses,
+    bool cache_flushed) {
+    const uint32_t pid = cpu_sample_pid(context, sample, stack_pid);
+    if (!cpu_pid_in_scope(context, pid)) {
+        context.quality.cpu_samples_out_of_scope += 1;
+        context.skipped_events += 1;
+        return;
+    }
+    context.pid_by_tid[sample.tid] = pid;
+
+    std::vector<uint64_t> addresses = stack_addresses;
+    if (sample.instruction_pointer != 0 &&
+        (addresses.empty() || addresses.front() != sample.instruction_pointer)) {
+        addresses.insert(addresses.begin(), sample.instruction_pointer);
+    }
+    auto frames = stack_frames_from_addresses(context, addresses, pid);
+    std::reverse(frames.begin(), frames.end());
+
+    const std::filesystem::path path = context.events_dir / "cpu.jsonl";
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out) {
+        context.skipped_events += 1;
+        return;
+    }
+    const StackFrameInfo* leaf = frames.empty() ? nullptr : &frames.front();
+    out << "{\"schema_version\":1"
+        << ",\"timestamp\":{\"unix_millis\":" << sample.unix_millis
+        << ",\"etw\":" << sample.event_timestamp << "}"
+        << ",\"category\":\"cpu\""
+        << ",\"event_type\":\"sampled_profile\""
+        << ",\"pid\":" << pid
+        << ",\"tid\":" << sample.tid
+        << ",\"processor\":" << sample.processor
+        << ",\"interval_us\":" << context.cpu_sampling_interval_us
+        << ",\"instruction_pointer\":" << sample.instruction_pointer
+        << ",\"address\":\"" << format_address(sample.instruction_pointer) << "\""
+        << ",\"frame\":";
+    if (leaf == nullptr) {
+        out << "null";
+    } else {
+        out << "\"" << json_escape(leaf->text) << "\"";
+    }
+    out << ",\"module\":";
+    if (leaf == nullptr || !leaf->resolved) {
+        out << "null";
+    } else {
+        out << "{\"name\":\"" << json_escape(leaf->module_name)
+            << "\",\"path\":\"" << json_escape(leaf->module_path)
+            << "\",\"rva\":" << leaf->module_offset << "}";
+    }
+    out << ",\"stack\":{\"order\":\"leaf_to_root\",\"frames\":[";
+    for (size_t index = 0; index < frames.size(); ++index) {
+        if (index != 0) {
+            out << ",";
+        }
+        out << "\"" << json_escape(frames[index].text) << "\"";
+    }
+    out << "],\"addresses\":[";
+    for (size_t index = 0; index < frames.size(); ++index) {
+        if (index != 0) {
+            out << ",";
+        }
+        out << frames[index].address;
+    }
+    out << "],\"frame_details\":[";
+    for (size_t index = 0; index < frames.size(); ++index) {
+        if (index != 0) {
+            out << ",";
+        }
+        const auto& frame = frames[index];
+        out << "{\"address\":" << frame.address
+            << ",\"text\":\"" << json_escape(frame.text) << "\""
+            << ",\"resolved\":" << (frame.resolved ? "true" : "false")
+            << ",\"module_name\":";
+        if (frame.resolved) {
+            out << "\"" << json_escape(frame.module_name) << "\"";
+        } else {
+            out << "null";
+        }
+        out << ",\"module_path\":";
+        if (frame.resolved) {
+            out << "\"" << json_escape(frame.module_path) << "\"";
+        } else {
+            out << "null";
+        }
+        out << ",\"rva\":";
+        if (frame.resolved) {
+            out << frame.module_offset;
+        } else {
+            out << "null";
+        }
+        out << "}";
+    }
+    out << "]}"
+        << ",\"stacked\":" << (stack_addresses.empty() ? "false" : "true")
+        << ",\"cache_flushed\":" << (cache_flushed ? "true" : "false")
+        << ",\"operation_id\":null,\"artifact_id\":null}\n";
+    context.files_written.insert("cpu");
+    context.events_written += 1;
+    context.quality.cpu_samples_written += 1;
+    if (stack_addresses.empty()) {
+        context.quality.cpu_samples_leaf_only += 1;
+    } else {
+        context.quality.cpu_samples_with_stack += 1;
+    }
+    if (cache_flushed) {
+        context.quality.cpu_samples_cache_flushed += 1;
+    }
 }
 
 std::optional<std::string> direct_file_path(const EventMetadata& metadata, uint32_t opcode) {
@@ -1150,7 +1500,7 @@ void write_file_event(ExtractionContext& context, FileEventRecord event) {
     }
     const auto frames = stack_frames_from_addresses(context, event.stack_addresses, event.pid);
     out << "{\"schema_version\":1"
-        << ",\"timestamp\":{\"unix_millis\":" << unix_millis_from_etw_timestamp_value(event.event_timestamp) << "}"
+        << ",\"timestamp\":{\"unix_millis\":" << unix_millis_from_event_timestamp(context, event.event_timestamp) << "}"
         << ",\"category\":\"file\""
         << ",\"event_type\":\"" << json_escape(event.event_type) << "\""
         << ",\"pid\":" << event.pid
@@ -1241,8 +1591,90 @@ bool attach_stack_to_pending_file(ExtractionContext& context, const DecodedStack
     return false;
 }
 
+void cache_pending_cpu_sample(ExtractionContext& context, PendingCpuSample sample) {
+    if (context.pending_cpu_samples_by_timestamp.find(sample.event_timestamp) ==
+        context.pending_cpu_samples_by_timestamp.end()) {
+        while (context.pending_cpu_timestamp_order.size() >= DA_MAX_PENDING_CPU_TIMESTAMPS) {
+            const long long oldest = context.pending_cpu_timestamp_order.front();
+            context.pending_cpu_timestamp_order.pop_front();
+            auto removed = context.pending_cpu_samples_by_timestamp.find(oldest);
+            if (removed == context.pending_cpu_samples_by_timestamp.end()) {
+                continue;
+            }
+            auto samples = std::move(removed->second);
+            context.pending_cpu_samples_by_timestamp.erase(removed);
+            for (const auto& pending : samples) {
+                write_cpu_sample(context, pending, pending.stack_pid, pending.stack_addresses, true);
+            }
+            break;
+        }
+        context.pending_cpu_timestamp_order.push_back(sample.event_timestamp);
+    }
+    auto& pending = context.pending_cpu_samples_by_timestamp[sample.event_timestamp];
+    if (pending.size() >= DA_MAX_PENDING_CPU_SAMPLES_PER_TIMESTAMP) {
+        write_cpu_sample(context, sample, sample.stack_pid, sample.stack_addresses, true);
+        return;
+    }
+    pending.push_back(std::move(sample));
+}
+
+bool attach_stack_to_pending_cpu(ExtractionContext& context, const DecodedStackWalkEvent& stack) {
+    if (!preset_enabled(context.preset_flags, "cpu")) {
+        return false;
+    }
+    auto it = context.pending_cpu_samples_by_timestamp.find(stack.event_timestamp);
+    if (it == context.pending_cpu_samples_by_timestamp.end()) {
+        return false;
+    }
+    auto& pending = it->second;
+    auto sample = std::find_if(pending.begin(), pending.end(), [&stack](const PendingCpuSample& value) {
+        return value.tid == stack.stack_thread;
+    });
+    if (sample == pending.end()) {
+        return false;
+    }
+    sample->stack_pid = stack.stack_process;
+    sample->stack_addresses.insert(
+        sample->stack_addresses.end(), stack.addresses.begin(), stack.addresses.end());
+    return true;
+}
+
+void process_cpu_sample_event(ExtractionContext& context, PEVENT_RECORD record) {
+    if (!preset_enabled(context.preset_flags, "cpu")) {
+        context.skipped_events += 1;
+        return;
+    }
+    auto sample = decode_sampled_profile_event(record);
+    if (!sample.has_value()) {
+        context.skipped_events += 1;
+        return;
+    }
+    sample->unix_millis = unix_millis_from_event_timestamp(context, sample->event_timestamp);
+    const uint32_t pid = cpu_sample_pid(context, *sample, 0);
+    if (!cpu_pid_in_scope(context, pid)) {
+        context.quality.cpu_samples_out_of_scope += 1;
+        context.skipped_events += 1;
+        return;
+    }
+    uint32_t stack_pid = 0;
+    sample->stack_addresses =
+        take_matching_pending_stack(context, sample->event_timestamp, pid, sample->tid, &stack_pid);
+    sample->stack_pid = stack_pid;
+    cache_pending_cpu_sample(context, std::move(*sample));
+}
+
+void flush_pending_cpu_samples(ExtractionContext& context) {
+    for (auto& [_, samples] : context.pending_cpu_samples_by_timestamp) {
+        for (const auto& sample : samples) {
+            write_cpu_sample(context, sample, sample.stack_pid, sample.stack_addresses, false);
+        }
+    }
+    context.pending_cpu_samples_by_timestamp.clear();
+    context.pending_cpu_timestamp_order.clear();
+}
+
 void process_stack_walk_event(ExtractionContext& context, DecodedStackWalkEvent stack) {
-    if (!attach_stack_to_pending_file(context, stack)) {
+    if (!attach_stack_to_pending_cpu(context, stack) && !attach_stack_to_pending_file(context, stack)) {
         cache_pending_stack(context, std::move(stack));
     }
 }
@@ -1433,7 +1865,8 @@ void write_extracted_event(ExtractionContext& context, PEVENT_RECORD record, con
     }
     const auto frames = stack_frames(context, record, process_pid);
     out << "{\"schema_version\":1"
-        << ",\"timestamp\":{\"unix_millis\":" << unix_millis_from_etw_timestamp(record->EventHeader.TimeStamp) << "}"
+        << ",\"timestamp\":{\"unix_millis\":"
+        << unix_millis_from_event_timestamp(context, record->EventHeader.TimeStamp.QuadPart) << "}"
         << ",\"category\":\"" << category << "\""
         << ",\"event_type\":\"" << json_escape(event_type) << "\""
         << ",\"pid\":" << process_pid
@@ -1497,7 +1930,11 @@ void WINAPI event_record_callback(PEVENT_RECORD record) {
         process_stack_walk_event(*context, std::move(*stack));
         return;
     }
-    const char* raw_category = event_category(metadata.names);
+    if (is_sampled_profile_event(record)) {
+        process_cpu_sample_event(*context, record);
+        return;
+    }
+    const char* raw_category = event_category_for_record(record, metadata.names);
     if (raw_category == nullptr) {
         context->skipped_events += 1;
         return;
@@ -1505,6 +1942,21 @@ void WINAPI event_record_callback(PEVENT_RECORD record) {
     const std::string event_type = !metadata.names.opcode.empty()
                                        ? metadata.names.opcode
                                        : (!metadata.names.task.empty() ? metadata.names.task : "event");
+    if (std::strcmp(raw_category, "process") == 0) {
+        process_tree_allows_event(*context, metadata, raw_category, record->EventHeader.ProcessId);
+    }
+    if (std::strcmp(raw_category, "thread") == 0) {
+        const uint32_t thread_pid = metadata.process_pid
+                                        .value_or(static_cast<uint32_t>(first_matching_number(
+                                            metadata, {"processid", "process id", "pid"})
+                                                                          .value_or(record->EventHeader.ProcessId)));
+        const uint32_t thread_tid = static_cast<uint32_t>(first_matching_number(
+            metadata, {"threadid", "thread id", "tid"})
+                                                              .value_or(record->EventHeader.ThreadId));
+        if (cpu_pid_in_scope(*context, thread_pid)) {
+            context->pid_by_tid[thread_tid] = thread_pid;
+        }
+    }
     if (std::strcmp(raw_category, "image") == 0 &&
         process_tree_allows_event(*context, metadata, raw_category, record->EventHeader.ProcessId)) {
         const uint32_t image_pid = metadata.process_pid.value_or(record->EventHeader.ProcessId);
@@ -1571,6 +2023,11 @@ void copy_extraction_result(DA_EtwEventExtractionResult* out, uint32_t caller_si
     DA_SET_ETW_RESULT_FIELD(incomplete_io, context.quality.incomplete_io);
     DA_SET_ETW_RESULT_FIELD(reused_irp, context.quality.reused_irp);
     DA_SET_ETW_RESULT_FIELD(dropped_stack_walk, context.quality.dropped_stack_walk);
+    DA_SET_ETW_RESULT_FIELD(cpu_samples_written, context.quality.cpu_samples_written);
+    DA_SET_ETW_RESULT_FIELD(cpu_samples_with_stack, context.quality.cpu_samples_with_stack);
+    DA_SET_ETW_RESULT_FIELD(cpu_samples_leaf_only, context.quality.cpu_samples_leaf_only);
+    DA_SET_ETW_RESULT_FIELD(cpu_samples_out_of_scope, context.quality.cpu_samples_out_of_scope);
+    DA_SET_ETW_RESULT_FIELD(cpu_samples_cache_flushed, context.quality.cpu_samples_cache_flushed);
 #undef DA_SET_ETW_RESULT_FIELD
 }
 
@@ -1579,16 +2036,38 @@ struct RealTimeConsumer final {
     std::string session_name;
     std::thread worker;
     std::atomic<ULONG> status = ERROR_SUCCESS;
+    std::mutex start_mutex;
+    std::condition_variable start_condition;
+    bool start_complete = false;
+    ULONG open_status = ERROR_SUCCESS;
 };
 
 void run_realtime_consumer(RealTimeConsumer* consumer) noexcept {
     EVENT_TRACE_LOGFILEA logfile = {};
     logfile.LoggerName = consumer->session_name.data();
-    logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    logfile.ProcessTraceMode =
+        PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
     logfile.EventRecordCallback = event_record_callback;
     logfile.Context = &consumer->context;
-    const ULONG status = process_trace_logfile(logfile);
+    TRACEHANDLE trace = OpenTraceA(&logfile);
+    {
+        std::lock_guard<std::mutex> lock(consumer->start_mutex);
+        consumer->start_complete = true;
+        consumer->open_status = trace == INVALID_PROCESSTRACE_HANDLE ? GetLastError() : ERROR_SUCCESS;
+    }
+    consumer->start_condition.notify_one();
+    ULONG status = consumer->open_status;
+    if (trace != INVALID_PROCESSTRACE_HANDLE) {
+        consumer->context.raw_timestamps = true;
+        initialize_raw_timestamp_clock(consumer->context);
+        status = ProcessTrace(&trace, 1, nullptr, nullptr);
+        const ULONG close_status = CloseTrace(trace);
+        if (status == ERROR_SUCCESS) {
+            status = close_status;
+        }
+    }
     flush_pending_file_events(consumer->context);
+    flush_pending_cpu_samples(consumer->context);
     consumer->status.store(status, std::memory_order_relaxed);
 }
 
@@ -1673,16 +2152,39 @@ public:
         }
 
         const EventMetadata metadata = event_metadata(record);
-        const char* category = event_category(metadata.names);
-        const bool keep_for_output = category != nullptr && preset_enabled(context_.preset_flags, category);
+        const char* category = event_category_for_record(record, metadata.names);
+        const bool cpu_event = is_sampled_profile_event(record);
+        bool keep_for_cpu = false;
+        if (cpu_event && preset_enabled(context_.preset_flags, "cpu")) {
+            if (auto sample = decode_sampled_profile_event(record); sample.has_value()) {
+                keep_for_cpu = cpu_pid_in_scope(context_, cpu_sample_pid(context_, *sample, 0));
+            }
+        }
+        if (category != nullptr && std::strcmp(category, "thread") == 0) {
+            const uint32_t pid = metadata.process_pid
+                                     .value_or(static_cast<uint32_t>(first_matching_number(
+                                         metadata, {"processid", "process id", "pid"})
+                                                                       .value_or(record->EventHeader.ProcessId)));
+            const uint32_t tid = static_cast<uint32_t>(first_matching_number(
+                metadata, {"threadid", "thread id", "tid"})
+                                                           .value_or(record->EventHeader.ThreadId));
+            if (cpu_pid_in_scope(context_, pid)) {
+                context_.pid_by_tid[tid] = pid;
+            }
+        }
+        const bool keep_for_output = keep_for_cpu || (category != nullptr && preset_enabled(context_.preset_flags, category));
         const bool keep_for_module_map = category != nullptr && std::strcmp(category, "image") == 0;
+        const bool keep_for_cpu_context = preset_enabled(context_.preset_flags, "cpu") && category != nullptr &&
+                                          (std::strcmp(category, "process") == 0 ||
+                                           std::strcmp(category, "thread") == 0 ||
+                                           std::strcmp(category, "image") == 0);
         // Filtered ETL must keep more than final output categories: StackWalk
         // pairs with later events, image events build the module map, and FileIo
         // OP_END completes cached begin records.
         const bool keep_for_stack_walk = keep_stack_walk_for_filter(context_, record, metadata);
         const bool keep_for_file_completion = keep_file_completion_for_filter(context_, record, category);
-        const bool needs_process_tree_filter = !keep_for_stack_walk && !keep_for_file_completion;
-        if ((!keep_for_output && !keep_for_module_map && !keep_for_stack_walk && !keep_for_file_completion) ||
+        const bool needs_process_tree_filter = !keep_for_cpu && !keep_for_stack_walk && !keep_for_file_completion;
+        if ((!keep_for_output && !keep_for_module_map && !keep_for_cpu_context && !keep_for_stack_walk && !keep_for_file_completion) ||
             (needs_process_tree_filter &&
              !process_tree_allows_event(context_, metadata, category, record->EventHeader.ProcessId))) {
             context_.skipped_events += 1;
@@ -1692,7 +2194,9 @@ public:
         hr = relogger->Inject(event);
         if (SUCCEEDED(hr)) {
             context_.events_written += 1;
-            if (keep_for_output) {
+            if (keep_for_cpu) {
+                context_.files_written.insert("cpu");
+            } else if (keep_for_output) {
                 context_.files_written.insert(category);
             }
         } else {
@@ -1735,7 +2239,7 @@ std::vector<ProviderSpec> provider_specs(uint32_t preset_flags) {
     if ((collection_flags & DA_ETW_PRESET_IMAGE) != 0) {
         process_keywords |= 0x40;
     }
-    if (process_keywords != 0) {
+    if (process_keywords != 0 && (preset_flags & DA_ETW_PRESET_CPU) == 0) {
         providers.push_back(ProviderSpec{DA_KernelProcessProviderGuid, process_keywords});
     }
     if ((preset_flags & DA_ETW_PRESET_FILE) != 0) {
@@ -1761,6 +2265,10 @@ std::vector<CLASSIC_EVENT_ID> stack_trace_events(uint32_t preset_flags) {
         event.Type = type;
         events.push_back(event);
     };
+
+    if ((preset_flags & DA_ETW_PRESET_CPU) != 0) {
+        add(DA_PerfInfoGuid, static_cast<UCHAR>(DA_SAMPLED_PROFILE_EVENT_TYPE));
+    }
 
     if ((collection_flags & DA_ETW_PRESET_PROCESS) != 0) {
         add(DA_ClassicProcessGuid, EVENT_TRACE_TYPE_START);
@@ -1801,10 +2309,10 @@ std::vector<CLASSIC_EVENT_ID> stack_trace_events(uint32_t preset_flags) {
     return events;
 }
 
-void enable_kernel_stack_tracing(TRACEHANDLE handle, uint32_t preset_flags, StackTraceRuntimeStatus& stack_status) {
+ULONG enable_kernel_stack_tracing(TRACEHANDLE handle, uint32_t preset_flags, StackTraceRuntimeStatus& stack_status) {
     const auto events = stack_trace_events(preset_flags);
     if (events.empty()) {
-        return;
+        return ERROR_SUCCESS;
     }
 
     const ULONG status = TraceSetInformation(
@@ -1817,6 +2325,7 @@ void enable_kernel_stack_tracing(TRACEHANDLE handle, uint32_t preset_flags, Stac
     } else {
         stack_status.kernel_stack_warning_count += 1;
     }
+    return status;
 }
 
 ULONG enable_providers(
@@ -1874,7 +2383,10 @@ void disable_providers(TRACEHANDLE handle, const std::vector<ProviderSpec>& prov
 
 TraceProperties make_trace_properties(
     const char* session_name_utf8,
-    const char* trace_path_utf8) {
+    const char* trace_path_utf8,
+    bool cpu_sampling = false,
+    uint32_t maximum_trace_size_mb = 0,
+    bool initialize_logger_guid = true) {
     const size_t logger_name_len = std::strlen(session_name_utf8) + 1;
     const size_t log_file_len = std::strlen(trace_path_utf8) + 1;
     const size_t properties_size =
@@ -1885,7 +2397,23 @@ TraceProperties make_trace_properties(
     trace.properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(trace.storage.get());
     trace.properties->Wnode.BufferSize = static_cast<ULONG>(properties_size);
     trace.properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    trace.properties->LogFileMode = EVENT_TRACE_FILE_MODE_SEQUENTIAL | EVENT_TRACE_REAL_TIME_MODE;
+    if (cpu_sampling) {
+        if (initialize_logger_guid) {
+            const HRESULT guid_status = CoCreateGuid(&trace.properties->Wnode.Guid);
+            if (FAILED(guid_status)) {
+                throw std::runtime_error("CoCreateGuid failed for CPU ETW session");
+            }
+        }
+        trace.properties->LogFileMode =
+            EVENT_TRACE_SYSTEM_LOGGER_MODE | EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_FILE_MODE_CIRCULAR;
+        trace.properties->EnableFlags =
+            EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_IMAGE_LOAD;
+        trace.properties->MaximumFileSize = maximum_trace_size_mb;
+        trace.properties->BufferSize = 64;
+        trace.properties->FlushTimer = 1;
+    } else {
+        trace.properties->LogFileMode = EVENT_TRACE_FILE_MODE_SEQUENTIAL | EVENT_TRACE_REAL_TIME_MODE;
+    }
     trace.properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
     trace.properties->LogFileNameOffset =
         static_cast<ULONG>(sizeof(EVENT_TRACE_PROPERTIES) + logger_name_len);
@@ -1893,6 +2421,82 @@ TraceProperties make_trace_properties(
     std::memcpy(trace.storage.get() + trace.properties->LogFileNameOffset, trace_path_utf8, log_file_len);
     return trace;
 }
+
+ULONG query_profile_interval_us(uint32_t& interval_us) {
+    TRACE_PROFILE_INTERVAL interval = {};
+    ULONG returned_length = 0;
+    const ULONG status = TraceQueryInformation(
+        0,
+        TraceSampledProfileIntervalInfo,
+        &interval,
+        sizeof(interval),
+        &returned_length);
+    if (status == ERROR_SUCCESS) {
+        interval_us = interval.Interval / 10;
+    }
+    return status;
+}
+
+ULONG set_profile_interval_us(uint32_t interval_us) {
+    TRACE_PROFILE_INTERVAL interval = {};
+    interval.Source = 0;
+    interval.Interval = interval_us * 10;
+    return TraceSetInformation(0, TraceSampledProfileIntervalInfo, &interval, sizeof(interval));
+}
+
+void restore_profile_interval(
+    CpuSamplingRuntimeStatus& cpu_status,
+    DA_EtwSessionStopResult* out,
+    uint32_t caller_size) {
+    if (!cpu_status.requested || !cpu_status.previous_interval_valid || !cpu_status.interval_changed) {
+        return;
+    }
+    if (out != nullptr && result_has_field(
+                              caller_size,
+                              offsetof(DA_EtwSessionStopResult, interval_restore_attempted),
+                              sizeof(out->interval_restore_attempted))) {
+        out->interval_restore_attempted = 1;
+    }
+    uint32_t current_interval_us = 0;
+    ULONG status = query_profile_interval_us(current_interval_us);
+    if (status != ERROR_SUCCESS || current_interval_us != cpu_status.applied_interval_us) {
+        cpu_status.warning_count += 1;
+        if (out != nullptr && result_has_field(
+                                  caller_size,
+                                  offsetof(DA_EtwSessionStopResult, interval_restore_skipped),
+                                  sizeof(out->interval_restore_skipped))) {
+            out->interval_restore_skipped = 1;
+        }
+        return;
+    }
+    status = set_profile_interval_us(cpu_status.previous_interval_us);
+    if (status == ERROR_SUCCESS) {
+        cpu_status.interval_changed = false;
+        if (out != nullptr && result_has_field(
+                                  caller_size,
+                                  offsetof(DA_EtwSessionStopResult, interval_restored),
+                                  sizeof(out->interval_restored))) {
+            out->interval_restored = 1;
+        }
+    } else {
+        cpu_status.warning_count += 1;
+    }
+}
+
+struct ScopedProfileIntervalRestore final {
+    CpuSamplingRuntimeStatus* status = nullptr;
+    bool armed = true;
+
+    ~ScopedProfileIntervalRestore() {
+        if (armed && status != nullptr) {
+            restore_profile_interval(*status, nullptr, 0);
+        }
+    }
+
+    void release() {
+        armed = false;
+    }
+};
 #endif
 
 } // namespace
@@ -1904,6 +2508,7 @@ struct DA_EtwSessionHandle {
     std::string trace_path;
     std::vector<ProviderSpec> enabled_providers;
     StackTraceRuntimeStatus stack_trace_status;
+    CpuSamplingRuntimeStatus cpu_sampling_status;
     std::unique_ptr<RealTimeConsumer> realtime_consumer;
 #endif
 };
@@ -1916,7 +2521,7 @@ int32_t da_etw_abi_version(DA_EtwVersion* out) {
         out->struct_size = sizeof(DA_EtwVersion);
         out->flags = 0;
         out->abi_major = 0;
-        out->abi_minor = 2;
+        out->abi_minor = 3;
         out->abi_patch = 0;
         return DA_ETW_OK;
     });
@@ -1931,7 +2536,7 @@ int32_t da_etw_adapter_info(DA_EtwAdapterInfo* out) {
         out->flags = 0;
         out->capability_flags =
             DA_ETW_CAP_REALTIME_CONSUME | DA_ETW_CAP_FILE_TRACE | DA_ETW_CAP_PROCESS_TREE_FILTER |
-            DA_ETW_CAP_EVENT_STACK_TRACE;
+            DA_ETW_CAP_EVENT_STACK_TRACE | DA_ETW_CAP_CPU_SAMPLING;
         return DA_ETW_OK;
     });
 }
@@ -2003,6 +2608,24 @@ int32_t da_etw_session_start_file_trace(
     const char* trace_path_utf8,
     uint32_t preset_flags,
     DA_EtwSessionHandle** out_handle) {
+    DA_EtwSessionOptions options = {};
+    options.struct_size = sizeof(options);
+    options.cpu_sampling_interval_us = 1000;
+    options.maximum_trace_size_mb = 512;
+    return da_etw_session_start_file_trace_ex(
+        session_name_utf8,
+        trace_path_utf8,
+        preset_flags,
+        &options,
+        out_handle);
+}
+
+int32_t da_etw_session_start_file_trace_ex(
+    const char* session_name_utf8,
+    const char* trace_path_utf8,
+    uint32_t preset_flags,
+    const DA_EtwSessionOptions* options,
+    DA_EtwSessionHandle** out_handle) {
     return guard([&]() -> int32_t {
         if (out_handle == nullptr) {
             return fail(DA_ETW_ERR_INVALID_ARGUMENT, "out handle pointer is null");
@@ -2014,11 +2637,49 @@ int32_t da_etw_session_start_file_trace(
         if (trace_path_utf8 == nullptr || trace_path_utf8[0] == '\0') {
             return fail(DA_ETW_ERR_INVALID_ARGUMENT, "trace path is empty");
         }
+        if (options == nullptr || options->struct_size < sizeof(DA_EtwSessionOptions)) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "ETW session options are missing or truncated");
+        }
+        const bool cpu_sampling = (preset_flags & DA_ETW_PRESET_CPU) != 0;
+        if (cpu_sampling &&
+            (options->cpu_sampling_interval_us < 125 || options->cpu_sampling_interval_us > 1000000)) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "CPU sampling interval must be in 125..=1000000 us");
+        }
+        if (cpu_sampling &&
+            (options->maximum_trace_size_mb < 64 || options->maximum_trace_size_mb > 4096)) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "CPU trace size must be in 64..=4096 MB");
+        }
 
 #ifndef _WIN32
         return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW file trace is only available on Windows");
 #else
-        auto trace = make_trace_properties(session_name_utf8, trace_path_utf8);
+        CpuSamplingRuntimeStatus cpu_status;
+        cpu_status.requested = cpu_sampling;
+        cpu_status.requested_interval_us = cpu_sampling ? options->cpu_sampling_interval_us : 0;
+        cpu_status.maximum_trace_size_mb = cpu_sampling ? options->maximum_trace_size_mb : 0;
+        auto trace = make_trace_properties(
+            session_name_utf8,
+            trace_path_utf8,
+            cpu_sampling,
+            options->maximum_trace_size_mb);
+        ScopedProfileIntervalRestore interval_restore_guard{&cpu_status};
+        if (cpu_sampling) {
+            ULONG interval_status = query_profile_interval_us(cpu_status.previous_interval_us);
+            if (interval_status != ERROR_SUCCESS) {
+                return fail_win32("TraceQueryInformation(ProfileTime)", interval_status);
+            }
+            cpu_status.previous_interval_valid = true;
+            interval_status = set_profile_interval_us(cpu_status.requested_interval_us);
+            if (interval_status != ERROR_SUCCESS) {
+                return fail_win32("TraceSetInformation(ProfileTime)", interval_status);
+            }
+            cpu_status.interval_changed = true;
+            interval_status = query_profile_interval_us(cpu_status.applied_interval_us);
+            if (interval_status != ERROR_SUCCESS) {
+                return fail_win32("TraceQueryInformation(ProfileTime applied)", interval_status);
+            }
+        }
+
         TRACEHANDLE handle = 0;
         ULONG status = StartTraceA(&handle, session_name_utf8, trace.properties);
         if (status == ERROR_ALREADY_EXISTS) {
@@ -2036,7 +2697,14 @@ int32_t da_etw_session_start_file_trace(
             ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
             return fail_win32("EnableTraceEx2", status);
         }
-        enable_kernel_stack_tracing(handle, preset_flags, stack_status);
+        status = enable_kernel_stack_tracing(handle, preset_flags, stack_status);
+        if (status != ERROR_SUCCESS && cpu_sampling) {
+            disable_providers(handle, providers);
+            ControlTraceA(handle, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
+            return fail_win32("TraceSetInformation(Profile StackWalk)", status);
+        }
+        cpu_status.stack_enabled = cpu_sampling && stack_status.kernel_stack_enabled;
+        cpu_status.enabled = cpu_sampling && cpu_status.stack_enabled;
 
         auto session = std::make_unique<DA_EtwSessionHandle>();
         session->handle = handle;
@@ -2044,6 +2712,8 @@ int32_t da_etw_session_start_file_trace(
         session->trace_path = trace_path_utf8;
         session->enabled_providers = std::move(providers);
         session->stack_trace_status = stack_status;
+        session->cpu_sampling_status = cpu_status;
+        interval_restore_guard.release();
         *out_handle = session.release();
         return DA_ETW_OK;
 #endif
@@ -2083,6 +2753,35 @@ int32_t da_etw_session_stack_trace_status(
     });
 }
 
+int32_t da_etw_session_cpu_sampling_status(
+    DA_EtwSessionHandle* handle,
+    DA_EtwCpuSamplingStatus* out) {
+    return guard([&]() -> int32_t {
+        if (handle == nullptr) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "session handle is null");
+        }
+        if (out == nullptr) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "out CPU sampling status pointer is null");
+        }
+        std::memset(out, 0, sizeof(*out));
+        out->struct_size = sizeof(*out);
+#ifndef _WIN32
+        return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW CPU sampling status is only available on Windows");
+#else
+        const auto& status = handle->cpu_sampling_status;
+        out->requested = status.requested ? 1u : 0u;
+        out->enabled = status.enabled ? 1u : 0u;
+        out->stack_enabled = status.stack_enabled ? 1u : 0u;
+        out->requested_interval_us = status.requested_interval_us;
+        out->applied_interval_us = status.applied_interval_us;
+        out->previous_interval_us = status.previous_interval_us;
+        out->maximum_trace_size_mb = status.maximum_trace_size_mb;
+        out->warning_count = status.warning_count;
+        return DA_ETW_OK;
+#endif
+    });
+}
+
 int32_t da_etw_session_start_realtime_consumer(
     DA_EtwSessionHandle* handle,
     const char* events_dir_utf8,
@@ -2110,9 +2809,21 @@ int32_t da_etw_session_start_realtime_consumer(
         consumer->context.preset_flags = preset_flags;
         consumer->context.has_root_pid = has_root_pid != 0;
         consumer->context.root_pid = root_pid;
+        consumer->context.cpu_sampling_interval_us = handle->cpu_sampling_status.applied_interval_us;
         initialize_process_tree(consumer->context);
         std::filesystem::create_directories(consumer->context.events_dir);
         consumer->worker = std::thread(run_realtime_consumer, consumer.get());
+        {
+            std::unique_lock<std::mutex> lock(consumer->start_mutex);
+            consumer->start_condition.wait(lock, [&consumer] { return consumer->start_complete; });
+        }
+        if (consumer->open_status != ERROR_SUCCESS) {
+            const ULONG status = consumer->open_status;
+            if (consumer->worker.joinable()) {
+                consumer->worker.join();
+            }
+            return fail_win32("OpenTraceA(REALTIME)", status);
+        }
         handle->realtime_consumer = std::move(consumer);
         return DA_ETW_OK;
 #endif
@@ -2120,16 +2831,34 @@ int32_t da_etw_session_start_realtime_consumer(
 }
 
 int32_t da_etw_session_stop(DA_EtwSessionHandle* handle) {
+    DA_EtwSessionStopResult result = {};
+    result.struct_size = sizeof(result);
+    return da_etw_session_stop_ex(handle, &result);
+}
+
+int32_t da_etw_session_stop_ex(DA_EtwSessionHandle* handle, DA_EtwSessionStopResult* out) {
     return guard([&]() -> int32_t {
         if (handle == nullptr) {
             return fail(DA_ETW_ERR_INVALID_ARGUMENT, "session handle is null");
         }
+        if (out == nullptr) {
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "out stop result pointer is null");
+        }
+        const uint32_t caller_size = out->struct_size == 0 ? sizeof(*out) : out->struct_size;
+        std::memset(out, 0, std::min<size_t>(caller_size, sizeof(*out)));
+        out->struct_size = sizeof(*out);
 
 #ifndef _WIN32
         delete handle;
         return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW file trace is only available on Windows");
 #else
-        auto trace = make_trace_properties(handle->session_name.c_str(), handle->trace_path.c_str());
+        const bool cpu_sampling = handle->cpu_sampling_status.requested;
+        auto trace = make_trace_properties(
+            handle->session_name.c_str(),
+            handle->trace_path.c_str(),
+            cpu_sampling,
+            handle->cpu_sampling_status.maximum_trace_size_mb,
+            false);
         disable_providers(handle->handle, handle->enabled_providers);
         const ULONG status = ControlTraceA(
             handle->handle,
@@ -2142,6 +2871,36 @@ int32_t da_etw_session_stop(DA_EtwSessionHandle* handle) {
         const ULONG consumer_status = handle->realtime_consumer != nullptr
                                           ? handle->realtime_consumer->status.load(std::memory_order_relaxed)
                                           : ERROR_SUCCESS;
+        if (result_has_field(caller_size, offsetof(DA_EtwSessionStopResult, events_lost), sizeof(out->events_lost))) {
+            out->events_lost = trace.properties->EventsLost;
+            out->buffers_written = trace.properties->BuffersWritten;
+            out->log_buffers_lost = trace.properties->LogBuffersLost;
+            out->realtime_buffers_lost = trace.properties->RealTimeBuffersLost;
+        }
+        if (handle->realtime_consumer != nullptr) {
+            const auto& context = handle->realtime_consumer->context;
+#define DA_SET_STOP_FIELD(field, value)                                                        \
+    do {                                                                                       \
+        if (result_has_field(caller_size, offsetof(DA_EtwSessionStopResult, field), sizeof(out->field))) { \
+            out->field = (value);                                                              \
+        }                                                                                      \
+    } while (0)
+            DA_SET_STOP_FIELD(events_written, context.events_written);
+            DA_SET_STOP_FIELD(skipped_events, context.skipped_events);
+            DA_SET_STOP_FIELD(cpu_samples_written, context.quality.cpu_samples_written);
+            DA_SET_STOP_FIELD(cpu_samples_with_stack, context.quality.cpu_samples_with_stack);
+            DA_SET_STOP_FIELD(cpu_samples_leaf_only, context.quality.cpu_samples_leaf_only);
+            DA_SET_STOP_FIELD(cpu_samples_out_of_scope, context.quality.cpu_samples_out_of_scope);
+            DA_SET_STOP_FIELD(cpu_samples_cache_flushed, context.quality.cpu_samples_cache_flushed);
+#undef DA_SET_STOP_FIELD
+        }
+        restore_profile_interval(handle->cpu_sampling_status, out, caller_size);
+        if (result_has_field(caller_size, offsetof(DA_EtwSessionStopResult, warning_count), sizeof(out->warning_count))) {
+            out->warning_count = handle->cpu_sampling_status.warning_count;
+            if (consumer_status != ERROR_SUCCESS && consumer_status != ERROR_CANCELLED) {
+                out->warning_count += 1;
+            }
+        }
         delete handle;
         if (status != ERROR_SUCCESS) {
             return fail_win32("ControlTraceA(STOP)", status);
@@ -2186,12 +2945,15 @@ int32_t da_etw_extract_file_events(
 
         EVENT_TRACE_LOGFILEA logfile = {};
         logfile.LogFileName = const_cast<char*>(trace_path_utf8);
-        logfile.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
         logfile.EventRecordCallback = event_record_callback;
         logfile.Context = &context;
+        context.raw_timestamps = true;
+        initialize_raw_timestamp_clock(context);
 
         const ULONG status = process_trace_logfile(logfile);
         flush_pending_file_events(context);
+        flush_pending_cpu_samples(context);
         if (status != ERROR_SUCCESS) {
             return fail_win32("ProcessTrace", status);
         }

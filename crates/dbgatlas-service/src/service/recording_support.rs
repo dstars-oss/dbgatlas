@@ -12,6 +12,9 @@ pub(super) fn write_recording_start_artifacts(
     trace_consumer_error: Option<&str>,
     trace_stack_status: Option<dbgatlas_etw::EtwStackTraceStatus>,
     trace_stack_status_error: Option<&str>,
+    cpu_sampling: Option<CpuSamplingOptions>,
+    cpu_sampling_status: Option<dbgatlas_etw::EtwCpuSamplingStatus>,
+    cpu_sampling_status_error: Option<&str>,
 ) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
     fs::create_dir_all(artifact_dir.join("events"))?;
     let metadata = recording_metadata_json(
@@ -28,6 +31,10 @@ pub(super) fn write_recording_start_artifacts(
         trace_consumer_error,
         trace_stack_status,
         trace_stack_status_error,
+        cpu_sampling,
+        cpu_sampling_status,
+        cpu_sampling_status_error,
+        None,
         None,
     );
     let metadata_snapshot = format!("metadata/{}.json", operation_id.id.as_str());
@@ -66,7 +73,7 @@ pub(super) fn write_recording_start_artifacts(
 
 pub(super) fn write_recording_stop_artifacts(
     artifact_dir: &Path,
-    recording: &ManagedRecording,
+    recording: &mut ManagedRecording,
     operation_id: &OperationRef,
     now: Timestamp,
 ) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
@@ -83,6 +90,12 @@ pub(super) fn write_recording_stop_artifacts(
         let suffix = format!("events/{}", preset.artifact_file_name());
         let path = artifact_dir.join(&suffix);
         if path.is_file() && fs::metadata(&path)?.len() > 0 {
+            continue;
+        }
+        if *preset == RecordingPreset::Cpu {
+            if !path.is_file() {
+                fs::write(&path, [])?;
+            }
             continue;
         }
         let event = normalized_recording_event(
@@ -107,6 +120,7 @@ pub(super) fn write_recording_stop_artifacts(
 }
 
 pub(super) struct TraceArtifactOutcome {
+    pub(super) relative_path: String,
     pub(super) byte_len: u64,
     pub(super) description: String,
     pub(super) valid_etl: bool,
@@ -124,23 +138,28 @@ pub(super) struct EtwProcessingOutcome {
 
 pub(super) fn write_recording_terminal_trace_artifacts(
     artifact_dir: &Path,
-    recording: &ManagedRecording,
+    recording: &mut ManagedRecording,
     operation_id: &OperationRef,
     now: Timestamp,
     state: &str,
 ) -> Result<Vec<WorkerArtifactWrite>, ServiceError> {
     let trace_path = artifact_dir.join("trace.etl");
     let trace_outcome = write_recording_trace_artifact(recording, &trace_path)?;
-    let mut writes = write_recording_terminal_metadata(
+    let mut writes = Vec::new();
+    write_cpu_profile_artifacts(recording, &mut writes)?;
+    writes.extend(write_recording_terminal_metadata(
         artifact_dir,
         recording,
         operation_id,
         now,
         state,
         Some(&trace_outcome),
-    )?;
+    )?);
     writes.push(WorkerArtifactWrite {
-        relative_path: recording_relative_path(&recording.recording_id, "trace.etl"),
+        relative_path: recording_relative_path(
+            &recording.recording_id,
+            &trace_outcome.relative_path,
+        ),
         kind: "recording.trace".to_string(),
         role: None,
         byte_len: trace_outcome.byte_len,
@@ -151,37 +170,74 @@ pub(super) fn write_recording_terminal_trace_artifacts(
 }
 
 pub(super) fn write_recording_trace_artifact(
-    recording: &ManagedRecording,
+    recording: &mut ManagedRecording,
     trace_path: &Path,
 ) -> Result<TraceArtifactOutcome, ServiceError> {
-    let mut session = recording
-        .trace_session
+    let trace_session = recording.trace_session.clone();
+    let mut session = trace_session
         .lock()
         .map_err(|_| ServiceError::Worker("recording trace session lock poisoned".to_string()))?;
     if let Some(session) = session.take() {
         match session.stop() {
-            Ok(()) => {
+            Ok(stop_result) => {
+                recording.trace_stop_result = Some(stop_result);
                 let filter_note = filter_recording_trace(recording, trace_path);
-                let extraction_note = extract_recording_events(recording, trace_path);
-                let byte_len = fs::metadata(trace_path)?.len();
+                let extraction_note = if recording.trace_consumer_error.is_some() {
+                    extract_recording_events(recording, trace_path)
+                } else {
+                    EtwProcessingOutcome {
+                        description: "realtime event consumer is authoritative; offline extraction was not run".to_string(),
+                        result: None,
+                        error: None,
+                    }
+                };
+                let mut relative_path = "trace.etl".to_string();
+                let mut fallback_reason = None;
+                if recording.cpu_sampling.is_some() && filter_note.error.is_some() {
+                    relative_path = "trace.unfiltered.etl".to_string();
+                    let unfiltered_path = recording.artifact_dir.join(&relative_path);
+                    fs::rename(trace_path, &unfiltered_path)?;
+                    fallback_reason = filter_note.error.clone();
+                }
+                let final_path = recording.artifact_dir.join(&relative_path);
+                let byte_len = fs::metadata(&final_path)?.len();
                 let description = format!(
                     "ETW file trace; {}; {}",
                     filter_note.description, extraction_note.description
                 );
                 return Ok(TraceArtifactOutcome {
+                    relative_path,
                     byte_len,
                     description,
                     valid_etl: true,
-                    fallback_reason: None,
+                    fallback_reason,
                     filter: filter_note,
                     extraction: extraction_note,
                 });
             }
             Err(error) => {
+                let extraction_note = extract_recording_events(recording, trace_path);
+                if recording.cpu_sampling.is_some() && trace_path.is_file() {
+                    let relative_path = "trace.unfiltered.etl".to_string();
+                    let unfiltered_path = recording.artifact_dir.join(&relative_path);
+                    fs::rename(trace_path, &unfiltered_path)?;
+                    return Ok(TraceArtifactOutcome {
+                        relative_path,
+                        byte_len: fs::metadata(&unfiltered_path)?.len(),
+                        description: format!(
+                            "unfiltered ETL retained after native stop error: {error}"
+                        ),
+                        valid_etl: false,
+                        fallback_reason: Some(format!("Native ETW stop failed: {error}")),
+                        filter: EtwProcessingOutcome::default(),
+                        extraction: extraction_note,
+                    });
+                }
                 let trace_text =
                     format!("DbgAtlas fallback trace artifact.\nNative ETW stop failed: {error}\n");
                 fs::write(trace_path, trace_text.as_bytes())?;
                 return Ok(TraceArtifactOutcome {
+                    relative_path: "trace.etl".to_string(),
                     byte_len: trace_text.len() as u64,
                     description: "fallback trace artifact with native ETW stop error".to_string(),
                     valid_etl: false,
@@ -201,6 +257,7 @@ pub(super) fn write_recording_trace_artifact(
         format!("DbgAtlas fallback trace artifact.\nNative ETW start failed: {reason}\n");
     fs::write(trace_path, trace_text.as_bytes())?;
     Ok(TraceArtifactOutcome {
+        relative_path: "trace.etl".to_string(),
         byte_len: trace_text.len() as u64,
         description: "fallback trace artifact with native ETW start error".to_string(),
         valid_etl: false,
@@ -208,6 +265,50 @@ pub(super) fn write_recording_trace_artifact(
         filter: EtwProcessingOutcome::default(),
         extraction: EtwProcessingOutcome::default(),
     })
+}
+
+pub(super) fn write_cpu_profile_artifacts(
+    recording: &mut ManagedRecording,
+    writes: &mut Vec<WorkerArtifactWrite>,
+) -> Result<(), ServiceError> {
+    let Some(cpu) = recording.cpu_sampling else {
+        return Ok(());
+    };
+    let events_path = recording.artifact_dir.join("events/cpu.jsonl");
+    if !events_path.is_file() {
+        fs::write(&events_path, [])?;
+    }
+    let applied_interval_us = recording
+        .cpu_sampling_status
+        .map(|status| status.applied_interval_us)
+        .filter(|interval| *interval != 0)
+        .unwrap_or(cpu.interval_us);
+    let aggregation =
+        dbgatlas_recording::aggregate_cpu_jsonl(&events_path, applied_interval_us, 100)?;
+    recording.cpu_summary = Some(aggregation.hotspots.summary(20));
+    fs::create_dir_all(recording.artifact_dir.join("cpu"))?;
+    let hotspots_path = recording.artifact_dir.join("cpu/hotspots.json");
+    let hotspots_len = write_json_file(
+        &hotspots_path,
+        &serde_json::to_value(&aggregation.hotspots)?,
+    )?;
+    let folded_path = recording.artifact_dir.join("cpu/stacks.folded");
+    fs::write(&folded_path, aggregation.folded_stacks.as_bytes())?;
+    writes.push(WorkerArtifactWrite {
+        relative_path: recording_relative_path(&recording.recording_id, "cpu/hotspots.json"),
+        kind: "recording.cpu.hotspots".to_string(),
+        role: None,
+        byte_len: hotspots_len,
+        description: Some("CPU frame and stack hotspots".to_string()),
+    });
+    writes.push(WorkerArtifactWrite {
+        relative_path: recording_relative_path(&recording.recording_id, "cpu/stacks.folded"),
+        kind: "recording.cpu.folded".to_string(),
+        role: None,
+        byte_len: fs::metadata(&folded_path)?.len(),
+        description: Some("root-to-leaf folded CPU stacks".to_string()),
+    });
+    Ok(())
 }
 
 pub(super) fn register_recording_event_writes(
@@ -221,7 +322,7 @@ pub(super) fn register_recording_event_writes(
         let size_after = fs::metadata(&path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        if size_after == 0 {
+        if size_after == 0 && *preset != RecordingPreset::Cpu {
             continue;
         }
         writes.push(WorkerArtifactWrite {
@@ -289,20 +390,68 @@ pub(super) fn extract_recording_events(
         etw_preset_flags(&recording.presets),
         recording.root_pid,
     ) {
-        Ok(result) => EtwProcessingOutcome {
-            description: format!(
-                "event extraction wrote {} events to {} files and skipped {}",
-                result.events_written, result.files_written, result.skipped_events
-            ),
-            result: Some(result),
-            error: None,
-        },
+        Ok(result) => {
+            let interval_error = normalize_extracted_cpu_interval(recording)
+                .err()
+                .map(|error| error.to_string());
+            EtwProcessingOutcome {
+                description: format!(
+                    "event extraction wrote {} events to {} files and skipped {}{}",
+                    result.events_written,
+                    result.files_written,
+                    result.skipped_events,
+                    interval_error
+                        .as_ref()
+                        .map(|error| format!("; CPU interval normalization failed: {error}"))
+                        .unwrap_or_default()
+                ),
+                result: Some(result),
+                error: interval_error,
+            }
+        }
         Err(error) => EtwProcessingOutcome {
             description: format!("event extraction skipped: {error}"),
             result: None,
             error: Some(error.to_string()),
         },
     }
+}
+
+fn normalize_extracted_cpu_interval(recording: &ManagedRecording) -> Result<(), ServiceError> {
+    let Some(cpu) = recording.cpu_sampling else {
+        return Ok(());
+    };
+    let path = recording.artifact_dir.join("events/cpu.jsonl");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let interval_us = recording
+        .cpu_sampling_status
+        .map(|status| status.applied_interval_us)
+        .filter(|interval| *interval != 0)
+        .unwrap_or(cpu.interval_us);
+    let temporary = recording.artifact_dir.join("events/cpu.interval.tmp");
+    let result = (|| -> Result<(), ServiceError> {
+        let input = BufReader::new(fs::File::open(&path)?);
+        let mut output = fs::File::create(&temporary)?;
+        for line in input.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut value: Value = serde_json::from_str(&line)?;
+            value["interval_us"] = json!(interval_us);
+            serde_json::to_writer(&mut output, &value)?;
+            writeln!(output)?;
+        }
+        output.flush()?;
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(super) fn write_recording_terminal_metadata(
@@ -327,6 +476,10 @@ pub(super) fn write_recording_terminal_metadata(
         recording.trace_consumer_error.as_deref(),
         recording.trace_stack_status,
         recording.trace_stack_status_error.as_deref(),
+        recording.cpu_sampling,
+        recording.cpu_sampling_status,
+        recording.cpu_sampling_status_error.as_deref(),
+        recording.trace_stop_result,
         trace_outcome,
     );
     let metadata_len = write_json_file(&artifact_dir.join("recording.json"), &metadata)?;
@@ -354,6 +507,10 @@ pub(super) fn recording_metadata_json(
     trace_consumer_error: Option<&str>,
     trace_stack_status: Option<dbgatlas_etw::EtwStackTraceStatus>,
     trace_stack_status_error: Option<&str>,
+    cpu_sampling: Option<CpuSamplingOptions>,
+    cpu_sampling_status: Option<dbgatlas_etw::EtwCpuSamplingStatus>,
+    cpu_sampling_status_error: Option<&str>,
+    trace_stop_result: Option<dbgatlas_etw::EtwSessionStopResult>,
     trace_outcome: Option<&TraceArtifactOutcome>,
 ) -> Value {
     json!({
@@ -376,6 +533,13 @@ pub(super) fn recording_metadata_json(
             trace_stack_status_error,
             trace_start_error,
         ),
+        "cpu_sampling": cpu_sampling_metadata(
+            cpu_sampling,
+            cpu_sampling_status,
+            cpu_sampling_status_error,
+            trace_stop_result,
+            trace_outcome,
+        ),
         "trace_start_error": trace_start_error,
         "trace_consumer_error": trace_consumer_error,
         "trace": trace_metadata(trace_outcome),
@@ -384,15 +548,102 @@ pub(super) fn recording_metadata_json(
     })
 }
 
+pub(super) fn cpu_sampling_metadata(
+    requested: Option<CpuSamplingOptions>,
+    status: Option<dbgatlas_etw::EtwCpuSamplingStatus>,
+    status_error: Option<&str>,
+    stop: Option<dbgatlas_etw::EtwSessionStopResult>,
+    trace_outcome: Option<&TraceArtifactOutcome>,
+) -> Value {
+    let Some(requested) = requested else {
+        return Value::Null;
+    };
+    let mut warnings = Vec::new();
+    if let Some(error) = status_error {
+        warnings.push(format!("CPU sampling status unavailable: {error}"));
+    }
+    if let Some(status) = status {
+        if status.warning_count > 0 {
+            warnings.push(format!(
+                "CPU sampling startup reported {} warnings",
+                status.warning_count
+            ));
+        }
+    }
+    if let Some(stop) = stop {
+        if stop.events_lost > 0 || stop.log_buffers_lost > 0 || stop.realtime_buffers_lost > 0 {
+            warnings.push(format!(
+                "ETW loss detected: events={}, log_buffers={}, realtime_buffers={}",
+                stop.events_lost, stop.log_buffers_lost, stop.realtime_buffers_lost
+            ));
+        }
+        if stop.interval_restore_skipped {
+            warnings.push(
+                "ProfileTime restoration was skipped because another profiler changed the interval"
+                    .to_string(),
+            );
+        } else if stop.interval_restore_attempted && !stop.interval_restored {
+            warnings.push("ProfileTime restoration was attempted but did not succeed".to_string());
+        }
+        if stop.cpu_samples_leaf_only > 0 {
+            warnings.push(format!(
+                "{} CPU samples could not be paired with StackWalk and were emitted leaf-only",
+                stop.cpu_samples_leaf_only
+            ));
+        }
+        if stop.cpu_samples_cache_flushed > 0 {
+            warnings.push(format!(
+                "{} CPU samples were flushed from the bounded pairing cache",
+                stop.cpu_samples_cache_flushed
+            ));
+        }
+    }
+    if let Some(outcome) = trace_outcome {
+        if let Some(error) = &outcome.filter.error {
+            warnings.push(format!("target ETL filtering failed: {error}"));
+        }
+    }
+    json!({
+        "requested": requested,
+        "status": status,
+        "status_error": status_error,
+        "requested_interval_us": requested.interval_us,
+        "applied_interval_us": status.map(|status| status.applied_interval_us),
+        "previous_interval_us": status.map(|status| status.previous_interval_us),
+        "maximum_trace_size_mb": requested.max_trace_size_mb,
+        "interval_restore": stop.map(|stop| json!({
+            "attempted": stop.interval_restore_attempted,
+            "restored": stop.interval_restored,
+            "skipped": stop.interval_restore_skipped,
+        })),
+        "quality": stop.map(|stop| json!({
+            "samples": stop.cpu_samples_written,
+            "stacked_samples": stop.cpu_samples_with_stack,
+            "leaf_only_samples": stop.cpu_samples_leaf_only,
+            "out_of_scope_samples": stop.cpu_samples_out_of_scope,
+            "cache_flushed_samples": stop.cpu_samples_cache_flushed,
+            "events_lost": stop.events_lost,
+            "buffers_written": stop.buffers_written,
+            "log_buffers_lost": stop.log_buffers_lost,
+            "realtime_buffers_lost": stop.realtime_buffers_lost,
+        })),
+        "warnings": warnings,
+    })
+}
+
 pub(super) fn trace_metadata(outcome: Option<&TraceArtifactOutcome>) -> Value {
     match outcome {
         Some(outcome) => json!({
             "valid_etl": outcome.valid_etl,
+            "relative_path": outcome.relative_path,
+            "target_filtered": outcome.filter.error.is_none(),
             "fallback_reason": outcome.fallback_reason,
             "filter": processing_metadata(&outcome.filter),
         }),
         None => json!({
             "valid_etl": null,
+            "relative_path": null,
+            "target_filtered": null,
             "fallback_reason": null,
             "filter": null,
         }),
@@ -504,6 +755,7 @@ pub(super) fn etw_preset_flags(presets: &[RecordingPreset]) -> dbgatlas_etw::Etw
             RecordingPreset::File => dbgatlas_etw::EtwPresetFlags::FILE,
             RecordingPreset::Registry => dbgatlas_etw::EtwPresetFlags::REGISTRY,
             RecordingPreset::Network => dbgatlas_etw::EtwPresetFlags::NETWORK,
+            RecordingPreset::Cpu => dbgatlas_etw::EtwPresetFlags::CPU,
         });
     }
     flags

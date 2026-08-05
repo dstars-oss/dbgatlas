@@ -486,6 +486,8 @@ pub(super) struct RecordingStartParams {
     pub(super) target: RecordingTarget,
     #[serde(default = "dbgatlas_recording::default_presets")]
     pub(super) presets: Vec<RecordingPreset>,
+    #[serde(default)]
+    pub(super) cpu_sampling: Option<CpuSamplingOptions>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

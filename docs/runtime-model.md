@@ -80,7 +80,7 @@ recording runtime config 只保存本机工具和进程策略，不进入 analys
 
 recording policy 的文档目标：
 
-- 默认使用内置 process/thread/image/file/registry/network presets。
+- 默认使用内置 process/thread/image/file/registry/network presets；CPU sampling 通过显式 `cpu` preset opt-in，默认不启用。
 - 以 process tree 作为主要过滤维度。
 - 支持 launch process 和 attach pid 两种 target。
 - attach 不回填历史，只记录 `recording.start` 之后的事件。

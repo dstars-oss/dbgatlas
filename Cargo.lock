@@ -184,6 +184,7 @@ version = "0.3.0"
 dependencies = [
  "dbgatlas-etw-sys",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -223,6 +224,8 @@ version = "0.3.0"
 dependencies = [
  "dbgatlas-model",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

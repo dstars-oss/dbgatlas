@@ -1,5 +1,164 @@
 use super::*;
 
+fn start_cpu_recording(host: &ServiceHost, project_root: &Path) -> JsonRpcResponse {
+    host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: "recording.start".to_string(),
+        params: Some(json!({
+            "project_root": project_root,
+            "target": { "type": "attach", "pid": std::process::id() },
+            "presets": ["cpu"],
+            "cpu_sampling": { "interval_us": 1000, "max_trace_size_mb": 512 }
+        })),
+    })
+}
+
+#[test]
+fn cpu_recording_enforces_single_session_and_writes_profile_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let (host, stop_count) = cpu_test_host(MockEtwMode::Success);
+    let started = start_cpu_recording(&host, temp.path());
+    assert!(started.error.is_none(), "{:?}", started.error);
+    let start_result = started.result.unwrap();
+    assert_eq!(start_result["cpu_sampling"]["interval_us"], 1000);
+    assert!(start_result["cpu_summary"].is_null());
+    let recording_id = start_result["recording_id"].clone();
+
+    let concurrent = start_cpu_recording(&host, temp.path());
+    assert!(
+        concurrent
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("another CPU recording"))
+    );
+
+    let status = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(2)),
+        method: "recording.status".to_string(),
+        params: Some(json!({ "recording_id": recording_id })),
+    });
+    assert!(status.result.unwrap()["cpu_summary"].is_null());
+
+    let stopped = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(3)),
+        method: "recording.stop".to_string(),
+        params: Some(json!({ "recording_id": recording_id })),
+    });
+    assert!(stopped.error.is_none(), "{:?}", stopped.error);
+    let stopped = stopped.result.unwrap();
+    assert_eq!(stopped["cpu_summary"]["quality"]["total_samples"], 3);
+    assert_eq!(stopped["cpu_summary"]["quality"]["stacked_samples"], 2);
+    assert_eq!(
+        stopped["cpu_summary"]["top_exclusive_frames"][0]["frame"],
+        "busy.exe+0x10"
+    );
+    assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+
+    let recording_id = recording_id["id"].as_str().unwrap();
+    let recording_dir = temp
+        .path()
+        .join(INTERNAL_WORKSPACE_DIR)
+        .join("artifacts/recordings")
+        .join(recording_id);
+    let cpu_lines = fs::read_to_string(recording_dir.join("events/cpu.jsonl")).unwrap();
+    assert_eq!(
+        cpu_lines.lines().count(),
+        3,
+        "realtime samples must not be duplicated"
+    );
+    assert!(recording_dir.join("cpu/hotspots.json").is_file());
+    assert_eq!(
+        fs::read_to_string(recording_dir.join("cpu/stacks.folded")).unwrap(),
+        "busy.exe+0x30 1\nkernel32.dll+0x20;busy.exe+0x10 2\n"
+    );
+    assert!(recording_dir.join("trace.unfiltered.etl").is_file());
+    assert!(!recording_dir.join("trace.etl").is_file());
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(recording_dir.join("recording.json")).unwrap()).unwrap();
+    assert_eq!(
+        metadata["cpu_sampling"]["interval_restore"]["restored"],
+        true
+    );
+    assert_eq!(metadata["cpu_sampling"]["quality"]["events_lost"], 1);
+    assert!(
+        !metadata["cpu_sampling"]["warnings"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(metadata["trace"]["relative_path"], "trace.unfiltered.etl");
+    assert_eq!(metadata["trace"]["target_filtered"], false);
+
+    let restarted = start_cpu_recording(&host, temp.path());
+    assert!(restarted.error.is_none(), "{:?}", restarted.error);
+}
+
+#[test]
+fn cpu_recording_cancel_kill_and_zero_samples_finalize_cleanly() {
+    for method in ["recording.cancel", "recording.kill"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, stop_count) = cpu_test_host(MockEtwMode::ZeroSamples);
+        let started = start_cpu_recording(&host, temp.path()).result.unwrap();
+        let recording_id = started["recording_id"].clone();
+        let finished = host.handle_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: method.to_string(),
+            params: Some(json!({ "recording_id": recording_id })),
+        });
+        assert!(finished.error.is_none(), "{method}: {:?}", finished.error);
+        assert_eq!(
+            finished.result.unwrap()["cpu_summary"]["quality"]["total_samples"],
+            0
+        );
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        let recording_id = recording_id["id"].as_str().unwrap();
+        let dir = temp
+            .path()
+            .join(INTERNAL_WORKSPACE_DIR)
+            .join("artifacts/recordings")
+            .join(recording_id);
+        assert_eq!(fs::metadata(dir.join("events/cpu.jsonl")).unwrap().len(), 0);
+        assert!(dir.join("cpu/hotspots.json").is_file());
+        let metadata: Value =
+            serde_json::from_slice(&fs::read(dir.join("recording.json")).unwrap()).unwrap();
+        assert_eq!(
+            metadata["cpu_sampling"]["interval_restore"]["restored"],
+            true
+        );
+    }
+}
+
+#[test]
+fn cpu_recording_start_and_consumer_failures_are_strict_and_rollback() {
+    let temp = tempfile::tempdir().unwrap();
+    let (host, _) = cpu_test_host(MockEtwMode::StartFailure);
+    let failed = start_cpu_recording(&host, temp.path());
+    assert!(
+        failed
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("profile privilege denied"))
+    );
+
+    let (host, stop_count) = cpu_test_host(MockEtwMode::ConsumerFailure);
+    let failed = start_cpu_recording(&host, temp.path());
+    assert!(
+        failed
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("realtime consumer failed"))
+    );
+    assert_eq!(
+        stop_count.load(Ordering::SeqCst),
+        1,
+        "failed start must stop ETW and restore interval"
+    );
+}
+
 #[test]
 fn recording_start_creates_recording_artifacts() {
     let temp = tempfile::tempdir().unwrap();

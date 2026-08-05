@@ -7,8 +7,9 @@ use dbgatlas_model::{
     ResultPreview, SessionRef, Timestamp,
 };
 use dbgatlas_recording::{
-    RecordTtd, RecordingPreset, RecordingState, RecordingTarget, StartRecording,
-    TtdRecordingOptions, TtdTarget, build_ttd_args, ttd_stop_target,
+    CpuProfileSummary, CpuSamplingOptions, RecordTtd, RecordingPreset, RecordingState,
+    RecordingTarget, StartRecording, TtdRecordingOptions, TtdTarget, build_ttd_args,
+    ttd_stop_target,
 };
 use dbgatlas_runtime::{RuntimeConfig, resolve_store_windbg_dbgeng_dir};
 use dbgatlas_worker_protocol::{
@@ -28,7 +29,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -323,6 +324,7 @@ pub struct ServiceHost {
     supervisor: Arc<dyn WorkerSupervisor>,
     capabilities: ServiceCapabilities,
     ttd_runner: Arc<dyn TtdRecorderRunner>,
+    etw_controller: Arc<dyn EtwController>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -370,11 +372,38 @@ struct ServiceState {
     recordings: HashMap<String, ManagedRecording>,
     operations: HashMap<String, ServiceOperation>,
     active_ttd_recording: Option<RecordingRef>,
+    active_cpu_recording: Option<RecordingRef>,
 }
 
 struct TtdActiveGuard {
     state: Arc<Mutex<ServiceState>>,
     recording_id: RecordingRef,
+}
+
+struct CpuActiveGuard {
+    state: Arc<Mutex<ServiceState>>,
+    recording_id: RecordingRef,
+    committed: bool,
+}
+
+impl CpuActiveGuard {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CpuActiveGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.active_cpu_recording.as_ref() == Some(&self.recording_id) {
+            state.active_cpu_recording = None;
+        }
+    }
 }
 
 impl Drop for TtdActiveGuard {
@@ -396,6 +425,7 @@ struct ManagedRecording {
     artifact_dir: PathBuf,
     target: RecordingTarget,
     presets: Vec<RecordingPreset>,
+    cpu_sampling: Option<CpuSamplingOptions>,
     root_pid: Option<u32>,
     state: RecordingState,
     created_at: Timestamp,
@@ -403,11 +433,15 @@ struct ManagedRecording {
     last_operation: Option<OperationRef>,
     artifacts: Vec<ArtifactRef>,
     #[serde(skip)]
-    trace_session: Arc<Mutex<Option<dbgatlas_etw::EtwFileSession>>>,
+    trace_session: Arc<Mutex<Option<Box<dyn EtwSessionControl>>>>,
     trace_start_error: Option<String>,
     trace_consumer_error: Option<String>,
     trace_stack_status: Option<dbgatlas_etw::EtwStackTraceStatus>,
     trace_stack_status_error: Option<String>,
+    cpu_sampling_status: Option<dbgatlas_etw::EtwCpuSamplingStatus>,
+    cpu_sampling_status_error: Option<String>,
+    trace_stop_result: Option<dbgatlas_etw::EtwSessionStopResult>,
+    cpu_summary: Option<CpuProfileSummary>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -577,6 +611,86 @@ enum TtdRecorderIdentity {
 
 trait TtdRecorderRunner: Send + Sync {
     fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdProcessExit, ServiceError>;
+}
+
+trait EtwSessionControl: Send + std::fmt::Debug {
+    fn stack_trace_status(
+        &self,
+    ) -> Result<dbgatlas_etw::EtwStackTraceStatus, dbgatlas_etw::EtwError>;
+    fn cpu_sampling_status(
+        &self,
+    ) -> Result<dbgatlas_etw::EtwCpuSamplingStatus, dbgatlas_etw::EtwError>;
+    fn start_realtime_consumer(
+        &mut self,
+        events_dir: PathBuf,
+        presets: dbgatlas_etw::EtwPresetFlags,
+        root_pid: Option<u32>,
+    ) -> Result<(), dbgatlas_etw::EtwError>;
+    fn stop(self: Box<Self>) -> Result<dbgatlas_etw::EtwSessionStopResult, dbgatlas_etw::EtwError>;
+}
+
+impl EtwSessionControl for dbgatlas_etw::EtwFileSession {
+    fn stack_trace_status(
+        &self,
+    ) -> Result<dbgatlas_etw::EtwStackTraceStatus, dbgatlas_etw::EtwError> {
+        self.stack_trace_status()
+    }
+
+    fn cpu_sampling_status(
+        &self,
+    ) -> Result<dbgatlas_etw::EtwCpuSamplingStatus, dbgatlas_etw::EtwError> {
+        self.cpu_sampling_status()
+    }
+
+    fn start_realtime_consumer(
+        &mut self,
+        events_dir: PathBuf,
+        presets: dbgatlas_etw::EtwPresetFlags,
+        root_pid: Option<u32>,
+    ) -> Result<(), dbgatlas_etw::EtwError> {
+        self.start_realtime_consumer(events_dir, presets, root_pid)
+    }
+
+    fn stop(self: Box<Self>) -> Result<dbgatlas_etw::EtwSessionStopResult, dbgatlas_etw::EtwError> {
+        (*self).stop_with_result()
+    }
+}
+
+trait EtwController: Send + Sync {
+    fn start(
+        &self,
+        session_name: &str,
+        trace_path: &Path,
+        presets: dbgatlas_etw::EtwPresetFlags,
+        cpu_sampling: Option<CpuSamplingOptions>,
+    ) -> Result<Box<dyn EtwSessionControl>, dbgatlas_etw::EtwError>;
+}
+
+#[derive(Debug)]
+struct NativeEtwController;
+
+impl EtwController for NativeEtwController {
+    fn start(
+        &self,
+        session_name: &str,
+        trace_path: &Path,
+        presets: dbgatlas_etw::EtwPresetFlags,
+        cpu_sampling: Option<CpuSamplingOptions>,
+    ) -> Result<Box<dyn EtwSessionControl>, dbgatlas_etw::EtwError> {
+        let session = match cpu_sampling {
+            Some(cpu) => dbgatlas_etw::EtwFileSession::start_with_options(
+                session_name,
+                trace_path,
+                presets,
+                dbgatlas_etw::EtwSessionOptions {
+                    cpu_sampling_interval_us: cpu.interval_us,
+                    maximum_trace_size_mb: cpu.max_trace_size_mb,
+                },
+            )?,
+            None => dbgatlas_etw::EtwFileSession::start(session_name, trace_path, presets)?,
+        };
+        Ok(Box::new(session))
+    }
 }
 
 #[derive(Debug)]

@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
@@ -11,6 +15,12 @@ pub enum RecordingError {
     InvalidAttachPid,
     #[error("recording preset list must not be empty")]
     EmptyPresets,
+    #[error("cpu_sampling options require the `cpu` recording preset")]
+    CpuOptionsWithoutPreset,
+    #[error("cpu sampling interval_us must be between 125 and 1000000")]
+    InvalidCpuSamplingInterval,
+    #[error("cpu sampling max_trace_size_mb must be between 64 and 4096")]
+    InvalidCpuTraceSize,
     #[error("recording arguments must not contain control characters")]
     ControlCharacters,
     #[error("TTD timeout_ms must be greater than zero")]
@@ -85,6 +95,7 @@ pub enum RecordingPreset {
     File,
     Registry,
     Network,
+    Cpu,
 }
 
 impl RecordingPreset {
@@ -105,6 +116,7 @@ impl RecordingPreset {
             Self::File => "file.jsonl",
             Self::Registry => "registry.jsonl",
             Self::Network => "network.jsonl",
+            Self::Cpu => "cpu.jsonl",
         }
     }
 
@@ -116,8 +128,55 @@ impl RecordingPreset {
             Self::File => "file",
             Self::Registry => "registry",
             Self::Network => "network",
+            Self::Cpu => "cpu",
         }
     }
+}
+
+pub const DEFAULT_CPU_SAMPLING_INTERVAL_US: u32 = 1_000;
+pub const MIN_CPU_SAMPLING_INTERVAL_US: u32 = 125;
+pub const MAX_CPU_SAMPLING_INTERVAL_US: u32 = 1_000_000;
+pub const DEFAULT_CPU_TRACE_SIZE_MB: u32 = 512;
+pub const MIN_CPU_TRACE_SIZE_MB: u32 = 64;
+pub const MAX_CPU_TRACE_SIZE_MB: u32 = 4_096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuSamplingOptions {
+    #[serde(default = "default_cpu_sampling_interval_us")]
+    pub interval_us: u32,
+    #[serde(default = "default_cpu_trace_size_mb")]
+    pub max_trace_size_mb: u32,
+}
+
+impl Default for CpuSamplingOptions {
+    fn default() -> Self {
+        Self {
+            interval_us: DEFAULT_CPU_SAMPLING_INTERVAL_US,
+            max_trace_size_mb: DEFAULT_CPU_TRACE_SIZE_MB,
+        }
+    }
+}
+
+impl CpuSamplingOptions {
+    pub fn validate(self) -> Result<Self, RecordingError> {
+        if !(MIN_CPU_SAMPLING_INTERVAL_US..=MAX_CPU_SAMPLING_INTERVAL_US)
+            .contains(&self.interval_us)
+        {
+            return Err(RecordingError::InvalidCpuSamplingInterval);
+        }
+        if !(MIN_CPU_TRACE_SIZE_MB..=MAX_CPU_TRACE_SIZE_MB).contains(&self.max_trace_size_mb) {
+            return Err(RecordingError::InvalidCpuTraceSize);
+        }
+        Ok(self)
+    }
+}
+
+fn default_cpu_sampling_interval_us() -> u32 {
+    DEFAULT_CPU_SAMPLING_INTERVAL_US
+}
+
+fn default_cpu_trace_size_mb() -> u32 {
+    DEFAULT_CPU_TRACE_SIZE_MB
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +184,8 @@ pub struct StartRecording {
     pub target: RecordingTarget,
     #[serde(default = "default_presets")]
     pub presets: Vec<RecordingPreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_sampling: Option<CpuSamplingOptions>,
 }
 
 impl StartRecording {
@@ -132,9 +193,19 @@ impl StartRecording {
         if self.presets.is_empty() {
             return Err(RecordingError::EmptyPresets);
         }
+        let has_cpu = self.presets.contains(&RecordingPreset::Cpu);
+        if self.cpu_sampling.is_some() && !has_cpu {
+            return Err(RecordingError::CpuOptionsWithoutPreset);
+        }
+        let cpu_sampling = if has_cpu {
+            Some(self.cpu_sampling.unwrap_or_default().validate()?)
+        } else {
+            None
+        };
         Ok(Self {
             target: self.target.validate()?,
             presets: self.presets,
+            cpu_sampling,
         })
     }
 }
@@ -426,6 +497,323 @@ pub fn ttd_stop_target(target: &TtdTarget, recorded_pid: Option<u32>) -> Option<
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CpuProfileQuality {
+    pub total_samples: u64,
+    pub stacked_samples: u64,
+    pub leaf_only_samples: u64,
+    pub resolved_leaf_samples: u64,
+    pub cache_flushed_samples: u64,
+    pub invalid_lines: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuFrameHotspot {
+    pub frame: String,
+    pub exclusive_samples: u64,
+    pub inclusive_samples: u64,
+    pub exclusive_percent: f64,
+    pub inclusive_percent: f64,
+    pub estimated_exclusive_cpu_ms: f64,
+    pub estimated_inclusive_cpu_ms: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuStackHotspot {
+    pub frames: Vec<String>,
+    pub samples: u64,
+    pub percent: f64,
+    pub estimated_cpu_ms: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuProcessDistribution {
+    pub pid: u32,
+    pub samples: u64,
+    pub percent: f64,
+    pub estimated_cpu_ms: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuThreadDistribution {
+    pub pid: u32,
+    pub tid: u32,
+    pub samples: u64,
+    pub percent: f64,
+    pub estimated_cpu_ms: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuHotspots {
+    pub schema_version: u32,
+    pub interval_us: u32,
+    pub estimated_cpu_time_ms: f64,
+    pub quality: CpuProfileQuality,
+    pub frames: Vec<CpuFrameHotspot>,
+    pub stacks: Vec<CpuStackHotspot>,
+    pub processes: Vec<CpuProcessDistribution>,
+    pub threads: Vec<CpuThreadDistribution>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuProfileSummary {
+    pub interval_us: u32,
+    pub estimated_cpu_time_ms: f64,
+    pub quality: CpuProfileQuality,
+    pub top_exclusive_frames: Vec<CpuFrameHotspot>,
+    pub top_inclusive_frames: Vec<CpuFrameHotspot>,
+    pub top_stacks: Vec<CpuStackHotspot>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CpuAggregationArtifacts {
+    pub hotspots: CpuHotspots,
+    pub folded_stacks: String,
+}
+
+impl CpuHotspots {
+    pub fn summary(&self, limit: usize) -> CpuProfileSummary {
+        let mut exclusive = self.frames.clone();
+        exclusive.sort_by(|left, right| {
+            right
+                .exclusive_samples
+                .cmp(&left.exclusive_samples)
+                .then_with(|| left.frame.cmp(&right.frame))
+        });
+        exclusive.truncate(limit);
+        let mut inclusive = self.frames.clone();
+        inclusive.sort_by(|left, right| {
+            right
+                .inclusive_samples
+                .cmp(&left.inclusive_samples)
+                .then_with(|| left.frame.cmp(&right.frame))
+        });
+        inclusive.truncate(limit);
+        CpuProfileSummary {
+            interval_us: self.interval_us,
+            estimated_cpu_time_ms: self.estimated_cpu_time_ms,
+            quality: self.quality.clone(),
+            top_exclusive_frames: exclusive,
+            top_inclusive_frames: inclusive,
+            top_stacks: self.stacks.iter().take(limit).cloned().collect(),
+        }
+    }
+}
+
+pub fn aggregate_cpu_jsonl(
+    path: &Path,
+    interval_us: u32,
+    top_limit: usize,
+) -> std::io::Result<CpuAggregationArtifacts> {
+    let input = BufReader::new(File::open(path)?);
+    let mut quality = CpuProfileQuality::default();
+    let mut exclusive_counts = BTreeMap::<String, u64>::new();
+    let mut inclusive_counts = BTreeMap::<String, u64>::new();
+    let mut stack_counts = BTreeMap::<Vec<String>, u64>::new();
+    let mut process_counts = BTreeMap::<u32, u64>::new();
+    let mut thread_counts = BTreeMap::<(u32, u32), u64>::new();
+
+    for line in input.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            quality.invalid_lines += 1;
+            continue;
+        };
+        if value.get("category").and_then(Value::as_str) != Some("cpu")
+            || value.get("event_type").and_then(Value::as_str) != Some("sampled_profile")
+        {
+            continue;
+        }
+        let Some(pid) = value
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            quality.invalid_lines += 1;
+            continue;
+        };
+        let Some(tid) = value
+            .get("tid")
+            .and_then(Value::as_u64)
+            .and_then(|tid| u32::try_from(tid).ok())
+        else {
+            quality.invalid_lines += 1;
+            continue;
+        };
+        let mut leaf_to_root = value
+            .pointer("/stack/frames")
+            .and_then(Value::as_array)
+            .map(|frames| {
+                frames
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|frame| !frame.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if leaf_to_root.is_empty() {
+            if let Some(frame) = value.get("frame").and_then(Value::as_str) {
+                leaf_to_root.push(frame.to_string());
+            } else if let Some(address) = value.get("address").and_then(Value::as_str) {
+                leaf_to_root.push(address.to_string());
+            }
+        }
+        if leaf_to_root.is_empty() {
+            quality.invalid_lines += 1;
+            continue;
+        }
+
+        quality.total_samples += 1;
+        let stacked = value
+            .get("stacked")
+            .and_then(Value::as_bool)
+            .unwrap_or(leaf_to_root.len() > 1);
+        if stacked {
+            quality.stacked_samples += 1;
+        } else {
+            quality.leaf_only_samples += 1;
+        }
+        if value.get("module").is_some_and(|module| !module.is_null()) {
+            quality.resolved_leaf_samples += 1;
+        }
+        if value.get("cache_flushed").and_then(Value::as_bool) == Some(true) {
+            quality.cache_flushed_samples += 1;
+        }
+
+        *exclusive_counts.entry(leaf_to_root[0].clone()).or_default() += 1;
+        for frame in leaf_to_root.iter().cloned().collect::<BTreeSet<_>>() {
+            *inclusive_counts.entry(frame).or_default() += 1;
+        }
+        let mut root_to_leaf = leaf_to_root;
+        root_to_leaf.reverse();
+        *stack_counts.entry(root_to_leaf).or_default() += 1;
+        *process_counts.entry(pid).or_default() += 1;
+        *thread_counts.entry((pid, tid)).or_default() += 1;
+    }
+
+    let total = quality.total_samples;
+    let percent = |count: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            count as f64 * 100.0 / total as f64
+        }
+    };
+    let cpu_ms = |count: u64| count as f64 * interval_us as f64 / 1000.0;
+
+    let mut frame_names = exclusive_counts.keys().cloned().collect::<BTreeSet<_>>();
+    frame_names.extend(inclusive_counts.keys().cloned());
+    let mut frames = frame_names
+        .into_iter()
+        .map(|frame| {
+            let exclusive_samples = exclusive_counts.get(&frame).copied().unwrap_or(0);
+            let inclusive_samples = inclusive_counts.get(&frame).copied().unwrap_or(0);
+            CpuFrameHotspot {
+                frame,
+                exclusive_samples,
+                inclusive_samples,
+                exclusive_percent: percent(exclusive_samples),
+                inclusive_percent: percent(inclusive_samples),
+                estimated_exclusive_cpu_ms: cpu_ms(exclusive_samples),
+                estimated_inclusive_cpu_ms: cpu_ms(inclusive_samples),
+            }
+        })
+        .collect::<Vec<_>>();
+    frames.sort_by(|left, right| {
+        right
+            .inclusive_samples
+            .cmp(&left.inclusive_samples)
+            .then_with(|| right.exclusive_samples.cmp(&left.exclusive_samples))
+            .then_with(|| left.frame.cmp(&right.frame))
+    });
+    frames.truncate(top_limit);
+
+    let mut stacks = stack_counts
+        .iter()
+        .map(|(frames, samples)| CpuStackHotspot {
+            frames: frames.clone(),
+            samples: *samples,
+            percent: percent(*samples),
+            estimated_cpu_ms: cpu_ms(*samples),
+        })
+        .collect::<Vec<_>>();
+    stacks.sort_by(|left, right| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left.frames.cmp(&right.frames))
+    });
+    stacks.truncate(top_limit);
+
+    let mut processes = process_counts
+        .into_iter()
+        .map(|(pid, samples)| CpuProcessDistribution {
+            pid,
+            samples,
+            percent: percent(samples),
+            estimated_cpu_ms: cpu_ms(samples),
+        })
+        .collect::<Vec<_>>();
+    processes.sort_by(|left, right| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    processes.truncate(top_limit);
+
+    let mut threads = thread_counts
+        .into_iter()
+        .map(|((pid, tid), samples)| CpuThreadDistribution {
+            pid,
+            tid,
+            samples,
+            percent: percent(samples),
+            estimated_cpu_ms: cpu_ms(samples),
+        })
+        .collect::<Vec<_>>();
+    threads.sort_by(|left, right| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left.pid.cmp(&right.pid))
+            .then_with(|| left.tid.cmp(&right.tid))
+    });
+    threads.truncate(top_limit);
+
+    let mut folded_entries = stack_counts.into_iter().collect::<Vec<_>>();
+    folded_entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let folded_stacks = folded_entries
+        .into_iter()
+        .map(|(frames, count)| {
+            let frames = frames
+                .into_iter()
+                .map(|frame| frame.replace(';', ":").replace(['\r', '\n'], " "))
+                .collect::<Vec<_>>()
+                .join(";");
+            format!("{frames} {count}\n")
+        })
+        .collect::<String>();
+
+    Ok(CpuAggregationArtifacts {
+        hotspots: CpuHotspots {
+            schema_version: 1,
+            interval_us,
+            estimated_cpu_time_ms: cpu_ms(total),
+            quality,
+            frames,
+            stacks,
+            processes,
+            threads,
+        },
+        folded_stacks,
+    })
+}
+
 fn validate_executable(path: &Path) -> Result<(), RecordingError> {
     if path.as_os_str().is_empty() {
         return Err(RecordingError::EmptyExecutable);
@@ -497,6 +885,7 @@ mod tests {
                 args: vec!["sample.txt".to_string()],
             },
             presets: default_presets(),
+            cpu_sampling: None,
         };
 
         assert!(request.validate().is_ok());
@@ -507,6 +896,7 @@ mod tests {
         let request = StartRecording {
             target: RecordingTarget::Attach { pid: 0 },
             presets: default_presets(),
+            cpu_sampling: None,
         };
 
         assert!(matches!(
@@ -520,12 +910,102 @@ mod tests {
         let request = StartRecording {
             target: RecordingTarget::Attach { pid: 42 },
             presets: Vec::new(),
+            cpu_sampling: None,
         };
 
         assert!(matches!(
             request.validate(),
             Err(RecordingError::EmptyPresets)
         ));
+    }
+
+    #[test]
+    fn validates_cpu_sampling_defaults_and_bounds() {
+        let request = StartRecording {
+            target: RecordingTarget::Attach { pid: 42 },
+            presets: vec![RecordingPreset::Cpu],
+            cpu_sampling: None,
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(request.cpu_sampling, Some(CpuSamplingOptions::default()));
+
+        let request = StartRecording {
+            target: RecordingTarget::Attach { pid: 42 },
+            presets: default_presets(),
+            cpu_sampling: Some(CpuSamplingOptions::default()),
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(RecordingError::CpuOptionsWithoutPreset)
+        ));
+
+        let request = StartRecording {
+            target: RecordingTarget::Attach { pid: 42 },
+            presets: vec![RecordingPreset::Cpu],
+            cpu_sampling: Some(CpuSamplingOptions {
+                interval_us: 124,
+                ..Default::default()
+            }),
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(RecordingError::InvalidCpuSamplingInterval)
+        ));
+
+        let request = StartRecording {
+            target: RecordingTarget::Attach { pid: 42 },
+            presets: vec![RecordingPreset::Cpu],
+            cpu_sampling: Some(CpuSamplingOptions {
+                max_trace_size_mb: 4097,
+                ..Default::default()
+            }),
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(RecordingError::InvalidCpuTraceSize)
+        ));
+    }
+
+    #[test]
+    fn aggregates_cpu_samples_deterministically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cpu.jsonl");
+        let sample = |pid, tid, frames: &[&str], stacked, cache_flushed| {
+            serde_json::to_string(&serde_json::json!({
+                "category": "cpu",
+                "event_type": "sampled_profile",
+                "pid": pid,
+                "tid": tid,
+                "frame": frames[0],
+                "module": { "name": "app.exe" },
+                "stacked": stacked,
+                "cache_flushed": cache_flushed,
+                "stack": { "order": "leaf_to_root", "frames": frames },
+            }))
+            .unwrap()
+        };
+        let input = [
+            sample(10, 1, &["leaf+0x1", "root+0x2"], true, false),
+            sample(10, 1, &["leaf+0x1", "root+0x2"], true, false),
+            sample(10, 2, &["other+0x3"], false, true),
+        ]
+        .join("\n");
+        std::fs::write(&path, input + "\nnot-json\n").unwrap();
+
+        let first = aggregate_cpu_jsonl(&path, 1000, 100).unwrap();
+        let second = aggregate_cpu_jsonl(&path, 1000, 100).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.hotspots.quality.total_samples, 3);
+        assert_eq!(first.hotspots.quality.stacked_samples, 2);
+        assert_eq!(first.hotspots.quality.leaf_only_samples, 1);
+        assert_eq!(first.hotspots.quality.invalid_lines, 1);
+        assert_eq!(first.hotspots.estimated_cpu_time_ms, 3.0);
+        assert_eq!(first.folded_stacks, "other+0x3 1\nroot+0x2;leaf+0x1 2\n");
+        let summary = first.hotspots.summary(20);
+        assert_eq!(summary.top_exclusive_frames[0].frame, "leaf+0x1");
+        assert_eq!(summary.top_inclusive_frames[0].frame, "leaf+0x1");
+        assert_eq!(summary.top_inclusive_frames[0].inclusive_samples, 2);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub struct EtwCapabilities {
     pub file_trace: bool,
     pub process_tree_filter: bool,
     pub event_stack_trace: bool,
+    pub cpu_sampling: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +39,48 @@ pub struct EtwEventExtractionResult {
     pub incomplete_io: u32,
     pub reused_irp: u32,
     pub dropped_stack_walk: u32,
+    pub cpu_samples_written: u32,
+    pub cpu_samples_with_stack: u32,
+    pub cpu_samples_leaf_only: u32,
+    pub cpu_samples_out_of_scope: u32,
+    pub cpu_samples_cache_flushed: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtwSessionOptions {
+    pub cpu_sampling_interval_us: u32,
+    pub maximum_trace_size_mb: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtwCpuSamplingStatus {
+    pub requested: bool,
+    pub enabled: bool,
+    pub stack_enabled: bool,
+    pub requested_interval_us: u32,
+    pub applied_interval_us: u32,
+    pub previous_interval_us: u32,
+    pub maximum_trace_size_mb: u32,
+    pub warning_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtwSessionStopResult {
+    pub events_lost: u32,
+    pub buffers_written: u32,
+    pub log_buffers_lost: u32,
+    pub realtime_buffers_lost: u32,
+    pub interval_restore_attempted: bool,
+    pub interval_restored: bool,
+    pub interval_restore_skipped: bool,
+    pub warning_count: u32,
+    pub events_written: u32,
+    pub skipped_events: u32,
+    pub cpu_samples_written: u32,
+    pub cpu_samples_with_stack: u32,
+    pub cpu_samples_leaf_only: u32,
+    pub cpu_samples_out_of_scope: u32,
+    pub cpu_samples_cache_flushed: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +116,9 @@ impl EtwPresetFlags {
     };
     pub const NETWORK: Self = Self {
         bits: dbgatlas_etw_sys::DA_ETW_PRESET_NETWORK,
+    };
+    pub const CPU: Self = Self {
+        bits: dbgatlas_etw_sys::DA_ETW_PRESET_CPU,
     };
     pub const ALL: Self = Self {
         bits: dbgatlas_etw_sys::DA_ETW_PRESET_PROCESS
@@ -154,11 +200,55 @@ impl EtwFileSession {
         Ok(Self { handle })
     }
 
+    #[cfg(windows)]
+    pub fn start_with_options(
+        session_name: &str,
+        trace_path: impl AsRef<Path>,
+        preset_flags: EtwPresetFlags,
+        options: EtwSessionOptions,
+    ) -> Result<Self, EtwError> {
+        let session_name = session_name_to_cstring(session_name)?;
+        let trace_path = path_to_cstring(trace_path.as_ref())?;
+        let options = dbgatlas_etw_sys::DA_EtwSessionOptions {
+            struct_size: size_of::<dbgatlas_etw_sys::DA_EtwSessionOptions>() as u32,
+            flags: 0,
+            cpu_sampling_interval_us: options.cpu_sampling_interval_us,
+            maximum_trace_size_mb: options.maximum_trace_size_mb,
+        };
+        let mut handle = std::ptr::null_mut();
+        let status = unsafe {
+            dbgatlas_etw_sys::da_etw_session_start_file_trace_ex(
+                session_name.as_ptr(),
+                trace_path.as_ptr(),
+                preset_flags.bits(),
+                &options,
+                &mut handle,
+            )
+        };
+        status_to_result(status)?;
+        if handle.is_null() {
+            return Err(EtwError::NullSessionHandle);
+        }
+        Ok(Self { handle })
+    }
+
     #[cfg(not(windows))]
     pub fn start(
         session_name: &str,
         trace_path: impl AsRef<Path>,
         _preset_flags: EtwPresetFlags,
+    ) -> Result<Self, EtwError> {
+        session_name_to_cstring(session_name)?;
+        path_to_cstring(trace_path.as_ref())?;
+        Err(EtwError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(windows))]
+    pub fn start_with_options(
+        session_name: &str,
+        trace_path: impl AsRef<Path>,
+        _preset_flags: EtwPresetFlags,
+        _options: EtwSessionOptions,
     ) -> Result<Self, EtwError> {
         session_name_to_cstring(session_name)?;
         path_to_cstring(trace_path.as_ref())?;
@@ -209,6 +299,24 @@ impl EtwFileSession {
         Ok(stack_trace_status_from_native(status))
     }
 
+    #[cfg(windows)]
+    pub fn cpu_sampling_status(&self) -> Result<EtwCpuSamplingStatus, EtwError> {
+        let mut status = dbgatlas_etw_sys::DA_EtwCpuSamplingStatus {
+            struct_size: size_of::<dbgatlas_etw_sys::DA_EtwCpuSamplingStatus>() as u32,
+            ..Default::default()
+        };
+        let native_status = unsafe {
+            dbgatlas_etw_sys::da_etw_session_cpu_sampling_status(self.handle, &mut status)
+        };
+        status_to_result(native_status)?;
+        Ok(cpu_sampling_status_from_native(status))
+    }
+
+    #[cfg(not(windows))]
+    pub fn cpu_sampling_status(&self) -> Result<EtwCpuSamplingStatus, EtwError> {
+        Err(EtwError::UnsupportedPlatform)
+    }
+
     #[cfg(not(windows))]
     pub fn stack_trace_status(&self) -> Result<EtwStackTraceStatus, EtwError> {
         Err(EtwError::UnsupportedPlatform)
@@ -221,8 +329,25 @@ impl EtwFileSession {
         status_to_result(status)
     }
 
+    #[cfg(windows)]
+    pub fn stop_with_result(mut self) -> Result<EtwSessionStopResult, EtwError> {
+        let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+        let mut result = dbgatlas_etw_sys::DA_EtwSessionStopResult {
+            struct_size: size_of::<dbgatlas_etw_sys::DA_EtwSessionStopResult>() as u32,
+            ..Default::default()
+        };
+        let status = unsafe { dbgatlas_etw_sys::da_etw_session_stop_ex(handle, &mut result) };
+        status_to_result(status)?;
+        Ok(stop_result_from_native(result))
+    }
+
     #[cfg(not(windows))]
     pub fn stop(self) -> Result<(), EtwError> {
+        Err(EtwError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(windows))]
+    pub fn stop_with_result(self) -> Result<EtwSessionStopResult, EtwError> {
         Err(EtwError::UnsupportedPlatform)
     }
 }
@@ -392,6 +517,44 @@ fn capabilities_from_flags(flags: u32) -> EtwCapabilities {
         file_trace: flags & dbgatlas_etw_sys::DA_ETW_CAP_FILE_TRACE != 0,
         process_tree_filter: flags & dbgatlas_etw_sys::DA_ETW_CAP_PROCESS_TREE_FILTER != 0,
         event_stack_trace: flags & dbgatlas_etw_sys::DA_ETW_CAP_EVENT_STACK_TRACE != 0,
+        cpu_sampling: flags & dbgatlas_etw_sys::DA_ETW_CAP_CPU_SAMPLING != 0,
+    }
+}
+
+fn cpu_sampling_status_from_native(
+    status: dbgatlas_etw_sys::DA_EtwCpuSamplingStatus,
+) -> EtwCpuSamplingStatus {
+    EtwCpuSamplingStatus {
+        requested: status.requested != 0,
+        enabled: status.enabled != 0,
+        stack_enabled: status.stack_enabled != 0,
+        requested_interval_us: status.requested_interval_us,
+        applied_interval_us: status.applied_interval_us,
+        previous_interval_us: status.previous_interval_us,
+        maximum_trace_size_mb: status.maximum_trace_size_mb,
+        warning_count: status.warning_count,
+    }
+}
+
+fn stop_result_from_native(
+    result: dbgatlas_etw_sys::DA_EtwSessionStopResult,
+) -> EtwSessionStopResult {
+    EtwSessionStopResult {
+        events_lost: result.events_lost,
+        buffers_written: result.buffers_written,
+        log_buffers_lost: result.log_buffers_lost,
+        realtime_buffers_lost: result.realtime_buffers_lost,
+        interval_restore_attempted: result.interval_restore_attempted != 0,
+        interval_restored: result.interval_restored != 0,
+        interval_restore_skipped: result.interval_restore_skipped != 0,
+        warning_count: result.warning_count,
+        events_written: result.events_written,
+        skipped_events: result.skipped_events,
+        cpu_samples_written: result.cpu_samples_written,
+        cpu_samples_with_stack: result.cpu_samples_with_stack,
+        cpu_samples_leaf_only: result.cpu_samples_leaf_only,
+        cpu_samples_out_of_scope: result.cpu_samples_out_of_scope,
+        cpu_samples_cache_flushed: result.cpu_samples_cache_flushed,
     }
 }
 
@@ -425,6 +588,11 @@ fn extraction_result_from_native(
         incomplete_io: result.incomplete_io,
         reused_irp: result.reused_irp,
         dropped_stack_walk: result.dropped_stack_walk,
+        cpu_samples_written: result.cpu_samples_written,
+        cpu_samples_with_stack: result.cpu_samples_with_stack,
+        cpu_samples_leaf_only: result.cpu_samples_leaf_only,
+        cpu_samples_out_of_scope: result.cpu_samples_out_of_scope,
+        cpu_samples_cache_flushed: result.cpu_samples_cache_flushed,
     }
 }
 
@@ -497,6 +665,7 @@ mod tests {
         assert!(info.capabilities.process_tree_filter);
         assert!(info.capabilities.realtime_consume);
         assert!(info.capabilities.event_stack_trace);
+        assert!(info.capabilities.cpu_sampling);
     }
 
     #[cfg(not(windows))]
@@ -512,12 +681,14 @@ mod tests {
     fn decodes_capability_flags() {
         let capabilities = capabilities_from_flags(
             dbgatlas_etw_sys::DA_ETW_CAP_REALTIME_CONSUME
-                | dbgatlas_etw_sys::DA_ETW_CAP_PROCESS_TREE_FILTER,
+                | dbgatlas_etw_sys::DA_ETW_CAP_PROCESS_TREE_FILTER
+                | dbgatlas_etw_sys::DA_ETW_CAP_CPU_SAMPLING,
         );
         assert!(capabilities.realtime_consume);
         assert!(!capabilities.file_trace);
         assert!(capabilities.process_tree_filter);
         assert!(!capabilities.event_stack_trace);
+        assert!(capabilities.cpu_sampling);
     }
 
     #[test]
@@ -537,6 +708,39 @@ mod tests {
         assert_eq!(status.provider_stack_warning_count, 2);
         assert!(!status.kernel_stack_enabled);
         assert_eq!(status.kernel_stack_warning_count, 1);
+    }
+
+    #[test]
+    fn decodes_cpu_sampling_and_stop_quality() {
+        let status = cpu_sampling_status_from_native(dbgatlas_etw_sys::DA_EtwCpuSamplingStatus {
+            requested: 1,
+            enabled: 1,
+            stack_enabled: 1,
+            requested_interval_us: 1000,
+            applied_interval_us: 997,
+            previous_interval_us: 10_000,
+            maximum_trace_size_mb: 512,
+            warning_count: 2,
+            ..Default::default()
+        });
+        assert!(status.enabled && status.stack_enabled);
+        assert_eq!(status.applied_interval_us, 997);
+        assert_eq!(status.previous_interval_us, 10_000);
+
+        let stop = stop_result_from_native(dbgatlas_etw_sys::DA_EtwSessionStopResult {
+            interval_restore_attempted: 1,
+            interval_restored: 1,
+            cpu_samples_written: 12,
+            cpu_samples_with_stack: 10,
+            cpu_samples_leaf_only: 2,
+            cpu_samples_out_of_scope: 30,
+            ..Default::default()
+        });
+        assert!(stop.interval_restore_attempted && stop.interval_restored);
+        assert_eq!(stop.cpu_samples_written, 12);
+        assert_eq!(stop.cpu_samples_with_stack, 10);
+        assert_eq!(stop.cpu_samples_leaf_only, 2);
+        assert_eq!(stop.cpu_samples_out_of_scope, 30);
     }
 
     #[test]
@@ -629,10 +833,13 @@ mod tests {
         let mut flags = EtwPresetFlags::empty();
         flags.insert(EtwPresetFlags::PROCESS);
         flags.insert(EtwPresetFlags::NETWORK);
+        flags.insert(EtwPresetFlags::CPU);
 
         assert_eq!(
             flags.bits(),
-            dbgatlas_etw_sys::DA_ETW_PRESET_PROCESS | dbgatlas_etw_sys::DA_ETW_PRESET_NETWORK
+            dbgatlas_etw_sys::DA_ETW_PRESET_PROCESS
+                | dbgatlas_etw_sys::DA_ETW_PRESET_NETWORK
+                | dbgatlas_etw_sys::DA_ETW_PRESET_CPU
         );
     }
 
@@ -699,5 +906,72 @@ mod tests {
             }
             Err(error) => panic!("unexpected ETW error: {error}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_sampling_records_current_process_or_reports_diagnostic_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("cpu.etl");
+        let events = temp.path().join("events");
+        let session_name = format!(
+            "dbgatlas-cpu-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut session = match EtwFileSession::start_with_options(
+            &session_name,
+            &trace,
+            EtwPresetFlags::CPU,
+            EtwSessionOptions {
+                cpu_sampling_interval_us: 1000,
+                maximum_trace_size_mb: 64,
+            },
+        ) {
+            Ok(session) => session,
+            Err(EtwError::Native { message, .. }) => {
+                assert!(
+                    !message.trim().is_empty(),
+                    "permission failure must be diagnostic"
+                );
+                return;
+            }
+            Err(error) => panic!("unexpected CPU session error: {error}"),
+        };
+        let status = session.cpu_sampling_status().unwrap();
+        assert!(status.enabled && status.stack_enabled);
+        session
+            .start_realtime_consumer(&events, EtwPresetFlags::CPU, Some(std::process::id()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut value = 1_u64;
+        while std::time::Instant::now() < deadline {
+            value = std::hint::black_box(value.wrapping_mul(6364136223846793005).wrapping_add(1));
+        }
+        std::hint::black_box(value);
+        let stop = session.stop_with_result().unwrap();
+        assert!(stop.interval_restore_attempted);
+        assert!(stop.interval_restored || stop.interval_restore_skipped);
+        assert!(stop.cpu_samples_written > 0);
+        assert!(stop.cpu_samples_with_stack > 0);
+        let cpu = std::fs::read_to_string(events.join("cpu.jsonl")).unwrap();
+        let samples = cpu
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample["pid"] == std::process::id())
+        );
+        assert!(samples.iter().any(|sample| {
+            sample["stack"]["frames"]
+                .as_array()
+                .is_some_and(|frames| !frames.is_empty())
+        }));
+        assert!(samples.iter().any(|sample| sample["module"].is_object()));
     }
 }

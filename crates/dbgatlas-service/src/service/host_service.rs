@@ -7,6 +7,7 @@ impl ServiceHost {
             supervisor,
             capabilities: ServiceCapabilities::from_runtime_config(&RuntimeConfig::default()),
             ttd_runner: Arc::new(ProcessTtdRecorderRunner),
+            etw_controller: Arc::new(NativeEtwController),
         }
     }
 
@@ -38,6 +39,12 @@ impl ServiceHost {
     #[cfg(test)]
     pub(super) fn with_ttd_runner(mut self, runner: Arc<dyn TtdRecorderRunner>) -> Self {
         self.ttd_runner = runner;
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_etw_controller(mut self, controller: Arc<dyn EtwController>) -> Self {
+        self.etw_controller = controller;
         self
     }
 

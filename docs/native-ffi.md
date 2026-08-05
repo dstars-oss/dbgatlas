@@ -86,3 +86,5 @@ DbgEng session、callback、event polling、COM 初始化和线程归属必须�
 真实 DbgEng session 由 per-session worker 持有。worker 主循环串行处理同一 session 的 start/eval/add_symbols/read_memory/close 请求，避免跨线程直接操作同一 DbgEng client。
 
 DbgEng、ETW、DIA 后续必须各自维护 header、DLL adapter 和 `*-sys` crate。不要新增中心化 protocol crate，也不要把多个 native adapter 过早聚合到一个 DLL ABI。
+
+ETW adapter ABI `0.3` 增加带 `struct_size` 的 `DA_EtwSessionOptions`、CPU sampling status 和 stop quality result；原 `da_etw_session_start_file_trace` / `da_etw_session_stop` 入口继续保留。CPU session 的全局 ProfileTime interval 必须由 native handle 持有 previous/applied 状态，并在 stop、启动回滚和 handle drop 路径按“当前值仍等于 applied”条件恢复。

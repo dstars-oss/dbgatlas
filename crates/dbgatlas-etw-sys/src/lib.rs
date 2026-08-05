@@ -10,6 +10,7 @@ pub const DA_ETW_CAP_REALTIME_CONSUME: u32 = 1 << 0;
 pub const DA_ETW_CAP_FILE_TRACE: u32 = 1 << 1;
 pub const DA_ETW_CAP_PROCESS_TREE_FILTER: u32 = 1 << 2;
 pub const DA_ETW_CAP_EVENT_STACK_TRACE: u32 = 1 << 3;
+pub const DA_ETW_CAP_CPU_SAMPLING: u32 = 1 << 4;
 
 pub const DA_ETW_PRESET_PROCESS: u32 = 1 << 0;
 pub const DA_ETW_PRESET_THREAD: u32 = 1 << 1;
@@ -17,6 +18,16 @@ pub const DA_ETW_PRESET_IMAGE: u32 = 1 << 2;
 pub const DA_ETW_PRESET_FILE: u32 = 1 << 3;
 pub const DA_ETW_PRESET_REGISTRY: u32 = 1 << 4;
 pub const DA_ETW_PRESET_NETWORK: u32 = 1 << 5;
+pub const DA_ETW_PRESET_CPU: u32 = 1 << 6;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_EtwSessionOptions {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub cpu_sampling_interval_us: u32,
+    pub maximum_trace_size_mb: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -53,6 +64,11 @@ pub struct DA_EtwEventExtractionResult {
     pub incomplete_io: u32,
     pub reused_irp: u32,
     pub dropped_stack_walk: u32,
+    pub cpu_samples_written: u32,
+    pub cpu_samples_with_stack: u32,
+    pub cpu_samples_leaf_only: u32,
+    pub cpu_samples_out_of_scope: u32,
+    pub cpu_samples_cache_flushed: u32,
 }
 
 #[repr(C)]
@@ -66,6 +82,43 @@ pub struct DA_EtwStackTraceStatus {
     pub provider_stack_warning_count: u32,
     pub kernel_stack_enabled: u32,
     pub kernel_stack_warning_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_EtwCpuSamplingStatus {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub requested: u32,
+    pub enabled: u32,
+    pub stack_enabled: u32,
+    pub requested_interval_us: u32,
+    pub applied_interval_us: u32,
+    pub previous_interval_us: u32,
+    pub maximum_trace_size_mb: u32,
+    pub warning_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_EtwSessionStopResult {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub events_lost: u32,
+    pub buffers_written: u32,
+    pub log_buffers_lost: u32,
+    pub realtime_buffers_lost: u32,
+    pub interval_restore_attempted: u32,
+    pub interval_restored: u32,
+    pub interval_restore_skipped: u32,
+    pub warning_count: u32,
+    pub events_written: u32,
+    pub skipped_events: u32,
+    pub cpu_samples_written: u32,
+    pub cpu_samples_with_stack: u32,
+    pub cpu_samples_leaf_only: u32,
+    pub cpu_samples_out_of_scope: u32,
+    pub cpu_samples_cache_flushed: u32,
 }
 
 #[repr(C)]
@@ -94,6 +147,13 @@ unsafe extern "C" {
         preset_flags: u32,
         out_handle: *mut *mut DA_EtwSessionHandle,
     ) -> i32;
+    pub fn da_etw_session_start_file_trace_ex(
+        session_name_utf8: *const c_char,
+        trace_path_utf8: *const c_char,
+        preset_flags: u32,
+        options: *const DA_EtwSessionOptions,
+        out_handle: *mut *mut DA_EtwSessionHandle,
+    ) -> i32;
     pub fn da_etw_session_start_realtime_consumer(
         handle: *mut DA_EtwSessionHandle,
         events_dir_utf8: *const c_char,
@@ -105,7 +165,15 @@ unsafe extern "C" {
         handle: *mut DA_EtwSessionHandle,
         out: *mut DA_EtwStackTraceStatus,
     ) -> i32;
+    pub fn da_etw_session_cpu_sampling_status(
+        handle: *mut DA_EtwSessionHandle,
+        out: *mut DA_EtwCpuSamplingStatus,
+    ) -> i32;
     pub fn da_etw_session_stop(handle: *mut DA_EtwSessionHandle) -> i32;
+    pub fn da_etw_session_stop_ex(
+        handle: *mut DA_EtwSessionHandle,
+        out: *mut DA_EtwSessionStopResult,
+    ) -> i32;
     pub fn da_etw_extract_file_events(
         trace_path_utf8: *const c_char,
         events_dir_utf8: *const c_char,

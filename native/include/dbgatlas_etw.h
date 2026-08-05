@@ -31,7 +31,8 @@ typedef enum DA_EtwCapabilityFlags {
     DA_ETW_CAP_REALTIME_CONSUME = 1u << 0,
     DA_ETW_CAP_FILE_TRACE = 1u << 1,
     DA_ETW_CAP_PROCESS_TREE_FILTER = 1u << 2,
-    DA_ETW_CAP_EVENT_STACK_TRACE = 1u << 3
+    DA_ETW_CAP_EVENT_STACK_TRACE = 1u << 3,
+    DA_ETW_CAP_CPU_SAMPLING = 1u << 4
 } DA_EtwCapabilityFlags;
 
 typedef enum DA_EtwPresetFlags {
@@ -40,8 +41,16 @@ typedef enum DA_EtwPresetFlags {
     DA_ETW_PRESET_IMAGE = 1u << 2,
     DA_ETW_PRESET_FILE = 1u << 3,
     DA_ETW_PRESET_REGISTRY = 1u << 4,
-    DA_ETW_PRESET_NETWORK = 1u << 5
+    DA_ETW_PRESET_NETWORK = 1u << 5,
+    DA_ETW_PRESET_CPU = 1u << 6
 } DA_EtwPresetFlags;
+
+typedef struct DA_EtwSessionOptions {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t cpu_sampling_interval_us;
+    uint32_t maximum_trace_size_mb;
+} DA_EtwSessionOptions;
 
 typedef struct DA_EtwVersion {
     uint32_t struct_size;
@@ -74,6 +83,11 @@ typedef struct DA_EtwEventExtractionResult {
     uint32_t incomplete_io;
     uint32_t reused_irp;
     uint32_t dropped_stack_walk;
+    uint32_t cpu_samples_written;
+    uint32_t cpu_samples_with_stack;
+    uint32_t cpu_samples_leaf_only;
+    uint32_t cpu_samples_out_of_scope;
+    uint32_t cpu_samples_cache_flushed;
 } DA_EtwEventExtractionResult;
 
 typedef struct DA_EtwStackTraceStatus {
@@ -89,6 +103,39 @@ typedef struct DA_EtwStackTraceStatus {
     uint32_t kernel_stack_enabled;
     uint32_t kernel_stack_warning_count;
 } DA_EtwStackTraceStatus;
+
+typedef struct DA_EtwCpuSamplingStatus {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t requested;
+    uint32_t enabled;
+    uint32_t stack_enabled;
+    uint32_t requested_interval_us;
+    uint32_t applied_interval_us;
+    uint32_t previous_interval_us;
+    uint32_t maximum_trace_size_mb;
+    uint32_t warning_count;
+} DA_EtwCpuSamplingStatus;
+
+typedef struct DA_EtwSessionStopResult {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t events_lost;
+    uint32_t buffers_written;
+    uint32_t log_buffers_lost;
+    uint32_t realtime_buffers_lost;
+    uint32_t interval_restore_attempted;
+    uint32_t interval_restored;
+    uint32_t interval_restore_skipped;
+    uint32_t warning_count;
+    uint32_t events_written;
+    uint32_t skipped_events;
+    uint32_t cpu_samples_written;
+    uint32_t cpu_samples_with_stack;
+    uint32_t cpu_samples_leaf_only;
+    uint32_t cpu_samples_out_of_scope;
+    uint32_t cpu_samples_cache_flushed;
+} DA_EtwSessionStopResult;
 
 typedef struct DA_EtwSessionHandle DA_EtwSessionHandle;
 
@@ -107,6 +154,12 @@ DA_ETW_EXPORT int32_t da_etw_session_start_file_trace(
     const char* trace_path_utf8,
     uint32_t preset_flags,
     DA_EtwSessionHandle** out_handle);
+DA_ETW_EXPORT int32_t da_etw_session_start_file_trace_ex(
+    const char* session_name_utf8,
+    const char* trace_path_utf8,
+    uint32_t preset_flags,
+    const DA_EtwSessionOptions* options,
+    DA_EtwSessionHandle** out_handle);
 DA_ETW_EXPORT int32_t da_etw_session_start_realtime_consumer(
     DA_EtwSessionHandle* handle,
     const char* events_dir_utf8,
@@ -116,7 +169,13 @@ DA_ETW_EXPORT int32_t da_etw_session_start_realtime_consumer(
 DA_ETW_EXPORT int32_t da_etw_session_stack_trace_status(
     DA_EtwSessionHandle* handle,
     DA_EtwStackTraceStatus* out);
+DA_ETW_EXPORT int32_t da_etw_session_cpu_sampling_status(
+    DA_EtwSessionHandle* handle,
+    DA_EtwCpuSamplingStatus* out);
 DA_ETW_EXPORT int32_t da_etw_session_stop(DA_EtwSessionHandle* handle);
+DA_ETW_EXPORT int32_t da_etw_session_stop_ex(
+    DA_EtwSessionHandle* handle,
+    DA_EtwSessionStopResult* out);
 DA_ETW_EXPORT int32_t da_etw_extract_file_events(
     const char* trace_path_utf8,
     const char* events_dir_utf8,

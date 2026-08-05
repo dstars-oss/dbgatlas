@@ -6,9 +6,15 @@ impl ServiceHost {
         let request = StartRecording {
             target: params.target,
             presets: params.presets,
+            cpu_sampling: params.cpu_sampling,
         }
         .validate()?;
         let recording_id = next_recording_ref();
+        let mut cpu_active_guard = if request.cpu_sampling.is_some() {
+            Some(self.start_cpu_recording(recording_id.clone())?)
+        } else {
+            None
+        };
         let operation_id = next_operation_ref();
         let workspace = ensure_project_workspace(&params.project_root)?;
         let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
@@ -16,12 +22,19 @@ impl ServiceHost {
         let trace_path = artifact_dir.join("trace.etl");
         let trace_session_name = etw_session_name(&recording_id);
         let trace_preset_flags = etw_preset_flags(&request.presets);
-        let (mut trace_session, trace_start_error) = match dbgatlas_etw::EtwFileSession::start(
+        let trace_start = self.etw_controller.start(
             &trace_session_name,
             &trace_path,
             trace_preset_flags,
-        ) {
+            request.cpu_sampling,
+        );
+        let (mut trace_session, trace_start_error) = match trace_start {
             Ok(session) => (Some(session), None),
+            Err(error) if request.cpu_sampling.is_some() => {
+                return Err(ServiceError::Rpc(format!(
+                    "CPU sampling ETW session failed to start: {error}"
+                )));
+            }
             Err(error) => (None, Some(error.to_string())),
         };
         let (trace_stack_status, trace_stack_status_error) = match trace_session.as_ref() {
@@ -30,6 +43,30 @@ impl ServiceHost {
                 Err(error) => (None, Some(error.to_string())),
             },
             None => (None, None),
+        };
+        let (cpu_sampling_status, cpu_sampling_status_error) = match trace_session.as_ref() {
+            Some(session) if request.cpu_sampling.is_some() => {
+                match session.cpu_sampling_status() {
+                    Ok(status) if status.enabled && status.stack_enabled => (Some(status), None),
+                    Ok(status) => {
+                        if let Some(session) = trace_session.take() {
+                            let _ = session.stop();
+                        }
+                        return Err(ServiceError::Rpc(format!(
+                            "CPU sampling ETW session did not enable SampledProfile StackWalk: {status:?}"
+                        )));
+                    }
+                    Err(error) => {
+                        if let Some(session) = trace_session.take() {
+                            let _ = session.stop();
+                        }
+                        return Err(ServiceError::Rpc(format!(
+                            "CPU sampling status query failed: {error}"
+                        )));
+                    }
+                }
+            }
+            _ => (None, None),
         };
         let prepared_target = match prepare_recording_target(&request.target) {
             Ok(prepared) => prepared,
@@ -52,6 +89,16 @@ impl ServiceHost {
             },
             None => None,
         };
+        if request.cpu_sampling.is_some() {
+            if let Some(error) = trace_consumer_error.as_deref() {
+                if let Some(session) = trace_session.take() {
+                    let _ = session.stop();
+                }
+                return Err(ServiceError::Rpc(format!(
+                    "CPU sampling realtime consumer failed to start: {error}"
+                )));
+            }
+        }
         if let Err(error) = prepared_target.resume() {
             if let Some(session) = trace_session {
                 let _ = session.stop();
@@ -70,6 +117,9 @@ impl ServiceHost {
             trace_consumer_error.as_deref(),
             trace_stack_status,
             trace_stack_status_error.as_deref(),
+            request.cpu_sampling,
+            cpu_sampling_status,
+            cpu_sampling_status_error.as_deref(),
         )?;
         let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
 
@@ -91,6 +141,7 @@ impl ServiceHost {
             artifact_dir,
             target: request.target,
             presets: request.presets,
+            cpu_sampling: request.cpu_sampling,
             root_pid,
             state: RecordingState::Running,
             created_at: now,
@@ -102,6 +153,10 @@ impl ServiceHost {
             trace_consumer_error,
             trace_stack_status,
             trace_stack_status_error,
+            cpu_sampling_status,
+            cpu_sampling_status_error,
+            trace_stop_result: None,
+            cpu_summary: None,
         };
 
         let mut operation = ServiceOperation::success(
@@ -120,6 +175,9 @@ impl ServiceHost {
         state
             .recordings
             .insert(recording_id.id.as_str().to_string(), recording.clone());
+        if let Some(guard) = cpu_active_guard.as_mut() {
+            guard.commit();
+        }
 
         recording_response(
             &recording,
@@ -485,12 +543,13 @@ impl ServiceHost {
 
         let operation_id = next_operation_ref();
         let workspace = Workspace::open(&recording.internal_workspace_root)?;
+        let artifact_dir = recording.artifact_dir.clone();
         let now = Timestamp::now();
         let (state, status, capability, summary, writes) = match mode {
             RecordingFinishMode::Stop => {
                 let writes = write_recording_stop_artifacts(
-                    &recording.artifact_dir,
-                    &recording,
+                    &artifact_dir,
+                    &mut recording,
                     &operation_id,
                     now,
                 )?;
@@ -508,8 +567,8 @@ impl ServiceHost {
                 "recording.cancel",
                 "recording canceled",
                 write_recording_terminal_trace_artifacts(
-                    &recording.artifact_dir,
-                    &recording,
+                    &artifact_dir,
+                    &mut recording,
                     &operation_id,
                     now,
                     "canceled",
@@ -521,8 +580,8 @@ impl ServiceHost {
                 "recording.kill",
                 "recording killed",
                 write_recording_terminal_trace_artifacts(
-                    &recording.artifact_dir,
-                    &recording,
+                    &artifact_dir,
+                    &mut recording,
                     &operation_id,
                     now,
                     "killed",
@@ -558,6 +617,9 @@ impl ServiceHost {
         operation.raw_output = registered.raw_output.clone();
 
         let mut state = self.lock_state()?;
+        if state.active_cpu_recording.as_ref() == Some(&recording.recording_id) {
+            state.active_cpu_recording = None;
+        }
         state.recordings.insert(
             recording.recording_id.id.as_str().to_string(),
             recording.clone(),

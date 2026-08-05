@@ -143,7 +143,11 @@ pub(super) fn infer_synthetic_artifact_kind(artifacts_root: &Path, path: &Path) 
             let category = event_file.strip_suffix(".jsonl").unwrap_or(event_file);
             format!("recording.events.{category}")
         }
-        ["recordings", ..] if file_name == "trace.etl" => "recording.trace".to_string(),
+        ["recordings", ..] if file_name == "trace.etl" || file_name == "trace.unfiltered.etl" => {
+            "recording.trace".to_string()
+        }
+        ["recordings", _, "cpu", "hotspots.json"] => "recording.cpu.hotspots".to_string(),
+        ["recordings", _, "cpu", "stacks.folded"] => "recording.cpu.folded".to_string(),
         ["recordings", ..] if extension == "run" => "recording.ttd.trace".to_string(),
         ["recordings", ..] if extension == "idx" => "recording.ttd.index".to_string(),
         ["recordings", ..] if file_name.starts_with("recorder") => {
