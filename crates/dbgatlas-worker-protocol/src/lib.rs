@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 4;
+pub const WORKER_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerEnvelope<T> {
@@ -151,6 +151,7 @@ pub enum WorkerResponse {
         writes: Vec<WorkerArtifactWrite>,
     },
     ReverseSessionOpened {
+        runtime: ReverseRuntimeInfo,
         writes: Vec<WorkerArtifactWrite>,
     },
     ReverseFunctionLookup {
@@ -196,12 +197,24 @@ impl WorkerResponse {
             WorkerResponse::Ok { writes, .. }
             | WorkerResponse::DebugCommand { writes, .. }
             | WorkerResponse::DebugMemory { writes, .. }
-            | WorkerResponse::ReverseSessionOpened { writes }
+            | WorkerResponse::ReverseSessionOpened { writes, .. }
             | WorkerResponse::ReverseFunctionLookup { writes, .. }
             | WorkerResponse::ReverseCoreFunction { writes, .. }
             | WorkerResponse::Failed { writes, .. } => writes,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseRuntimeInfo {
+    pub runtime_major: u32,
+    pub runtime_minor: u32,
+    pub runtime_build: u32,
+    pub provider_file_name: String,
+    pub ida_sdk_version: u32,
+    pub abi_major: u32,
+    pub abi_minor: u32,
+    pub abi_patch: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -652,6 +665,30 @@ mod tests {
                 expected: WORKER_PROTOCOL_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn reverse_runtime_info_round_trips_in_protocol_v5() {
+        let response = WorkerEnvelope::new(
+            "req-open",
+            WorkerResponse::ReverseSessionOpened {
+                runtime: ReverseRuntimeInfo {
+                    runtime_major: 9,
+                    runtime_minor: 4,
+                    runtime_build: 1,
+                    provider_file_name: "dbgatlas_ida_sdk_940.dll".to_string(),
+                    ida_sdk_version: 940,
+                    abi_major: 0,
+                    abi_minor: 3,
+                    abi_patch: 0,
+                },
+                writes: Vec::new(),
+            },
+        );
+        let encoded = encode_jsonl(&response).unwrap();
+        let decoded = decode_jsonl::<WorkerResponse>(&encoded).unwrap();
+        assert_eq!(decoded, response);
+        assert_eq!(decoded.version, 5);
     }
 
     #[test]

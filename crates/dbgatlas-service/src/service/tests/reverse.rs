@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn ida_install_resolution_honors_explicit_configured_and_default_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let explicit = temp.path().join("explicit");
+    let configured = temp.path().join("configured");
+    let default_94_pro = temp.path().join("IDA Professional 9.4");
+    let default_94_home = temp.path().join("IDA Home 9.4");
+    let default_93_pro = temp.path().join("IDA Professional 9.3");
+    for directory in [
+        &configured,
+        &default_94_pro,
+        &default_94_home,
+        &default_93_pro,
+    ] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("ida.dll"), b"ida").unwrap();
+        fs::write(directory.join("idalib.dll"), b"idalib").unwrap();
+    }
+    let defaults = vec![default_94_pro.clone(), default_94_home, default_93_pro];
+
+    assert_eq!(
+        resolve_ida_install_dir_from(Some(&explicit), Some(&configured), &defaults),
+        explicit
+    );
+    assert_eq!(
+        resolve_ida_install_dir_from(None, Some(&configured), &defaults),
+        configured
+    );
+    assert_eq!(
+        resolve_ida_install_dir_from(None, None, &defaults),
+        default_94_pro
+    );
+    assert_eq!(
+        IDA_DEFAULT_INSTALL_DIRS,
+        &[
+            r"C:\Program Files\IDA Professional 9.4",
+            r"C:\Program Files\IDA Home 9.4",
+            r"C:\Program Files\IDA Professional 9.3",
+        ]
+    );
+}
+
+#[test]
 fn reverse_lookup_records_session_lookup_and_workspace_facts() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("sample.exe");
@@ -62,6 +104,22 @@ fn reverse_lookup_records_session_lookup_and_workspace_facts() {
             .any(|operation| operation.capability == "reverse.lookup_function")
     );
     let session_id = serde_json::from_value::<SessionRef>(session_id).unwrap();
+    let session_metadata_path = workspace
+        .root()
+        .join("artifacts")
+        .join("reverse_sessions")
+        .join(session_id.id.as_str())
+        .join("sessions")
+        .join("session.json");
+    let session_metadata: Value =
+        serde_json::from_slice(&fs::read(session_metadata_path).unwrap()).unwrap();
+    assert_eq!(session_metadata["ida_runtime"]["runtime_major"], 9);
+    assert_eq!(session_metadata["ida_runtime"]["runtime_minor"], 3);
+    assert_eq!(session_metadata["ida_runtime"]["ida_sdk_version"], 930);
+    assert_eq!(
+        session_metadata["ida_runtime"]["provider_file_name"],
+        "dbgatlas_ida_sdk_930.dll"
+    );
     assert!(
         workspace
             .root()

@@ -4,9 +4,14 @@ This directory is reserved for third-party C++ dependencies used by native adapt
 
 Vendored dependencies:
 
-- `cpp/ida-sdk/include`: IDA SDK header snapshot from `dstars-oss/ida-sdk`
-  tag `v9.3.1-release`, commit `acacbbcc8fa349d919cc185d88b1ab3710ca252d`.
-  License: MIT, copied to `licenses/ida-sdk-MIT.txt`.
+- `cpp/ida-sdk/930/include`: IDA SDK 9.3 header snapshot from
+  `dstars-oss/ida-sdk`, tag `v9.3.1-release`, commit
+  `acacbbcc8fa349d919cc185d88b1ab3710ca252d`.
+- `cpp/ida-sdk/940/include`: IDA SDK 9.4 header snapshot from
+  `HexRaysSA/ida-sdk`, tag `v9.4.0-release`, commit
+  `2348615c25f90e357cd2cc72fcfede1ba14ad41a`.
+  Both snapshots use the same upstream MIT license, copied to
+  `licenses/ida-sdk-MIT.txt`.
   DbgAtlas only vendors `src/include` because the native IDA adapter compiles
   against SDK declarations but still dynamically loads the user's local
   `ida.dll` / `idalib.dll` / Hex-Rays dispatcher at runtime. The SDK `src/lib`,
@@ -21,9 +26,10 @@ Vendored dependencies:
 
 To refresh the IDA SDK header snapshot:
 
-1. Clone or fetch `https://github.com/dstars-oss/ida-sdk.git`.
+1. Clone or fetch the recorded 9.3 or 9.4 repository.
 2. Check out the intended tag or commit.
-3. Replace `cpp/ida-sdk/include` with that checkout's `src/include`.
+3. Replace the matching `cpp/ida-sdk/<sdk-version>/include` directory with
+   that checkout's `src/include`.
 4. Copy `LICENSE` to `licenses/ida-sdk-MIT.txt`.
 5. Update this record with the exact tag, commit, and rationale.
 

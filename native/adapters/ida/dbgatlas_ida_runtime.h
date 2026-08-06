@@ -26,7 +26,21 @@ void* (*dbgatlas_ida_hexrays_dispatcher())(int code, ...);
 #include <typeinf.hpp>
 #include <xref.hpp>
 
-static_assert(IDA_SDK_VERSION == 930, "DbgAtlas IDA adapter expects the IDA 9.3 SDK headers");
+#ifndef DBGATLAS_IDA_EXPECTED_SDK_VERSION
+#error DBGATLAS_IDA_EXPECTED_SDK_VERSION must be defined by the provider target
+#endif
+
+#ifndef DBGATLAS_IDA_RUNTIME_MAJOR
+#error DBGATLAS_IDA_RUNTIME_MAJOR must be defined by the provider target
+#endif
+
+#ifndef DBGATLAS_IDA_RUNTIME_MINOR
+#error DBGATLAS_IDA_RUNTIME_MINOR must be defined by the provider target
+#endif
+
+static_assert(
+    IDA_SDK_VERSION == DBGATLAS_IDA_EXPECTED_SDK_VERSION,
+    "DbgAtlas IDA provider was compiled with the wrong SDK headers");
 static_assert(sizeof(ea_t) == 8, "DbgAtlas IDA adapter only supports 64-bit ea_t");
 static_assert(sizeof(qvector<char>) == 24, "qvector ABI layout must match IDA x64");
 static_assert(sizeof(qstring) == 24, "qstring ABI layout must match IDA x64");

@@ -43,7 +43,8 @@ analysis-workspace/
     dbgatlas-worker.exe
     dbgatlas_dbgeng.dll
     dbgatlas_etw.dll
-    dbgatlas_ida.dll
+    dbgatlas_ida_sdk_930.dll
+    dbgatlas_ida_sdk_940.dll
     rt\
       windbg\
         amd64\          # copied Store WinDbg runtime: dbgeng + ttd
@@ -60,6 +61,8 @@ SCM 注册的 `DbgAtlas` service 指向 `<install-root>\bin\dbgatlas.exe`，不�
 安装态 service 还暴露 `service.update` JSON-RPC/MCP 方法，接收一个已经构建好的 payload 目录。该方法只完成校验并启动独立 updater 进程，然后异步返回 accepted；updater 会先复制到 `bin.next-*`，并在停服务前把 Store 或现有 DbgAtlas WinDbg runtime 放入 `bin.next-*\rt\windbg\<arch>`，停止服务后使用 rename 将旧 `bin` 移到 `bin.old-*` 并把新 payload 放到 `bin`，最后按请求重启服务并 best-effort 清理旧目录。payload 根目录的 `runtime.toml` 或 `etc/runtime.toml` 会在校验通过后覆盖安装态 `etc/runtime.toml`；payload 中的 `token` 不会复制，安装态 token 始终保留。payload `runtime.toml` 本身也不得包含 `token` / `token_file` / `bearer_token` 等 token 字段。更新结果写入 service 日志。
 
 `service.update` 排障优先看 `<install-root>\var\log\service-YYYY-MM-DD.log`：`accepted service.update` 表示请求已通过校验并启动 updater；`starting service apply-update` 表示子进程开始 staged 替换；残留 `bin.next-*` 多半表示替换前中断，残留 `bin.old-*` 表示新 payload 已经接管但清理失败或被占用。日志确认后再调用 `dbgatlas --json service health` 检查重启后的 HTTP/RPC/MCP endpoint。
+
+从仍要求旧 `dbgatlas_ida.dll` 的安装态版本升级到版本化 IDA provider 布局时，旧进程无法验证只包含 930/940 provider 的新 payload；该边界需要一次 MSI 或 `service install` 迁移。完成迁移后，后续 `service.update` 使用新的双 provider payload 清单。
 
 安装态 service 日志写入 `<install-root>\var\log\service-YYYY-MM-DD.log`，按 UTC 日期滚动，保留当天和前 6 天的 service 日志。
 

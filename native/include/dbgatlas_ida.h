@@ -40,6 +40,17 @@ typedef struct DA_IdaVersion {
     uint32_t ida_build;
 } DA_IdaVersion;
 
+typedef struct DA_IdaProviderInfo {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t abi_major;
+    uint32_t abi_minor;
+    uint32_t abi_patch;
+    uint32_t ida_sdk_version;
+    uint32_t ida_major;
+    uint32_t ida_minor;
+} DA_IdaProviderInfo;
+
 typedef struct DA_IdaTextView {
     uint32_t struct_size;
     uint32_t flags;
@@ -80,6 +91,7 @@ typedef struct DA_IdaArtifactResult {
 typedef struct DA_IdaSessionHandle DA_IdaSessionHandle;
 
 DA_IDA_EXPORT int32_t da_ida_abi_version(DA_IdaVersion* out);
+DA_IDA_EXPORT int32_t da_ida_provider_info(DA_IdaProviderInfo* out);
 DA_IDA_EXPORT void da_ida_release_view(void* owner);
 DA_IDA_EXPORT int32_t da_ida_last_error(
     char* buffer,

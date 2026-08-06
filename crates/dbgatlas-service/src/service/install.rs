@@ -829,44 +829,55 @@ pub(super) fn ttd_doctor_check(tools: &dbgatlas_runtime::ResolvedToolPaths) -> D
 }
 
 pub(super) fn ida_doctor_check(runtime: &RuntimeConfig) -> DoctorCheck {
-    let install_dir = runtime
-        .tools
-        .ida
-        .install_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_IDA_INSTALL_DIR));
-    let ida_dll = install_dir.join("ida.dll");
-    let idalib_dll = install_dir.join("idalib.dll");
-    if install_dir.is_dir() && ida_dll.is_file() && idalib_dll.is_file() {
-        return doctor_check(
-            "ida",
-            "IDA Pro",
-            DoctorCheckStatus::Ok,
-            "IDA runtime files were found".to_string(),
-            Some("ida.dll and idalib.dll are present".to_string()),
-            Some(install_dir),
-        );
-    }
-    let mut missing = Vec::new();
-    if !install_dir.is_dir() {
-        missing.push("install directory");
-    }
-    if !ida_dll.is_file() {
-        missing.push("ida.dll");
-    }
-    if !idalib_dll.is_file() {
-        missing.push("idalib.dll");
+    let candidates = ida_install_candidates(runtime.tools.ida.install_dir.as_deref());
+    if let Some(install_dir) = candidates
+        .iter()
+        .find(|candidate| is_ida_install_dir(candidate))
+    {
+        return match dbgatlas_ida::detect_runtime_info(install_dir) {
+            Ok(info) => doctor_check(
+                "ida",
+                "IDA",
+                DoctorCheckStatus::Ok,
+                format!(
+                    "IDA {}.{} runtime will use {}",
+                    info.runtime_major, info.runtime_minor, info.provider_file_name
+                ),
+                Some(format!(
+                    "SDK provider {}, ABI {}.{}.{}, runtime build {}",
+                    info.ida_sdk_version,
+                    info.abi_major,
+                    info.abi_minor,
+                    info.abi_patch,
+                    info.runtime_build
+                )),
+                Some(install_dir.clone()),
+            ),
+            Err(error) => doctor_check(
+                "ida",
+                "IDA",
+                DoctorCheckStatus::Warning,
+                "IDA runtime files were found but no compatible provider is available".to_string(),
+                Some(error.to_string()),
+                Some(install_dir.clone()),
+            ),
+        };
     }
     doctor_check(
         "ida",
-        "IDA Pro",
+        "IDA",
         DoctorCheckStatus::Warning,
-        format!(
-            "IDA Pro 9.3 runtime was not detected at {}; reverse features are unavailable unless callers pass a valid ida_install_dir",
-            install_dir.display()
-        ),
-        Some(format!("missing {}", missing.join(", "))),
-        Some(install_dir),
+        "No supported IDA runtime was detected; reverse features require a valid ida_install_dir"
+            .to_string(),
+        Some(format!(
+            "checked {}",
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        runtime.tools.ida.install_dir.clone(),
     )
 }
 
@@ -984,9 +995,8 @@ pub(super) fn doctor_msi_warning_line(check: &DoctorCheck) -> String {
         "service_health" => "Installed service health check did not pass.".to_string(),
         "dbgeng" => "WinDbg DbgEng runtime was not detected; debug sessions may fail.".to_string(),
         "ttd" => "TTD.exe was not detected; TTD recording is unavailable.".to_string(),
-        "ida" => {
-            "IDA Pro 9.3 runtime was not detected; reverse features are unavailable.".to_string()
-        }
+        "ida" => "A supported IDA runtime/provider pair was not detected; reverse features are unavailable."
+            .to_string(),
         _ => format!("{}: {}", check.label, check.summary),
     }
 }

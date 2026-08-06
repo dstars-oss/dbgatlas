@@ -79,7 +79,7 @@ service `0.3` 使用统一方法注册表定义 canonical method、domain route�
 
 service-hosted HTTP MCP 入口通过现有 service/domain workflow 暴露 MCP tools，不复制 debug/session/recording 业务逻辑，也不提供独立 stdio MCP 进程。
 
-IDA 路线走 DbgAtlas 自有 C++ native adapter 主线。Rust safe wrapper 通过 runtime config 或请求参数提供的 IDA install dir 配置 DLL search path，并运行时加载 `dbgatlas_ida.dll`；adapter 编译期使用 vendored IDA SDK header 快照获取类型、常量和函数声明，并在 session open 时按需加载用户本机安装目录里的 `ida.dll` / `idalib.dll` / Hex-Rays dispatcher，不链接 IDA SDK import libs。Rust 侧通过 `dbgatlas-ida-sys` ABI 类型和 safe wrapper 暴露最小能力，不把 IDA C++ 类型穿过 C ABI。安装态 service 通过 active interactive user worker 执行 IDA open、lookup、Core Functions 和 close；每个 IDA database 使用独立 reverse session worker，避免 LocalSystem 直接加载 IDALib。
+IDA 路线走 DbgAtlas 自有 C++ native adapter 主线。Rust safe wrapper 先读取 `idalib.dll` VERSIONINFO，再从 DbgAtlas 自身目录发现 metadata 与 major/minor 完全匹配的版本化 provider；当前 payload 包含 `dbgatlas_ida_sdk_930.dll` 和 `dbgatlas_ida_sdk_940.dll`。两个 provider 共用业务源码，分别编译于对应的 vendored SDK headers，并在 session open 时按需加载用户本机安装目录里的 `ida.dll` / `idalib.dll` / Hex-Rays dispatcher，不链接 IDA SDK import libs。Rust 侧通过 `dbgatlas-ida-sys` ABI 类型和 safe wrapper 暴露最小能力，不把 IDA C++ 类型穿过 C ABI。安装态 service 通过 active interactive user worker 执行 IDA open、lookup、Core Functions 和 close；每个 IDA database 使用独立 reverse session worker，避免 LocalSystem 直接加载 IDALib。新增版本通过同一 C ABI 增加 provider，未知版本不回退到相邻 SDK。
 
 ETW recording 路线优先走 C++ adapter + Rust safe wrapper：ETW session、provider enable、实时消费、预处理和过滤留在 native adapter 内部，Rust 侧负责安全封装、worker 编排、artifact 登记和 service/CLI/MCP 入口。WPR/WPAExport 不作为主采集链路。
 

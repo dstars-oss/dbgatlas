@@ -55,11 +55,14 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 ## IDA native adapter ABI
 
-IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义独立 C ABI。Rust safe wrapper 根据请求中的 IDA install dir 配置 Windows DLL search path，再运行时加载 `dbgatlas_ida.dll`；adapter 编译期使用 `3rdpart/cpp/ida-sdk/include` 中固定版本的 IDA SDK header 快照获取类型、常量和函数声明，并在 session open 时按需加载用户本机安装目录里的 `ida.dll` / `idalib.dll` / Hex-Rays dispatcher。构建不链接 IDA SDK import libs，session open 会在 IDALib 初始化后校验运行时版本为 IDA 9.3.x，导出边界只暴露 opaque handle、固定宽度整数和 text view。
+IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义 ABI 0.3。`da_ida_provider_info` 可在不加载 IDA runtime 的情况下报告 provider ABI、SDK 和目标 IDA major/minor。Rust safe wrapper 读取安装目录中 `idalib.dll` 的 VERSIONINFO，并只从 DbgAtlas executable、`deps` 和既有父目录中发现版本化 provider；当前分别使用 `3rdpart/cpp/ida-sdk/930/include` 与 `940/include` 构建 `dbgatlas_ida_sdk_930.dll` 和 `dbgatlas_ida_sdk_940.dll`。provider 在 session open 时按需加载用户本机的 `ida.dll` / `idalib.dll` / Hex-Rays dispatcher，初始化后通过 `get_library_version` 再次校验 major/minor。构建不链接 IDA SDK import libs，未知版本、缺失 provider 或 metadata 不匹配都会失败，不回退到相邻版本。导出边界只暴露 opaque handle、固定宽度整数和 text view。
+
+IDA provider 默认维护当前 minor 和前一 minor；同一 major/minor 下的 service pack/build 复用同一 provider，build 号仅用于诊断记录。当前范围是 Windows x64 的 IDA 9.4 和 9.3，不包含 Windows ARM64。
 
 当前最小 ABI：
 
 - `da_ida_abi_version(out)`
+- `da_ida_provider_info(out)`
 - `da_ida_session_open(install_dir_utf8, database_path_utf8, out_handle)`
 - `da_ida_lookup_function(handle, runtime_address, runtime_module_base, ida_image_base, out)`
 - `da_ida_core_function(handle, function_utf8, arguments_json_utf8, out)`

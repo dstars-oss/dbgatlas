@@ -23,6 +23,19 @@ pub struct DA_IdaVersion {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct DA_IdaProviderInfo {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub abi_major: u32,
+    pub abi_minor: u32,
+    pub abi_patch: u32,
+    pub ida_sdk_version: u32,
+    pub ida_major: u32,
+    pub ida_minor: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DA_IdaTextView {
     pub struct_size: u32,
     pub flags: u32,
@@ -72,6 +85,7 @@ pub struct DA_IdaSessionHandle {
 }
 
 pub type DaIdaAbiVersionFn = unsafe extern "C" fn(*mut DA_IdaVersion) -> i32;
+pub type DaIdaProviderInfoFn = unsafe extern "C" fn(*mut DA_IdaProviderInfo) -> i32;
 pub type DaIdaReleaseViewFn = unsafe extern "C" fn(*mut c_void);
 pub type DaIdaLastErrorFn = unsafe extern "C" fn(*mut c_char, usize, *mut usize) -> i32;
 pub type DaIdaSessionOpenFn =

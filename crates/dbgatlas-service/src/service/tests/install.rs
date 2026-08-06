@@ -1,6 +1,13 @@
 use super::*;
 
 #[test]
+fn required_payload_uses_only_versioned_ida_providers() {
+    assert!(WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.contains(&"dbgatlas_ida_sdk_930.dll"));
+    assert!(WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.contains(&"dbgatlas_ida_sdk_940.dll"));
+    assert!(!WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.contains(&"dbgatlas_ida.dll"));
+}
+
+#[test]
 fn default_service_root_uses_program_files_dbgatlas() {
     let program_files = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
@@ -296,7 +303,8 @@ fn copy_payload_installs_files_into_bin() {
         fs::read_to_string(paths.bin_dir.join("dbgatlas.exe")).unwrap(),
         "dbgatlas.exe"
     );
-    assert!(paths.bin_dir.join("dbgatlas_ida.dll").is_file());
+    assert!(paths.bin_dir.join("dbgatlas_ida_sdk_930.dll").is_file());
+    assert!(paths.bin_dir.join("dbgatlas_ida_sdk_940.dll").is_file());
 }
 
 #[test]

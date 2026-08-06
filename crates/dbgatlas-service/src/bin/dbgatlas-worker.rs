@@ -7,7 +7,7 @@ use dbgatlas_model::{
 };
 use dbgatlas_runtime::RuntimeConfig;
 use dbgatlas_worker_protocol::{
-    ReverseCoreFunctionResult, ReverseFunctionLookupResult, WorkerArtifactRole,
+    ReverseCoreFunctionResult, ReverseFunctionLookupResult, ReverseRuntimeInfo, WorkerArtifactRole,
     WorkerArtifactWrite, WorkerEnvelope, WorkerRequest, WorkerResponse, decode_jsonl, encode_jsonl,
 };
 use std::fs::{self, OpenOptions};
@@ -435,8 +435,22 @@ impl WorkerState {
         }
         match dbgatlas_ida::IdaSession::open(ida_install_dir, database_path) {
             Ok(session) => {
+                let info = session.runtime_info();
+                let runtime = ReverseRuntimeInfo {
+                    runtime_major: info.runtime_major,
+                    runtime_minor: info.runtime_minor,
+                    runtime_build: info.runtime_build,
+                    provider_file_name: info.provider_file_name.clone(),
+                    ida_sdk_version: info.ida_sdk_version,
+                    abi_major: info.abi_major,
+                    abi_minor: info.abi_minor,
+                    abi_patch: info.abi_patch,
+                };
                 self.reverse_session = Some(session);
-                WorkerResponse::ReverseSessionOpened { writes: Vec::new() }
+                WorkerResponse::ReverseSessionOpened {
+                    runtime,
+                    writes: Vec::new(),
+                }
             }
             Err(error) => WorkerResponse::failed("reverse_open_failed", error.to_string()),
         }

@@ -5,6 +5,12 @@ use std::sync::mpsc;
 use std::thread;
 use thiserror::Error;
 
+const ADAPTER_ABI_MAJOR: u32 = 0;
+const ADAPTER_ABI_MINOR: u32 = 3;
+
+#[cfg(windows)]
+mod provider;
+
 #[derive(Debug, Error)]
 pub enum IdaError {
     #[error("IDA adapter is only supported on Windows")]
@@ -17,6 +23,14 @@ pub enum IdaError {
     Native { status: i32, message: String },
     #[error("failed to load native IDA adapter: {0}")]
     DynamicLoad(String),
+    #[error("failed to detect IDA runtime version from {path}: {message}")]
+    RuntimeVersionDetection { path: PathBuf, message: String },
+    #[error("IDA runtime version {major}.{minor} is not supported")]
+    UnsupportedRuntimeVersion { major: u32, minor: u32 },
+    #[error("no IDA provider is available for runtime {major}.{minor}")]
+    ProviderNotFound { major: u32, minor: u32 },
+    #[error("IDA provider {path} is incompatible: {message}")]
+    ProviderMismatch { path: PathBuf, message: String },
     #[error("IDA session worker stopped")]
     WorkerStopped,
     #[error("artifact I/O failed: {0}")]
@@ -31,6 +45,29 @@ pub struct NativeVersion {
     pub ida_major: u32,
     pub ida_minor: u32,
     pub ida_build: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdaProviderInfo {
+    pub path: PathBuf,
+    pub abi_major: u32,
+    pub abi_minor: u32,
+    pub abi_patch: u32,
+    pub ida_sdk_version: u32,
+    pub ida_major: u32,
+    pub ida_minor: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdaRuntimeInfo {
+    pub runtime_major: u32,
+    pub runtime_minor: u32,
+    pub runtime_build: u32,
+    pub provider_file_name: String,
+    pub ida_sdk_version: u32,
+    pub abi_major: u32,
+    pub abi_minor: u32,
+    pub abi_patch: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +103,7 @@ pub struct CoreFunctionArtifactResult {
 pub struct IdaSession {
     commands: mpsc::Sender<Command>,
     thread: Option<thread::JoinHandle<()>>,
+    runtime_info: IdaRuntimeInfo,
 }
 
 impl IdaSession {
@@ -85,14 +123,15 @@ impl IdaSession {
         #[cfg(windows)]
         {
             let (commands_tx, commands_rx) = mpsc::channel::<Command>();
-            let (ready_tx, ready_rx) = mpsc::channel::<Result<(), IdaError>>();
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<IdaRuntimeInfo, IdaError>>();
             let thread = thread::spawn(move || {
                 run_native_session(install_dir, database_path, ready_tx, commands_rx)
             });
             match ready_rx.recv().map_err(|_| IdaError::WorkerStopped)? {
-                Ok(()) => Ok(Self {
+                Ok(runtime_info) => Ok(Self {
                     commands: commands_tx,
                     thread: Some(thread),
+                    runtime_info,
                 }),
                 Err(error) => {
                     let _ = thread.join();
@@ -100,6 +139,10 @@ impl IdaSession {
                 }
             }
         }
+    }
+
+    pub fn runtime_info(&self) -> &IdaRuntimeInfo {
+        &self.runtime_info
     }
 
     pub fn lookup_function(
@@ -215,6 +258,7 @@ enum Command {
 #[cfg(windows)]
 struct AdapterApi {
     _abi_version: dbgatlas_ida_sys::DaIdaAbiVersionFn,
+    _provider_info: dbgatlas_ida_sys::DaIdaProviderInfoFn,
     release_view: dbgatlas_ida_sys::DaIdaReleaseViewFn,
     last_error: dbgatlas_ida_sys::DaIdaLastErrorFn,
     session_open: dbgatlas_ida_sys::DaIdaSessionOpenFn,
@@ -263,7 +307,7 @@ impl Drop for DllDirectory {
 
 #[cfg(windows)]
 impl AdapterLibrary {
-    fn load(install_dir: &Path) -> Result<Self, IdaError> {
+    fn load(install_dir: &Path, provider: &IdaProviderInfo) -> Result<Self, IdaError> {
         use windows_sys::Win32::System::LibraryLoader::{
             LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_USER_DIRS, LoadLibraryExW,
             SetDefaultDllDirectories,
@@ -274,7 +318,7 @@ impl AdapterLibrary {
             return Err(last_os_error("SetDefaultDllDirectories"));
         }
         let dll_directory = DllDirectory::add(install_dir)?;
-        let adapter_path = find_adapter_path()?;
+        let adapter_path = &provider.path;
         let adapter_wide = wide_null(adapter_path.as_os_str());
         let load_flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS;
         let module =
@@ -290,6 +334,7 @@ impl AdapterLibrary {
             let result = (|| -> Result<AdapterApi, IdaError> {
                 Ok(AdapterApi {
                     _abi_version: bind_symbol(module, b"da_ida_abi_version\0")?,
+                    _provider_info: bind_symbol(module, b"da_ida_provider_info\0")?,
                     release_view: bind_symbol(module, b"da_ida_release_view\0")?,
                     last_error: bind_symbol(module, b"da_ida_last_error\0")?,
                     session_open: bind_symbol(module, b"da_ida_session_open\0")?,
@@ -314,14 +359,31 @@ impl AdapterLibrary {
         };
         let version_status = unsafe { (api._abi_version)(&mut version) };
         if version_status != dbgatlas_ida_sys::DA_IDA_OK
-            || version.abi_major != 0
-            || version.abi_minor < 2
+            || version.abi_major != ADAPTER_ABI_MAJOR
+            || version.abi_minor < ADAPTER_ABI_MINOR
         {
             unsafe { windows_sys::Win32::Foundation::FreeLibrary(module) };
             return Err(IdaError::DynamicLoad(format!(
-                "dbgatlas_ida ABI {}.{} is incompatible; expected at least 0.2",
-                version.abi_major, version.abi_minor
+                "IDA provider ABI {}.{} is incompatible; expected at least {}.{}",
+                version.abi_major, version.abi_minor, ADAPTER_ABI_MAJOR, ADAPTER_ABI_MINOR
             )));
+        }
+
+        let mut raw_provider = dbgatlas_ida_sys::DA_IdaProviderInfo {
+            struct_size: std::mem::size_of::<dbgatlas_ida_sys::DA_IdaProviderInfo>() as u32,
+            ..Default::default()
+        };
+        let provider_status = unsafe { (api._provider_info)(&mut raw_provider) };
+        if provider_status != dbgatlas_ida_sys::DA_IDA_OK
+            || raw_provider.ida_sdk_version != provider.ida_sdk_version
+            || raw_provider.ida_major != provider.ida_major
+            || raw_provider.ida_minor != provider.ida_minor
+        {
+            unsafe { windows_sys::Win32::Foundation::FreeLibrary(module) };
+            return Err(IdaError::ProviderMismatch {
+                path: adapter_path.to_path_buf(),
+                message: "provider metadata changed between discovery and load".to_string(),
+            });
         }
 
         Ok(Self {
@@ -351,7 +413,7 @@ pub fn native_version() -> Result<NativeVersion, IdaError> {
     {
         Ok(NativeVersion {
             abi_major: 0,
-            abi_minor: 2,
+            abi_minor: ADAPTER_ABI_MINOR,
             abi_patch: 0,
             ida_major: 0,
             ida_minor: 0,
@@ -360,32 +422,116 @@ pub fn native_version() -> Result<NativeVersion, IdaError> {
     }
 }
 
+pub fn available_providers() -> Result<Vec<IdaProviderInfo>, IdaError> {
+    #[cfg(not(windows))]
+    {
+        Err(IdaError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
+    {
+        provider::discover_providers()
+    }
+}
+
+pub fn detect_runtime_info(install_dir: impl AsRef<Path>) -> Result<IdaRuntimeInfo, IdaError> {
+    let install_dir = validate_path(install_dir.as_ref(), "install_dir")?;
+    #[cfg(not(windows))]
+    {
+        let _ = install_dir;
+        Err(IdaError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
+    {
+        validate_install_dir(&install_dir)?;
+        let (_, info) = resolve_runtime_provider(&install_dir)?;
+        Ok(info)
+    }
+}
+
+fn select_provider(
+    providers: &[IdaProviderInfo],
+    major: u32,
+    minor: u32,
+) -> Result<IdaProviderInfo, IdaError> {
+    if let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.ida_major == major && provider.ida_minor == minor)
+    {
+        return Ok(provider.clone());
+    }
+    if matches!((major, minor), (9, 3) | (9, 4)) {
+        Err(IdaError::ProviderNotFound { major, minor })
+    } else {
+        Err(IdaError::UnsupportedRuntimeVersion { major, minor })
+    }
+}
+
 #[cfg(windows)]
-fn run_native_session(
-    install_dir: PathBuf,
-    database_path: PathBuf,
-    ready: mpsc::Sender<Result<(), IdaError>>,
-    commands: mpsc::Receiver<Command>,
-) {
+fn validate_install_dir(install_dir: &Path) -> Result<(), IdaError> {
     if !install_dir.is_dir() {
-        let _ = ready.send(Err(IdaError::DynamicLoad(format!(
+        return Err(IdaError::DynamicLoad(format!(
             "tools.ida.install_dir does not exist or is not a directory: {}",
             install_dir.display()
-        ))));
-        return;
+        )));
     }
     for dll in ["ida.dll", "idalib.dll"] {
         let path = install_dir.join(dll);
         if !path.is_file() {
-            let _ = ready.send(Err(IdaError::DynamicLoad(format!(
+            return Err(IdaError::DynamicLoad(format!(
                 "tools.ida.install_dir is missing {dll}: {}",
                 path.display()
-            ))));
-            return;
+            )));
         }
     }
+    Ok(())
+}
 
-    let adapter = match AdapterLibrary::load(&install_dir) {
+#[cfg(windows)]
+fn resolve_runtime_provider(
+    install_dir: &Path,
+) -> Result<(IdaProviderInfo, IdaRuntimeInfo), IdaError> {
+    let runtime_version = provider::detect_runtime_version(&install_dir.join("idalib.dll"))?;
+    let providers = provider::discover_providers()?;
+    let provider = select_provider(&providers, runtime_version.major, runtime_version.minor)?;
+    let runtime_info = IdaRuntimeInfo {
+        runtime_major: runtime_version.major,
+        runtime_minor: runtime_version.minor,
+        runtime_build: runtime_version.build,
+        provider_file_name: provider
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| provider.path.display().to_string()),
+        ida_sdk_version: provider.ida_sdk_version,
+        abi_major: provider.abi_major,
+        abi_minor: provider.abi_minor,
+        abi_patch: provider.abi_patch,
+    };
+    Ok((provider, runtime_info))
+}
+
+#[cfg(windows)]
+fn run_native_session(
+    install_dir: PathBuf,
+    database_path: PathBuf,
+    ready: mpsc::Sender<Result<IdaRuntimeInfo, IdaError>>,
+    commands: mpsc::Receiver<Command>,
+) {
+    if let Err(error) = validate_install_dir(&install_dir) {
+        let _ = ready.send(Err(error));
+        return;
+    }
+
+    let (provider, runtime_info) = match resolve_runtime_provider(&install_dir) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let adapter = match AdapterLibrary::load(&install_dir, &provider) {
         Ok(adapter) => adapter,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -416,7 +562,7 @@ fn run_native_session(
         let _ = ready.send(Err(native_error(&adapter, open)));
         return;
     }
-    let _ = ready.send(Ok(()));
+    let _ = ready.send(Ok(runtime_info));
 
     while let Ok(command) = commands.recv() {
         match command {
@@ -651,32 +797,6 @@ fn validate_path(path: &Path, field: &'static str) -> Result<PathBuf, IdaError> 
 }
 
 #[cfg(windows)]
-fn find_adapter_path() -> Result<PathBuf, IdaError> {
-    let exe = std::env::current_exe()
-        .map_err(|error| IdaError::DynamicLoad(format!("failed to locate current exe: {error}")))?;
-    let exe_dir = exe
-        .parent()
-        .ok_or_else(|| IdaError::DynamicLoad("current exe has no parent directory".to_string()))?;
-    let candidates = [
-        exe_dir.join("dbgatlas_ida.dll"),
-        exe_dir.join("deps").join("dbgatlas_ida.dll"),
-        exe_dir
-            .parent()
-            .map(|parent| parent.join("dbgatlas_ida.dll"))
-            .unwrap_or_else(|| exe_dir.join("dbgatlas_ida.dll")),
-    ];
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(IdaError::DynamicLoad(format!(
-        "dbgatlas_ida.dll was not found next to {}",
-        exe.display()
-    )))
-}
-
-#[cfg(windows)]
 fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     value.encode_wide().chain(std::iter::once(0)).collect()
@@ -801,6 +921,82 @@ mod tests {
     fn native_version_is_readable_without_ida_runtime() {
         let version = native_version().unwrap();
         assert_eq!(version.abi_major, 0);
+        assert_eq!(version.abi_minor, 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovers_both_versioned_providers_without_ida_runtime() {
+        let providers = available_providers().unwrap();
+        assert!(providers.iter().any(|provider| {
+            provider.ida_sdk_version == 930 && provider.ida_major == 9 && provider.ida_minor == 3
+        }));
+        assert!(providers.iter().any(|provider| {
+            provider.ida_sdk_version == 940 && provider.ida_major == 9 && provider.ida_minor == 4
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_discovery_keeps_directory_precedence() {
+        let source = available_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.ida_sdk_version == 930)
+            .unwrap()
+            .path;
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let file_name = source.file_name().unwrap();
+        std::fs::copy(&source, first.join(file_name)).unwrap();
+        std::fs::copy(&source, second.join(file_name)).unwrap();
+
+        let providers = provider::discover_providers_in(&[first.clone(), second]).unwrap();
+        let selected = providers
+            .iter()
+            .find(|provider| provider.ida_sdk_version == 930)
+            .unwrap();
+        assert_eq!(selected.path, first.join(file_name));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_provider_candidate_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("dbgatlas_ida_sdk_invalid.dll");
+        std::fs::write(&path, b"not a dll").unwrap();
+        assert!(matches!(
+            provider::discover_providers_in(&[temp.path().to_path_buf()]),
+            Err(IdaError::ProviderMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn selects_exact_provider_and_fails_closed() {
+        let provider = IdaProviderInfo {
+            path: PathBuf::from("dbgatlas_ida_sdk_930.dll"),
+            abi_major: 0,
+            abi_minor: 3,
+            abi_patch: 0,
+            ida_sdk_version: 930,
+            ida_major: 9,
+            ida_minor: 3,
+        };
+        assert_eq!(
+            select_provider(std::slice::from_ref(&provider), 9, 3).unwrap(),
+            provider
+        );
+        assert!(matches!(
+            select_provider(&[], 9, 4),
+            Err(IdaError::ProviderNotFound { major: 9, minor: 4 })
+        ));
+        assert!(matches!(
+            select_provider(&[], 9, 5),
+            Err(IdaError::UnsupportedRuntimeVersion { major: 9, minor: 5 })
+        ));
     }
 
     #[cfg(windows)]

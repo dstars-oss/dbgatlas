@@ -2298,11 +2298,25 @@ DA_IDA_EXPORT int32_t da_ida_abi_version(DA_IdaVersion* out) {
     }
     out->flags = 0;
     out->abi_major = 0;
-    out->abi_minor = 2;
+    out->abi_minor = 3;
     out->abi_patch = 0;
-    out->ida_major = 0;
-    out->ida_minor = 0;
+    out->ida_major = DBGATLAS_IDA_RUNTIME_MAJOR;
+    out->ida_minor = DBGATLAS_IDA_RUNTIME_MINOR;
     out->ida_build = 0;
+    return DA_IDA_OK;
+}
+
+DA_IDA_EXPORT int32_t da_ida_provider_info(DA_IdaProviderInfo* out) {
+    if (out == nullptr || out->struct_size < sizeof(DA_IdaProviderInfo)) {
+        return fail(DA_IDA_ERR_INVALID_ARGUMENT, "provider info output buffer is invalid");
+    }
+    out->flags = 0;
+    out->abi_major = 0;
+    out->abi_minor = 3;
+    out->abi_patch = 0;
+    out->ida_sdk_version = DBGATLAS_IDA_EXPECTED_SDK_VERSION;
+    out->ida_major = DBGATLAS_IDA_RUNTIME_MAJOR;
+    out->ida_minor = DBGATLAS_IDA_RUNTIME_MINOR;
     return DA_IDA_OK;
 }
 
@@ -2508,11 +2522,25 @@ DA_IDA_EXPORT int32_t da_ida_abi_version(DA_IdaVersion* out) {
     }
     out->flags = 0;
     out->abi_major = 0;
-    out->abi_minor = 2;
+    out->abi_minor = 3;
     out->abi_patch = 0;
-    out->ida_major = 0;
-    out->ida_minor = 0;
+    out->ida_major = DBGATLAS_IDA_RUNTIME_MAJOR;
+    out->ida_minor = DBGATLAS_IDA_RUNTIME_MINOR;
     out->ida_build = 0;
+    return DA_IDA_OK;
+}
+
+DA_IDA_EXPORT int32_t da_ida_provider_info(DA_IdaProviderInfo* out) {
+    if (out == nullptr || out->struct_size < sizeof(DA_IdaProviderInfo)) {
+        return DA_IDA_ERR_INVALID_ARGUMENT;
+    }
+    out->flags = 0;
+    out->abi_major = 0;
+    out->abi_minor = 3;
+    out->abi_patch = 0;
+    out->ida_sdk_version = DBGATLAS_IDA_EXPECTED_SDK_VERSION;
+    out->ida_major = DBGATLAS_IDA_RUNTIME_MAJOR;
+    out->ida_minor = DBGATLAS_IDA_RUNTIME_MINOR;
     return DA_IDA_OK;
 }
 

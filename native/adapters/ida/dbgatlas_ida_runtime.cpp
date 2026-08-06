@@ -91,6 +91,9 @@ using get_func_qty_fn = size_t(idaapi*)();
 using get_func_name_fn = ssize_t(idaapi*)(qstring*, ea_t);
 using get_frame_size_fn = asize_t(idaapi*)(const func_t*);
 using lock_func_range_fn = void(idaapi*)(const func_t*, bool);
+#if IDA_SDK_VERSION >= 940
+using lock_func_range_ea_fn = void(idaapi*)(ea_t, bool);
+#endif
 using func_tail_iterator_set_fn = bool(idaapi*)(func_tail_iterator_t*, func_t*, ea_t);
 using func_item_iterator_next_fn = bool(idaapi*)(func_item_iterator_t*, testf_t*, void*);
 using get_tinfo_fn = bool(idaapi*)(tinfo_t*, ea_t);
@@ -150,6 +153,9 @@ struct IdaApis {
     get_func_name_fn get_func_name = nullptr;
     get_frame_size_fn get_frame_size = nullptr;
     lock_func_range_fn lock_func_range = nullptr;
+#if IDA_SDK_VERSION >= 940
+    lock_func_range_ea_fn lock_func_range_ea = nullptr;
+#endif
     func_tail_iterator_set_fn func_tail_iterator_set = nullptr;
     func_item_iterator_next_fn func_item_iterator_next = nullptr;
     get_tinfo_fn get_tinfo = nullptr;
@@ -239,10 +245,11 @@ void validate_library_version(const IdaApis& api) {
     if (!api.get_library_version(major, minor, build)) {
         throw std::runtime_error("get_library_version failed");
     }
-    if (major != 9 || minor != 3) {
+    if (major != DBGATLAS_IDA_RUNTIME_MAJOR || minor != DBGATLAS_IDA_RUNTIME_MINOR) {
         std::ostringstream out;
         out << "IDA runtime version " << major << "." << minor << " build " << build
-            << " does not match vendored IDA SDK headers 9.3";
+            << " does not match provider target " << DBGATLAS_IDA_RUNTIME_MAJOR << "."
+            << DBGATLAS_IDA_RUNTIME_MINOR;
         throw std::runtime_error(out.str());
     }
 }
@@ -288,6 +295,9 @@ void dbgatlas_ida_runtime_load(const std::wstring& install_dir) {
     api.get_func_name = bind_proc<get_func_name_fn>(api.ida, "ida.dll", "get_func_name");
     api.get_frame_size = bind_proc<get_frame_size_fn>(api.ida, "ida.dll", "get_frame_size");
     api.lock_func_range = bind_proc<lock_func_range_fn>(api.ida, "ida.dll", "lock_func_range");
+#if IDA_SDK_VERSION >= 940
+    api.lock_func_range_ea = bind_proc<lock_func_range_ea_fn>(api.ida, "ida.dll", "lock_func_range_ea");
+#endif
     api.func_tail_iterator_set = bind_proc<func_tail_iterator_set_fn>(api.ida, "ida.dll", "func_tail_iterator_set");
     api.func_item_iterator_next = bind_proc<func_item_iterator_next_fn>(api.ida, "ida.dll", "func_item_iterator_next");
     api.get_tinfo = bind_proc<get_tinfo_fn>(api.ida, "ida.dll", "get_tinfo");
@@ -470,6 +480,13 @@ idaman void ida_export lock_func_range(const func_t* pfn, bool lock) {
     ensure_loaded();
     g_api.lock_func_range(pfn, lock);
 }
+
+#if IDA_SDK_VERSION >= 940
+idaman void ida_export lock_func_range_ea(ea_t ea, bool lock) {
+    ensure_loaded();
+    g_api.lock_func_range_ea(ea, lock);
+}
+#endif
 
 idaman bool ida_export func_tail_iterator_set(func_tail_iterator_t* iterator, func_t* pfn, ea_t ea) {
     ensure_loaded();

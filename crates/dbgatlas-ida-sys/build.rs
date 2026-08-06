@@ -8,11 +8,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repo_dir = manifest_dir.join("..").join("..");
     let native_dir = repo_dir.join("native");
-    let ida_sdk_include_dir = repo_dir
-        .join("3rdpart")
-        .join("cpp")
-        .join("ida-sdk")
-        .join("include");
+    let ida_sdk_root = repo_dir.join("3rdpart").join("cpp").join("ida-sdk");
 
     println!(
         "cargo:rerun-if-changed={}",
@@ -46,7 +42,8 @@ fn main() {
             .join("dbgatlas_ida_runtime.h")
             .display()
     );
-    emit_rerun_if_changed_dir(&ida_sdk_include_dir);
+    emit_rerun_if_changed_dir(&ida_sdk_root.join("930").join("include"));
+    emit_rerun_if_changed_dir(&ida_sdk_root.join("940").join("include"));
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -87,8 +84,8 @@ fn main() {
         .arg("--config")
         .arg(build_type)
         .arg("--target")
-        .arg("dbgatlas_ida");
-    run(build, "build native IDA adapter");
+        .arg("dbgatlas_ida_providers");
+    run(build, "build native IDA providers");
 
     let mut outputs = Vec::new();
     collect_files(&build_dir, &mut outputs);
@@ -99,7 +96,11 @@ fn main() {
         let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !file_name.contains("dbgatlas_ida") {
+        if file_name != "dbgatlas_ida_sdk_930.dll"
+            && file_name != "dbgatlas_ida_sdk_940.dll"
+            && file_name != "dbgatlas_ida_sdk_930.lib"
+            && file_name != "dbgatlas_ida_sdk_940.lib"
+        {
             continue;
         }
         if file_name.ends_with(".dll") {

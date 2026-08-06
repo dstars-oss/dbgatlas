@@ -33,9 +33,19 @@ pub(super) fn mock_worker_response(request: WorkerRequest) -> Result<WorkerRespo
             length,
             artifact_dir,
         } => write_mock_memory_response(session_id, operation_id, address, length, artifact_dir),
-        WorkerRequest::OpenReverseSession { .. } => {
-            Ok(WorkerResponse::ReverseSessionOpened { writes: Vec::new() })
-        }
+        WorkerRequest::OpenReverseSession { .. } => Ok(WorkerResponse::ReverseSessionOpened {
+            runtime: ReverseRuntimeInfo {
+                runtime_major: 9,
+                runtime_minor: 3,
+                runtime_build: 0,
+                provider_file_name: "dbgatlas_ida_sdk_930.dll".to_string(),
+                ida_sdk_version: 930,
+                abi_major: 0,
+                abi_minor: 3,
+                abi_patch: 0,
+            },
+            writes: Vec::new(),
+        }),
         WorkerRequest::LookupReverseFunction {
             runtime_address,
             runtime_module_base,

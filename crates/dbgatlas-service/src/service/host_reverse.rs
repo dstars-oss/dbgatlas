@@ -10,10 +10,10 @@ impl ServiceHost {
         let operation_id = next_operation_ref();
         let workspace = ensure_project_workspace(&params.project_root)?;
         let artifact_dir = workspace.ensure_reverse_session_artifact_dir(&session_id.id)?;
-        let ida_install_dir = params
-            .ida_install_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_IDA_INSTALL_DIR));
+        let ida_install_dir = resolve_ida_install_dir(
+            params.ida_install_dir.as_deref(),
+            self.capabilities.ida_install_dir.as_deref(),
+        );
         let worker = match self.supervisor.create_worker(WorkerCreateRequest {
             session_id: session_id.clone(),
             project_root: params.project_root.clone(),
@@ -65,8 +65,8 @@ impl ServiceHost {
                 database_path: params.database_path.clone(),
             },
         );
-        match open {
-            Ok(WorkerResponse::ReverseSessionOpened { .. }) => {}
+        let ida_runtime = match open {
+            Ok(WorkerResponse::ReverseSessionOpened { runtime, .. }) => runtime,
             Ok(WorkerResponse::Failed { code, message, .. }) => {
                 let _ = self.supervisor.kill_worker(&worker);
                 let error = diagnose_reverse_open_error(worker_failed_message(code, message));
@@ -167,6 +167,7 @@ impl ServiceHost {
                 "session_id": session_id,
                 "database_path": params.database_path,
                 "ida_install_dir": ida_install_dir,
+                "ida_runtime": ida_runtime,
                 "created_at": now,
                 "mode": "native_dynamic_idalib",
                 "writes_idb": false,
