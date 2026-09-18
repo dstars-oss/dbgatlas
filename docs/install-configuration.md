@@ -8,6 +8,7 @@
 - 安装形态：MSI 安装包，或从 `target\release` payload 注册 Windows service。
 - 默认安装根：`%ProgramFiles%\DbgAtlas`。
 - 默认监听地址：`127.0.0.1:7331`。
+- 服务启动类型：自动启动（`AUTO_START`），Windows 启动时由 SCM 启动，不依赖用户登录。MSI、安装脚本和 `service install --force` 均设置此默认值。
 - HTTP endpoint：
   - JSON-RPC：`http://127.0.0.1:7331/rpc`
   - MCP：`http://127.0.0.1:7331/mcp`
@@ -51,6 +52,17 @@ dbgatlas service health --json
 .\target\release\dbgatlas.exe service start
 .\target\release\dbgatlas.exe service health --json
 ```
+
+`service install` 注册开机自动启动，但不立即启动服务；上面的 `service start` 用于本次安装后立即启动。MSI 和 `build-release-install.ps1` 默认会执行启动步骤；脚本的 `-NoStart` 仅跳过本次启动，不关闭开机自动启动。
+
+已有安装若仍为手动启动，可在管理员 PowerShell 中修正并立即启动：
+
+```powershell
+Set-Service -Name DbgAtlas -StartupType Automatic
+Start-Service -Name DbgAtlas
+```
+
+`service.update` 只更新 payload 并按请求重启，保留现有 SCM 启动类型。
 
 ## Token 配置
 

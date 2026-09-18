@@ -20,6 +20,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn installed_service_starts_automatically_after_boot() {
+        let paths = ServiceInstallPaths::for_root(PathBuf::from(r"C:\Program Files\DbgAtlas"));
+        let info = windows_service_control::service_info(&paths);
+
+        assert_eq!(
+            info.start_type,
+            windows_service::service::ServiceStartType::AutoStart
+        );
+    }
+
+    #[test]
     fn service_log_pruning_keeps_seven_calendar_days() {
         let temp = tempfile::tempdir().unwrap();
         let current_day =
@@ -2027,7 +2038,7 @@ pub(super) mod windows_service_control {
             name: OsString::from(WINDOWS_SERVICE_NAME),
             display_name: OsString::from(WINDOWS_SERVICE_DISPLAY_NAME),
             service_type: ServiceType::OWN_PROCESS,
-            start_type: ServiceStartType::OnDemand,
+            start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
             executable_path: paths.installed_exe.clone(),
             launch_arguments: vec![
