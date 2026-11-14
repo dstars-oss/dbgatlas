@@ -31,7 +31,7 @@ flowchart LR
   ETWSYS --> ETWDLL["native ETW DLL"]
 ```
 
-`dbgatlas service` 是产品运行时控制面。CLI、HTTP MCP 和后续 UI 都是 service client，不是架构核心。对外 API 使用 JSON-RPC 2.0 over loopback HTTP，默认要求 bearer token；`/rpc` 承载 DbgAtlas 自有 JSON-RPC API，`/mcp` 承载 MCP JSON-RPC HTTP endpoint。长操作可以通过 HTTP streaming/SSE 返回 progress/output，但取消必须显式请求，断线不等于取消。
+`dbgatlas service` 是产品运行时控制面。CLI、HTTP MCP 和后续 UI 都是 service client，不是架构核心。对外 API 使用 JSON-RPC 2.0 over loopback HTTP，不使用认证并信任本机调用者，保留 loopback bind 与浏览器 `Origin` 校验；`/rpc` 承载 DbgAtlas 自有 JSON-RPC API，`/mcp` 承载 MCP JSON-RPC HTTP endpoint。长操作可以通过 HTTP streaming/SSE 返回 progress/output，但取消必须显式请求，断线不等于取消。
 
 对外 API 不暴露 `workspace.*`、`project.*` 或 `worker.*` 业务资源。调用方在创建 session 时传入 `project_root`；service 内部把它解析为 `<project_root>/dbgatlas` 作为 analysis workspace，并懒创建该目录。`workspace` 仍是内部持久化模型，负责 manifest、artifact metadata、operation log 和受控 artifact path。
 
@@ -66,7 +66,7 @@ service `0.3` 使用统一方法注册表定义 canonical method、domain route�
 ## Service 边界
 
 - 同一个 `dbgatlas.exe` 提供 `service run` 开发模式、安装态 Windows service 入口和普通 CLI client 命令。
-- Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。默认安装根是 `%ProgramFiles%\DbgAtlas`；安装器和提权脚本应复用 service 命令默认行为，只有自定义目录时才显式传入 `--install-root`。`install` 支持复制 payload 到 `<install-root>\bin`，也支持 `--payload-mode use-existing` 直接使用安装器已放置的 `bin`；配置/token 放在 `<install-root>\etc\`，服务日志放在 `<install-root>\var\log\`，DbgAtlas 受控 WinDbg runtime 放在 `<install-root>\bin\rt\`。SCM 只指向安装目录下的 binary，避免锁住开发构建产物。
+- Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。默认安装根是 `%ProgramFiles%\DbgAtlas`；安装器和提权脚本应复用 service 命令默认行为，只有自定义目录时才显式传入 `--install-root`。`install` 支持复制 payload 到 `<install-root>\bin`，也支持 `--payload-mode use-existing` 直接使用安装器已放置的 `bin`；配置放在 `<install-root>\etc\`，服务日志放在 `<install-root>\var\log\`，DbgAtlas 受控 WinDbg runtime 放在 `<install-root>\bin\rt\`。SCM 只指向安装目录下的 binary，避免锁住开发构建产物。
 - 安装态 service 可通过 `service.update` JSON-RPC/MCP 方法从构建好的 payload 目录异步更新自身；更新由独立 updater 进程完成 stop、rename swap、restart 和 best-effort cleanup。
 - `debug.session.create` 接收 `project_root` 和 target，返回 `session_id`；后续 `debug.eval`、`debug.modules`、`debug.threads`、`debug.stack`、`debug.session.close` 和 `debug.session.kill` 只需要 `session_id`。
 - 外部 service API 表达产品能力；内部 worker protocol 表达低层执行、状态、artifact 写入清单和进程控制。两者分层演进。

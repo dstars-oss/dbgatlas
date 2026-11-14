@@ -76,12 +76,10 @@ pub const WINDOWS_SERVICE_RT_DIR: &str = "rt";
 pub const WINDOWS_SERVICE_VAR_DIR: &str = "var";
 pub const WINDOWS_SERVICE_LOG_DIR: &str = "log";
 pub const WINDOWS_SERVICE_CONFIG_FILE: &str = "runtime.toml";
-pub const WINDOWS_SERVICE_TOKEN_FILE: &str = "token";
 pub const WINDOWS_SERVICE_INSTALL_MARKER_FILE: &str = ".dbgatlas-install-root";
 pub const WINDOWS_SERVICE_LOG_RETENTION_DAYS: i64 = 7;
 pub const WINDOWS_SERVICE_POSTINSTALL_REPORT_FILE: &str = "postinstall-report.txt";
 pub const WINDOWS_SERVICE_POSTINSTALL_SUMMARY_FILE: &str = "postinstall-summary.txt";
-const DBGATLAS_TOKEN_ENV_VAR: &str = "DBGATLAS_TOKEN";
 pub const DEFAULT_SERVICE_UPDATE_TIMEOUT_MS: u64 = 60_000;
 pub const SERVICE_UPDATE_DELAY_MS: u64 = 500;
 pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
@@ -102,58 +100,12 @@ static SERVICE_INSTALL_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
     pub bind: SocketAddr,
-    pub bearer_token: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct InstallTokenSelection {
-    token: String,
-    write_system_env: bool,
-}
-
-fn resolve_install_token<F>(
-    system_env_token: Option<&str>,
-    file_token: Option<&str>,
-    generate_token: F,
-) -> Result<InstallTokenSelection, ServiceError>
-where
-    F: FnOnce() -> Result<String, ServiceError>,
-{
-    if let Some(token) = trimmed_non_empty_token(system_env_token) {
-        return Ok(InstallTokenSelection {
-            token,
-            write_system_env: false,
-        });
-    }
-    if let Some(token) = trimmed_non_empty_token(file_token) {
-        return Ok(InstallTokenSelection {
-            token,
-            write_system_env: true,
-        });
-    }
-
-    let token = generate_token()?;
-    let token = trimmed_non_empty_token(Some(&token)).ok_or(ServiceError::EmptyBearerToken)?;
-    Ok(InstallTokenSelection {
-        token,
-        write_system_env: true,
-    })
-}
-
-fn trimmed_non_empty_token(value: Option<&str>) -> Option<String> {
-    let token = value?.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
 }
 
 impl ServiceConfig {
     pub fn dev_default() -> Self {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_SERVICE_PORT),
-            bearer_token: "dev-token".to_string(),
         }
     }
 }
@@ -259,10 +211,6 @@ impl ServiceShutdown {
 pub enum ServiceError {
     #[error("service bind address must be loopback: {0}")]
     NonLoopbackBind(SocketAddr),
-    #[error("bearer token must not be empty")]
-    EmptyBearerToken,
-    #[error("missing or invalid bearer token")]
-    Unauthorized,
     #[error("origin is not allowed: {0}")]
     InvalidOrigin(String),
     #[error("unsupported http method: {0}")]

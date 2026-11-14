@@ -11,7 +11,6 @@ pub struct ServiceInstallPaths {
     pub var_dir: PathBuf,
     pub log_dir: PathBuf,
     pub config_path: PathBuf,
-    pub token_file: PathBuf,
     pub installed_exe: PathBuf,
 }
 
@@ -68,7 +67,6 @@ impl ServiceInstallPaths {
         Self {
             staging_bin_dir: root_dir.join("bin.staging"),
             config_path: etc_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
-            token_file: etc_dir.join(WINDOWS_SERVICE_TOKEN_FILE),
             installed_exe: bin_dir.join("dbgatlas.exe"),
             windbg_runtime_dir: rt_dir.join("windbg").join(windbg_runtime_arch()),
             bin_dir,
@@ -82,10 +80,6 @@ impl ServiceInstallPaths {
 
     pub fn legacy_config_path(&self) -> PathBuf {
         self.root_dir.join(WINDOWS_SERVICE_CONFIG_FILE)
-    }
-
-    pub fn legacy_token_file(&self) -> PathBuf {
-        self.root_dir.join(WINDOWS_SERVICE_TOKEN_FILE)
     }
 
     pub fn legacy_rt_dir(&self) -> PathBuf {
@@ -168,7 +162,6 @@ pub struct WindowsServiceApplyUpdateOptions {
 pub struct WindowsServiceRunOptions {
     pub install_root: PathBuf,
     pub config_path: PathBuf,
-    pub token_file: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -179,7 +172,6 @@ pub struct WindowsServiceCommandResult {
     pub endpoint: Option<SocketAddr>,
     pub installed_binary: PathBuf,
     pub config_path: PathBuf,
-    pub token_file: PathBuf,
     pub log_dir: PathBuf,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub payload: Vec<ServicePayloadFile>,
@@ -510,15 +502,12 @@ pub fn installed_client_config() -> Result<Option<ServiceConfig>, ServiceError> 
 pub(super) fn installed_client_config_from_paths(
     paths: &ServiceInstallPaths,
 ) -> Result<Option<ServiceConfig>, ServiceError> {
-    if !paths.installed_exe.is_file() || !paths.config_path.is_file() || !paths.token_file.is_file()
-    {
+    if !paths.installed_exe.is_file() || !paths.config_path.is_file() {
         return Ok(None);
     }
     let runtime = RuntimeConfig::load(&paths.config_path)?;
-    let bearer_token = fs::read_to_string(&paths.token_file)?.trim().to_string();
     let config = ServiceConfig {
         bind: runtime.server.bind,
-        bearer_token,
     };
     validate_config(&config)?;
     Ok(Some(config))
@@ -754,7 +743,7 @@ pub(super) fn service_health_doctor_check(paths: &ServiceInstallPaths) -> Doctor
             method: "service.health".to_string(),
             params: Some(json!({})),
         };
-        match invoke_http_json_rpc(config.bind, &config.bearer_token, &request) {
+        match invoke_http_json_rpc(config.bind, &request) {
             Ok(response) if response.error.is_none() => {
                 return doctor_check(
                     "service_health",
@@ -1057,7 +1046,6 @@ pub(super) fn prepare_install_layout(paths: &ServiceInstallPaths) -> Result<(), 
     fs::create_dir_all(&paths.log_dir)?;
     fs::write(paths.install_marker_path(), "DbgAtlas install root\n")?;
     migrate_legacy_install_file(&paths.legacy_config_path(), &paths.config_path)?;
-    migrate_legacy_install_file(&paths.legacy_token_file(), &paths.token_file)?;
     Ok(())
 }
 
@@ -1124,10 +1112,6 @@ pub(super) fn copy_missing_install_state_from_paths(
     copy_missing_install_file(
         &[previous.config_path.clone(), previous.legacy_config_path()],
         &paths.config_path,
-    )?;
-    copy_missing_install_file(
-        &[previous.token_file.clone(), previous.legacy_token_file()],
-        &paths.token_file,
     )?;
     Ok(())
 }
@@ -1255,7 +1239,6 @@ pub(super) fn discover_service_config_payload(
     paths: &ServiceInstallPaths,
 ) -> Result<Option<ServicePayloadFile>, ServiceError> {
     // release payload 可以携带新的 runtime.toml 来调整 bind/proxy/工具策略；
-    // token 是机器本地密钥，只能留在安装态 etc\token，不能由 payload 覆盖。
     let candidates = [
         source_dir.join(WINDOWS_SERVICE_CONFIG_FILE),
         source_dir
@@ -1284,59 +1267,10 @@ pub(super) fn discover_service_config_payload(
 }
 
 pub(super) fn validate_update_runtime_config(path: &Path) -> Result<(), ServiceError> {
-    // 先按 TOML 结构拒绝任何 token 形态，再交给 dbgatlas-runtime 做版本和字段校验。
-    // 这样 updater 即使被传入错误 payload，也不会把 bearer token 写进 runtime.toml。
     let input = fs::read_to_string(path)?;
-    reject_runtime_config_token_keys(&input)?;
     reject_runtime_config_local_debug_tool_keys(&input)?;
     let _runtime = RuntimeConfig::from_toml_str(&input)?;
     Ok(())
-}
-
-pub(super) fn reject_runtime_config_token_keys(input: &str) -> Result<(), ServiceError> {
-    let value = toml::from_str::<toml::Value>(input)
-        .map_err(dbgatlas_runtime::RuntimeConfigError::ParseToml)?;
-    let mut path = Vec::new();
-    reject_runtime_config_token_keys_in_value(&value, &mut path)
-}
-
-pub(super) fn reject_runtime_config_token_keys_in_value(
-    value: &toml::Value,
-    path: &mut Vec<String>,
-) -> Result<(), ServiceError> {
-    match value {
-        toml::Value::Table(table) => {
-            for (key, value) in table {
-                path.push(key.clone());
-                if is_runtime_config_token_key(key) {
-                    return Err(ServiceError::Rpc(format!(
-                        "runtime config payload must not contain token fields: {}",
-                        path.join(".")
-                    )));
-                }
-                reject_runtime_config_token_keys_in_value(value, path)?;
-                path.pop();
-            }
-            Ok(())
-        }
-        toml::Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                path.push(index.to_string());
-                reject_runtime_config_token_keys_in_value(value, path)?;
-                path.pop();
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-pub(super) fn is_runtime_config_token_key(key: &str) -> bool {
-    key.chars()
-        .filter(|ch| *ch != '_' && *ch != '-')
-        .collect::<String>()
-        .to_ascii_lowercase()
-        .contains("token")
 }
 
 pub(super) fn reject_runtime_config_local_debug_tool_keys(input: &str) -> Result<(), ServiceError> {
@@ -1541,7 +1475,6 @@ pub(super) mod windows_service_control {
 pub(super) mod windows_service_control {
     use super::*;
     use std::ffi::OsString;
-    use std::os::windows::ffi::OsStrExt;
     use std::sync::OnceLock;
     use std::time::Instant;
     use windows_service::service::{
@@ -1552,20 +1485,10 @@ pub(super) mod windows_service_control {
         self, ServiceControlHandlerResult, ServiceStatusHandle,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
-    use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ,
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
-    };
 
     windows_service::define_windows_service!(ffi_service_main, service_main);
 
     static RUN_OPTIONS: OnceLock<WindowsServiceRunOptions> = OnceLock::new();
-    const MACHINE_ENVIRONMENT_REGISTRY_KEY: &str =
-        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 
     pub fn install(
         options: WindowsServiceInstallOptions,
@@ -1635,7 +1558,6 @@ pub(super) mod windows_service_control {
         }
         copy_missing_install_state_from_previous_root(&paths)?;
         let runtime = create_runtime_config_if_missing(&paths, options.bind)?;
-        ensure_install_token(&paths.token_file)?;
         if options.payload_mode == WindowsServicePayloadMode::Copy {
             install_payload(&payload, &paths)?;
         }
@@ -1827,8 +1749,20 @@ pub(super) mod windows_service_control {
         let manager = manager(ServiceManagerAccess::CONNECT)?;
         let service = open_required(
             &manager,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::QUERY_CONFIG
+                | ServiceAccess::CHANGE_CONFIG
+                | ServiceAccess::STOP
+                | ServiceAccess::START,
         )?;
+        let previous_config = service.query_config().map_err(map_windows_service_error)?;
+        let mut launch_config = service_info(&paths);
+        launch_config.service_type = previous_config.service_type;
+        launch_config.start_type = previous_config.start_type;
+        launch_config.error_control = previous_config.error_control;
+        launch_config.display_name = previous_config.display_name;
+        launch_config.dependencies = previous_config.dependencies;
+        // account_name/account_password 保持 None，ChangeServiceConfigW 保留原有账户。
         stop_service_with_timeout(&service, remaining_update_timeout(deadline)?)?;
         append_service_log("service stopped for apply-update");
 
@@ -1849,6 +1783,11 @@ pub(super) mod windows_service_control {
             ));
         }
 
+        // payload 与当前版本的启动参数一起更新，不保留已移除的 CLI 参数。
+        service
+            .change_config(&launch_config)
+            .map_err(map_windows_service_error)?;
+        append_service_log("service launch command refreshed after apply-update");
         if options.restart {
             start_service_with_timeout(&service, remaining_update_timeout(deadline)?)?;
             append_service_log("service restarted after apply-update");
@@ -1924,10 +1863,8 @@ pub(super) mod windows_service_control {
         set_status(&status_handle, ServiceState::StartPending)?;
         append_service_log("reported start_pending");
         let runtime = RuntimeConfig::load(&options.config_path)?;
-        let bearer_token = fs::read_to_string(&options.token_file)?.trim().to_string();
         let config = ServiceConfig {
             bind: runtime.server.bind,
-            bearer_token,
         };
         validate_config(&config)?;
         set_status(&status_handle, ServiceState::Running)?;
@@ -1993,8 +1930,6 @@ pub(super) mod windows_service_control {
                 paths.root_dir.clone().into_os_string(),
                 OsString::from("--config"),
                 paths.config_path.clone().into_os_string(),
-                OsString::from("--token-file"),
-                paths.token_file.clone().into_os_string(),
             ],
             dependencies: Vec::new(),
             account_name: None,
@@ -2126,224 +2061,6 @@ pub(super) mod windows_service_control {
             .map_err(map_windows_service_error)
     }
 
-    pub(super) fn ensure_install_token(path: &Path) -> Result<(), ServiceError> {
-        let system_env_token = read_machine_environment_variable(DBGATLAS_TOKEN_ENV_VAR)?;
-        let file_token = read_install_token_file(path)?;
-        let selection = resolve_install_token(
-            system_env_token.as_deref(),
-            file_token.as_deref(),
-            generate_token,
-        )?;
-        if selection.write_system_env {
-            write_machine_environment_variable(DBGATLAS_TOKEN_ENV_VAR, &selection.token)?;
-            broadcast_environment_change();
-        }
-        write_install_token_file(path, &selection.token)
-    }
-
-    pub(super) fn read_install_token_file(path: &Path) -> Result<Option<String>, ServiceError> {
-        if path.exists() {
-            let token = fs::read_to_string(path)?;
-            return Ok(trimmed_non_empty_token(Some(&token)));
-        }
-        Ok(None)
-    }
-
-    pub(super) fn write_install_token_file(path: &Path, token: &str) -> Result<(), ServiceError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, format!("{token}\n"))?;
-        Ok(())
-    }
-
-    pub(super) fn read_machine_environment_variable(
-        name: &str,
-    ) -> Result<Option<String>, ServiceError> {
-        let key = RegistryKey::open_machine_environment(KEY_QUERY_VALUE)?;
-        let name = wide_null(name);
-        let mut value_type = 0u32;
-        let mut byte_len = 0u32;
-        let status = unsafe {
-            RegQueryValueExW(
-                key.raw(),
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                &mut value_type,
-                std::ptr::null_mut(),
-                &mut byte_len,
-            )
-        };
-        if status == ERROR_FILE_NOT_FOUND {
-            return Ok(None);
-        }
-        if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
-            return Err(registry_error(
-                "query machine environment variable size",
-                status,
-            ));
-        }
-        if value_type != REG_SZ && value_type != REG_EXPAND_SZ {
-            return Err(ServiceError::ServiceControl(format!(
-                "machine environment variable {DBGATLAS_TOKEN_ENV_VAR} has unsupported registry type {value_type}"
-            )));
-        }
-
-        let mut bytes = vec![0u8; byte_len as usize];
-        let status = unsafe {
-            RegQueryValueExW(
-                key.raw(),
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                &mut value_type,
-                bytes.as_mut_ptr(),
-                &mut byte_len,
-            )
-        };
-        if status == ERROR_FILE_NOT_FOUND {
-            return Ok(None);
-        }
-        if status != ERROR_SUCCESS {
-            return Err(registry_error("query machine environment variable", status));
-        }
-        bytes.truncate(byte_len as usize);
-        utf16_registry_string(&bytes).map(Some)
-    }
-
-    pub(super) fn write_machine_environment_variable(
-        name: &str,
-        value: &str,
-    ) -> Result<(), ServiceError> {
-        let key = RegistryKey::open_machine_environment(KEY_SET_VALUE)?;
-        let name = wide_null(name);
-        let value = wide_null(value);
-        let byte_len = value
-            .len()
-            .checked_mul(std::mem::size_of::<u16>())
-            .and_then(|len| u32::try_from(len).ok())
-            .ok_or_else(|| {
-                ServiceError::ServiceControl(
-                    "machine environment variable value is too large".to_string(),
-                )
-            })?;
-        let status = unsafe {
-            RegSetValueExW(
-                key.raw(),
-                name.as_ptr(),
-                0,
-                REG_SZ,
-                value.as_ptr().cast::<u8>(),
-                byte_len,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(registry_error("write machine environment variable", status));
-        }
-        Ok(())
-    }
-
-    struct RegistryKey(HKEY);
-
-    impl RegistryKey {
-        fn open_machine_environment(access: u32) -> Result<Self, ServiceError> {
-            let subkey = wide_null(MACHINE_ENVIRONMENT_REGISTRY_KEY);
-            let mut key = std::ptr::null_mut();
-            let status =
-                unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, access, &mut key) };
-            if status != ERROR_SUCCESS {
-                return Err(registry_error(
-                    "open machine environment registry key",
-                    status,
-                ));
-            }
-            Ok(Self(key))
-        }
-
-        fn raw(&self) -> HKEY {
-            self.0
-        }
-    }
-
-    impl Drop for RegistryKey {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    RegCloseKey(self.0);
-                }
-            }
-        }
-    }
-
-    pub(super) fn utf16_registry_string(bytes: &[u8]) -> Result<String, ServiceError> {
-        let mut chunks = bytes.chunks_exact(2);
-        let mut units = chunks
-            .by_ref()
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        if !chunks.remainder().is_empty() {
-            return Err(ServiceError::ServiceControl(
-                "machine environment variable contains invalid UTF-16 bytes".to_string(),
-            ));
-        }
-        while units.last() == Some(&0) {
-            units.pop();
-        }
-        String::from_utf16(&units).map_err(|error| {
-            ServiceError::ServiceControl(format!(
-                "machine environment variable contains invalid UTF-16: {error}"
-            ))
-        })
-    }
-
-    pub(super) fn wide_null(value: &str) -> Vec<u16> {
-        OsStr::new(value)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    pub(super) fn broadcast_environment_change() {
-        let environment = wide_null("Environment");
-        let mut result = 0usize;
-        unsafe {
-            SendMessageTimeoutW(
-                HWND_BROADCAST,
-                WM_SETTINGCHANGE,
-                0,
-                environment.as_ptr() as isize,
-                SMTO_ABORTIFHUNG,
-                5000,
-                &mut result,
-            );
-        }
-    }
-
-    pub(super) fn registry_error(operation: &str, status: u32) -> ServiceError {
-        ServiceError::ServiceControl(format!("{operation} failed with Win32 status {status}"))
-    }
-
-    pub(super) fn generate_token() -> Result<String, ServiceError> {
-        use windows_sys::Win32::Security::Cryptography::{
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
-        };
-
-        let mut bytes = [0u8; 32];
-        let status = unsafe {
-            BCryptGenRandom(
-                std::ptr::null_mut(),
-                bytes.as_mut_ptr(),
-                bytes.len() as u32,
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-            )
-        };
-        if status != 0 {
-            return Err(ServiceError::ServiceControl(format!(
-                "BCryptGenRandom failed with status {status}"
-            )));
-        }
-        Ok(hex_encode(&bytes))
-    }
-
     pub(super) fn installed_endpoint(
         paths: &ServiceInstallPaths,
     ) -> Result<Option<SocketAddr>, ServiceError> {
@@ -2363,7 +2080,6 @@ pub(super) mod windows_service_control {
             endpoint,
             installed_binary: paths.installed_exe,
             config_path: paths.config_path,
-            token_file: paths.token_file,
             log_dir: paths.log_dir,
             payload,
         }
@@ -2379,16 +2095,6 @@ pub(super) mod windows_service_control {
             ServiceState::PausePending => "pause_pending",
             ServiceState::Paused => "paused",
         }
-    }
-
-    pub(super) fn hex_encode(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut output = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            output.push(HEX[(byte >> 4) as usize] as char);
-            output.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        output
     }
 
     pub(super) fn is_service_not_found(error: &windows_service::Error) -> bool {

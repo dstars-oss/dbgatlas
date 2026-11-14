@@ -97,28 +97,20 @@ enum ServiceCommand {
     Run {
         #[arg(long, default_value = "127.0.0.1:7331")]
         bind: SocketAddr,
-        #[arg(long, default_value = "dev-token")]
-        token: String,
         #[arg(long, hide = true)]
         windows_service: bool,
         #[arg(long, hide = true)]
         install_root: Option<PathBuf>,
         #[arg(long, hide = true)]
         config: Option<PathBuf>,
-        #[arg(long, hide = true)]
-        token_file: Option<PathBuf>,
     },
     Health {
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Info {
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Install {
         #[arg(long)]
@@ -205,29 +197,21 @@ enum DebugCommand {
         command: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Modules {
         session_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Threads {
         session_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Stack {
         session_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     ReadMemory {
         session_id: String,
@@ -237,8 +221,6 @@ enum DebugCommand {
         length: u64,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     AddSymbols {
         session_id: String,
@@ -247,8 +229,6 @@ enum DebugCommand {
         reload: bool,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
 }
 
@@ -263,22 +243,16 @@ enum DebugSessionCommand {
         attach: Option<u32>,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Close {
         session_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Kill {
         session_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
 }
 
@@ -301,8 +275,6 @@ enum RecordingCommand {
         args: Vec<String>,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Ttd {
         #[arg(long)]
@@ -341,36 +313,26 @@ enum RecordingCommand {
         args: Vec<String>,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Status {
         recording_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Stop {
         recording_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Cancel {
         recording_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
     Kill {
         recording_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
-        #[arg(long)]
-        token: Option<String>,
     },
 }
 
@@ -508,18 +470,13 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
     match command {
         ServiceCommand::Run {
             bind,
-            token,
             windows_service,
             install_root,
             config,
-            token_file,
         } => {
             if windows_service {
                 let config_path = config.ok_or_else(|| {
                     anyhow::anyhow!("--config is required with --windows-service")
-                })?;
-                let token_file = token_file.ok_or_else(|| {
-                    anyhow::anyhow!("--token-file is required with --windows-service")
                 })?;
                 let install_root = install_root
                     .or_else(|| install_root_from_config_path(&config_path))
@@ -531,13 +488,9 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
                 return Ok(run_windows_service_dispatcher(WindowsServiceRunOptions {
                     install_root,
                     config_path,
-                    token_file,
                 })?);
             }
-            let config = ServiceConfig {
-                bind,
-                bearer_token: token,
-            };
+            let config = ServiceConfig { bind };
             if !as_json {
                 println!(
                     "DbgAtlas service RPC listening on http://{}/rpc",
@@ -547,12 +500,12 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
             }
             run_http_service(config, ServiceHost::with_process_workers()?)?;
         }
-        ServiceCommand::Health { endpoint, token } => {
-            let response = call_service(endpoint, token, "service.health", json!({}))?;
+        ServiceCommand::Health { endpoint } => {
+            let response = call_service(endpoint, "service.health", json!({}))?;
             print_rpc_response(response, as_json)?;
         }
-        ServiceCommand::Info { endpoint, token } => {
-            let response = call_service(endpoint, token, "service.info", json!({}))?;
+        ServiceCommand::Info { endpoint } => {
+            let response = call_service(endpoint, "service.info", json!({}))?;
             print_rpc_response(response, as_json)?;
         }
         ServiceCommand::Install {
@@ -650,11 +603,9 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
             session_id,
             command,
             endpoint,
-            token,
         } => {
             let response = call_service(
                 endpoint,
-                token,
                 "debug.eval",
                 json!({
                     "session_id": { "id": session_id },
@@ -666,28 +617,23 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
         DebugCommand::Modules {
             session_id,
             endpoint,
-            token,
-        } => call_session_tool(endpoint, token, "debug.modules", session_id, as_json),
+        } => call_session_tool(endpoint, "debug.modules", session_id, as_json),
         DebugCommand::Threads {
             session_id,
             endpoint,
-            token,
-        } => call_session_tool(endpoint, token, "debug.threads", session_id, as_json),
+        } => call_session_tool(endpoint, "debug.threads", session_id, as_json),
         DebugCommand::Stack {
             session_id,
             endpoint,
-            token,
-        } => call_session_tool(endpoint, token, "debug.stack", session_id, as_json),
+        } => call_session_tool(endpoint, "debug.stack", session_id, as_json),
         DebugCommand::ReadMemory {
             session_id,
             address,
             length,
             endpoint,
-            token,
         } => {
             let response = call_service(
                 endpoint,
-                token,
                 "debug.read_memory",
                 json!({
                     "session_id": { "id": session_id },
@@ -702,11 +648,9 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
             symbol_path,
             reload,
             endpoint,
-            token,
         } => {
             let response = call_service(
                 endpoint,
-                token,
                 "debug.add_symbols",
                 json!({
                     "session_id": { "id": session_id },
@@ -726,7 +670,6 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
             file,
             attach,
             endpoint,
-            token,
         } => {
             let project_root = absolute_path(project_root)?;
             let target = match (file, attach) {
@@ -738,7 +681,6 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
             };
             let response = call_service(
                 endpoint,
-                token,
                 "debug.session.create",
                 json!({
                     "project_root": project_root,
@@ -750,13 +692,11 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
         DebugSessionCommand::Close {
             session_id,
             endpoint,
-            token,
-        } => call_session_tool(endpoint, token, "debug.session.close", session_id, as_json),
+        } => call_session_tool(endpoint, "debug.session.close", session_id, as_json),
         DebugSessionCommand::Kill {
             session_id,
             endpoint,
-            token,
-        } => call_session_tool(endpoint, token, "debug.session.kill", session_id, as_json),
+        } => call_session_tool(endpoint, "debug.session.kill", session_id, as_json),
     }
 }
 
@@ -771,7 +711,6 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
             cpu_max_trace_size_mb,
             args,
             endpoint,
-            token,
         } => {
             let project_root = absolute_path(project_root)?;
             let target = match (launch, attach) {
@@ -805,7 +744,7 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
                     "max_trace_size_mb": cpu_max_trace_size_mb.unwrap_or(DEFAULT_CPU_TRACE_SIZE_MB),
                 });
             }
-            let response = call_service(endpoint, token, "recording.start", params)?;
+            let response = call_service(endpoint, "recording.start", params)?;
             print_rpc_response(response, as_json)
         }
         RecordingCommand::Ttd {
@@ -827,7 +766,6 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
             show_ui,
             args,
             endpoint,
-            token,
         } => {
             let project_root = absolute_path(project_root)?;
             let target = match (launch, attach, monitor) {
@@ -871,7 +809,6 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
             };
             let response = call_service(
                 endpoint,
-                token,
                 "recording.ttd",
                 json!({
                     "project_root": project_root,
@@ -886,36 +823,30 @@ fn run_recording(command: RecordingCommand, as_json: bool) -> Result<()> {
         RecordingCommand::Status {
             recording_id,
             endpoint,
-            token,
-        } => call_recording_tool(endpoint, token, "recording.status", recording_id, as_json),
+        } => call_recording_tool(endpoint, "recording.status", recording_id, as_json),
         RecordingCommand::Stop {
             recording_id,
             endpoint,
-            token,
-        } => call_recording_tool(endpoint, token, "recording.stop", recording_id, as_json),
+        } => call_recording_tool(endpoint, "recording.stop", recording_id, as_json),
         RecordingCommand::Cancel {
             recording_id,
             endpoint,
-            token,
-        } => call_recording_tool(endpoint, token, "recording.cancel", recording_id, as_json),
+        } => call_recording_tool(endpoint, "recording.cancel", recording_id, as_json),
         RecordingCommand::Kill {
             recording_id,
             endpoint,
-            token,
-        } => call_recording_tool(endpoint, token, "recording.kill", recording_id, as_json),
+        } => call_recording_tool(endpoint, "recording.kill", recording_id, as_json),
     }
 }
 
 fn call_session_tool(
     endpoint: Option<SocketAddr>,
-    token: Option<String>,
     method: &str,
     session_id: String,
     as_json: bool,
 ) -> Result<()> {
     let response = call_service(
         endpoint,
-        token,
         method,
         json!({
             "session_id": { "id": session_id },
@@ -926,14 +857,12 @@ fn call_session_tool(
 
 fn call_recording_tool(
     endpoint: Option<SocketAddr>,
-    token: Option<String>,
     method: &str,
     recording_id: String,
     as_json: bool,
 ) -> Result<()> {
     let response = call_service(
         endpoint,
-        token,
         method,
         json!({
             "recording_id": { "id": recording_id },
@@ -944,22 +873,17 @@ fn call_recording_tool(
 
 fn call_service(
     endpoint: Option<SocketAddr>,
-    token: Option<String>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<dbgatlas_service::JsonRpcResponse> {
-    let connection = resolve_client_connection(endpoint, token)?;
+    let connection = resolve_client_connection(endpoint)?;
     let request = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(json!(1)),
         method: method.to_string(),
         params: Some(params),
     };
-    Ok(invoke_http_json_rpc(
-        connection.endpoint,
-        &connection.token,
-        &request,
-    )?)
+    Ok(invoke_http_json_rpc(connection.endpoint, &request)?)
 }
 
 fn print_rpc_response(response: dbgatlas_service::JsonRpcResponse, as_json: bool) -> Result<()> {
@@ -976,30 +900,16 @@ fn print_rpc_response(response: dbgatlas_service::JsonRpcResponse, as_json: bool
 
 struct ClientConnection {
     endpoint: SocketAddr,
-    token: String,
 }
 
-fn resolve_client_connection(
-    endpoint: Option<SocketAddr>,
-    token: Option<String>,
-) -> Result<ClientConnection> {
-    if let (Some(endpoint), Some(token)) = (endpoint.as_ref(), token.as_ref()) {
-        return Ok(ClientConnection {
-            endpoint: *endpoint,
-            token: token.clone(),
-        });
+fn resolve_client_connection(endpoint: Option<SocketAddr>) -> Result<ClientConnection> {
+    if let Some(endpoint) = endpoint {
+        return Ok(ClientConnection { endpoint });
     }
-    // 默认连接顺序：显式参数 > 安装态 etc/runtime.toml + etc/token > 开发态 dev default。
-    // token 只进入 Authorization header，不在普通 CLI 输出中打印。
-    let installed = installed_client_config()?;
-    let dev = ServiceConfig::dev_default();
+    // 默认连接顺序：显式参数 > 安装态 etc/runtime.toml > 开发态默认值。
+    let config = installed_client_config()?.unwrap_or_else(ServiceConfig::dev_default);
     Ok(ClientConnection {
-        endpoint: endpoint
-            .or_else(|| installed.as_ref().map(|config| config.bind))
-            .unwrap_or(dev.bind),
-        token: token
-            .or_else(|| installed.map(|config| config.bearer_token))
-            .unwrap_or(dev.bearer_token),
+        endpoint: config.bind,
     })
 }
 
@@ -1060,7 +970,6 @@ fn print_service_command_result(
     }
     println!("binary: {}", result.installed_binary.display());
     println!("config: {}", result.config_path.display());
-    println!("token file: {}", result.token_file.display());
     println!("log dir: {}", result.log_dir.display());
     Ok(())
 }

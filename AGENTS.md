@@ -124,6 +124,6 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 
 `dbgatlas service` 是当前安装态和开发态的主入口。它在同一个 loopback HTTP listener 上暴露两个 endpoint：`/rpc` 是 DbgAtlas 自有 JSON-RPC API，`/mcp` 是 Codex 等 MCP 客户端使用的 HTTP MCP endpoint。项目不再维护独立的 stdio MCP server 或 `dbgatlas-mcp` crate。
 
-`/rpc` 和 `/mcp` 共享 bearer token、loopback bind 限制和浏览器类客户端的 `Origin` 校验。Codex 项目配置可放在本地 `.codex/config.toml`，但 `.codex/` 应保持 ignored，不提交；token 通过 `DBGATLAS_TOKEN` 等本机环境变量传入，不写进仓库。
+`/rpc` 和 `/mcp` 不使用认证，信任本机调用者；二者共享 loopback bind 限制和浏览器类客户端的 `Origin` 校验。这些限制不提供本机用户或进程隔离。Codex 项目配置可放在本地 `.codex/config.toml`，但 `.codex/` 应保持 ignored，不提交。
 
 上述约定描述当前入口。未来远端后端通信在对应迭代单独设计，不通过直接放宽现有 listener 的 loopback 限制来替代远程连接设计。

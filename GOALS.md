@@ -100,6 +100,15 @@
 - 将现有录制/回放接入统一操作历史，录制产物可作为后续目标，保留来源及采集范围、失败和缺失信息。
 - 验收：内核暂停时仍可通过调试通道控制目标，不依赖客体普通 Agent 响应；完成录制到回放再到历史检索的链路。具体平台和采集方式在本轮开始前选定。
 
+## 本机 HTTP 入口简化（2026-11-14）
+
+- `/rpc` 和 `/mcp` 完整移除 bearer token 认证；删除 CLI 参数、安装态 token 文件依赖、环境变量写入及认证专属代码，不提供兼容开关或参数别名。
+- 保留 loopback bind 与浏览器 `Origin` 校验，明确服务信任本机调用者，不提供本机用户隔离。Windows worker 身份切换及管道 ACL 保持不变。
+- 更新器同步写入当前版本的 SCM 启动命令，保留已有服务账户、启动类型、服务类型、错误控制、显示名和依赖。
+- service/CLI 相关测试 131 项通过；独立只读审查及修正后复查通过；MSVC release 四文件 payload 构建通过。通过 MCP `service.update` 更新并重启，`service.health` 正常，安装文件与 release 哈希一致。
+- 安装态无 Authorization 的 RPC health、MCP initialize/tools/list 通过，两个 endpoint 的外部 Origin 均返回 403；MCP 调试 launch → 原生命令 → close 通过。详细证据及未覆盖项见 [HTTP 认证移除验证记录](docs/http-auth-removal-validation.md)。
+- 本项不改变迭代 2 的待开始状态。
+
 ## 后续独立方向
 
 - 虚拟化管理分两步：先做 VM 发现与启停，再做快照恢复以及旧会话、操作和观察的失效处理。

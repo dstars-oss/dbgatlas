@@ -33,7 +33,7 @@ Service initialization is delegated to:
 dbgatlas.exe service install --payload-mode use-existing --install-root [INSTALLROOT]
 ```
 
-The Rust service installer owns `etc\runtime.toml`, `etc\token`, `var\log`, and
+The Rust service installer owns `etc\runtime.toml`, `var\log`, and
 `bin\rt`. The MSI owns the files it places directly under `bin`.
 
 After service startup, the MSI runs:

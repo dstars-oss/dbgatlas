@@ -109,12 +109,11 @@ service `0.3` 的 RPC 和 MCP 使用三个产品级入口，参数统一为 proj
 
 `workspace.facts` 已在 `0.2` 移除且没有兼容 alias。原先读取聚合结果的调用方应按需调用上述三个方法；service 始终在内部解析 `<project_root>/dbgatlas`，不再接受 analysis workspace 或 `artifacts/` 的内部路径。
 
-Codex 通过 service-hosted HTTP MCP endpoint 接入，token 从本地环境读取：
+Codex 通过 service-hosted HTTP MCP endpoint 接入，无需配置认证凭据：
 
 ```toml
 [mcp_servers.dbgatlas]
 url = "http://127.0.0.1:7331/mcp"
-bearer_token_env_var = "DBGATLAS_TOKEN"
 enabled = true
 startup_timeout_sec = 10
 tool_timeout_sec = 120

@@ -15,10 +15,7 @@ fn cli_json_debug_workflow_returns_recording_refs() {
     let server_shutdown = shutdown.clone();
     let server = thread::spawn(move || {
         run_http_service_until(
-            ServiceConfig {
-                bind: endpoint,
-                bearer_token: "test-token".to_string(),
-            },
+            ServiceConfig { bind: endpoint },
             ServiceHost::with_mock_workers(),
             server_shutdown,
         )
@@ -36,8 +33,6 @@ fn cli_json_debug_workflow_returns_recording_refs() {
         dump_path.to_str().unwrap(),
         "--endpoint",
         &endpoint.to_string(),
-        "--token",
-        "test-token",
     ]);
     let session_id = create["result"]["session_id"]["id"].as_str().unwrap();
 
@@ -49,8 +44,6 @@ fn cli_json_debug_workflow_returns_recording_refs() {
         ".echo from-cli",
         "--endpoint",
         &endpoint.to_string(),
-        "--token",
-        "test-token",
     ]);
 
     assert_eq!(eval["result"]["operation_status"], "success");
@@ -69,10 +62,7 @@ fn cli_json_recording_workflow_controls_attach_recordings() {
     let server_shutdown = shutdown.clone();
     let server = thread::spawn(move || {
         run_http_service_until(
-            ServiceConfig {
-                bind: endpoint,
-                bearer_token: "test-token".to_string(),
-            },
+            ServiceConfig { bind: endpoint },
             ServiceHost::with_mock_workers(),
             server_shutdown,
         )
@@ -93,8 +83,6 @@ fn cli_json_recording_workflow_controls_attach_recordings() {
         &pid,
         "--endpoint",
         &endpoint_text,
-        "--token",
-        "test-token",
     ]);
     let recording_id = start["result"]["recording_id"]["id"].as_str().unwrap();
     assert_eq!(start["result"]["state"], "running");
@@ -106,8 +94,6 @@ fn cli_json_recording_workflow_controls_attach_recordings() {
         recording_id,
         "--endpoint",
         &endpoint_text,
-        "--token",
-        "test-token",
     ]);
     assert_eq!(status["result"]["state"], "running");
 
@@ -118,8 +104,6 @@ fn cli_json_recording_workflow_controls_attach_recordings() {
         recording_id,
         "--endpoint",
         &endpoint_text,
-        "--token",
-        "test-token",
     ]);
     assert_eq!(stop["result"]["state"], "stopped");
     assert_eq!(stop["result"]["operation_status"], "success");
@@ -133,8 +117,6 @@ fn cli_json_recording_workflow_controls_attach_recordings() {
         cancel_id,
         "--endpoint",
         &endpoint_text,
-        "--token",
-        "test-token",
     ]);
     assert_eq!(canceled["result"]["operation_status"], "canceled");
 
@@ -147,8 +129,6 @@ fn cli_json_recording_workflow_controls_attach_recordings() {
         kill_id,
         "--endpoint",
         &endpoint_text,
-        "--token",
-        "test-token",
     ]);
     assert_eq!(killed["result"]["state"], "killed");
     assert_eq!(killed["result"]["operation_status"], "failed");
@@ -307,8 +287,6 @@ fn start_recording_for_cli(project_root: &str, pid: &str, endpoint: &str) -> Val
         pid,
         "--endpoint",
         endpoint,
-        "--token",
-        "test-token",
     ])
 }
 
@@ -330,4 +308,17 @@ fn wait_for_service(endpoint: SocketAddr) {
         "service did not start at {}",
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), endpoint.port())
     );
+}
+
+#[test]
+fn cli_rejects_removed_authentication_arguments() {
+    for args in [
+        vec!["service", "run", "--token", "unused"],
+        vec!["service", "run", "--token-file", "unused"],
+        vec!["service", "health", "--token", "unused"],
+    ] {
+        let output = run_dbgatlas_output(&args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+    }
 }

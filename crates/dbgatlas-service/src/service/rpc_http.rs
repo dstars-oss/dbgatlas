@@ -338,7 +338,7 @@ pub(super) fn append_operation_diagnostic_log(
     raw_output: Option<&ArtifactRef>,
     error: Option<&str>,
 ) {
-    // 这里故意只记录 refs 和摘要级错误，不记录命令正文、token 或完整参数。
+    // 这里故意只记录 refs 和摘要级错误，不记录命令正文或完整参数。
     // 需要复现时再通过 workspace JSONL 和 artifact refs 进入事实层。
     append_service_diagnostic_log(&format!(
         "operation_recorded capability={} session_id={} operation_id={} status={} artifact_count={} raw_output_ref={} error={}",
@@ -622,13 +622,12 @@ pub fn run_http_service_until(
             );
             continue;
         }
-        let config = config.clone();
         let host = host.clone();
         shutdown.handler_started();
         let handler_shutdown = shutdown.clone();
         std::thread::spawn(move || {
             let _handler_guard = HttpHandlerGuard(handler_shutdown);
-            let response_result = handle_http_stream(&mut stream, &config, &host, Some(peer_addr));
+            let response_result = handle_http_stream(&mut stream, &host, Some(peer_addr));
             let (response, write_stage) = match response_result {
                 Ok(response) => (response, "write_response"),
                 Err(error) => match http_json_response(
@@ -687,16 +686,14 @@ impl Drop for HttpHandlerGuard {
 
 pub fn invoke_http_json_rpc(
     endpoint: SocketAddr,
-    bearer_token: &str,
     request: &JsonRpcRequest,
 ) -> Result<JsonRpcResponse, ServiceError> {
     let body = serde_json::to_string(request)?;
     let mut stream = TcpStream::connect(endpoint)?;
     write!(
         stream,
-        "POST /rpc HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         endpoint,
-        bearer_token,
         body.len(),
         body
     )?;
@@ -710,7 +707,6 @@ pub fn invoke_http_json_rpc(
 
 pub(super) fn handle_http_stream(
     stream: &mut TcpStream,
-    config: &ServiceConfig,
     host: &ServiceHost,
     peer_addr: Option<SocketAddr>,
 ) -> Result<String, ServiceError> {
@@ -734,8 +730,8 @@ pub(super) fn handle_http_stream(
         path: Some(request.path.clone()),
         ..Default::default()
     };
-    if let Err(error) = authorize_http_request(&request, config) {
-        append_http_diagnostic_log("authorize", &context, &error.to_string());
+    if let Err(error) = validate_http_request(&request) {
+        append_http_diagnostic_log("validate_request", &context, &error.to_string());
         return Err(error);
     }
     if request.method != "POST" {
@@ -854,10 +850,7 @@ pub(super) fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, S
     })
 }
 
-pub(super) fn authorize_http_request(
-    request: &HttpRequest,
-    config: &ServiceConfig,
-) -> Result<(), ServiceError> {
+pub(super) fn validate_http_request(request: &HttpRequest) -> Result<(), ServiceError> {
     if !matches!(request.path.as_str(), "/rpc" | "/mcp") {
         return Err(ServiceError::InvalidHttpRequest(format!(
             "unsupported path `{}`",
@@ -869,24 +862,7 @@ pub(super) fn authorize_http_request(
             return Err(ServiceError::InvalidOrigin(origin.clone()));
         }
     }
-    match request.headers.get("authorization") {
-        Some(actual) if bearer_token_matches(actual, &config.bearer_token) => Ok(()),
-        _ => Err(ServiceError::Unauthorized),
-    }
-}
-
-pub(super) fn bearer_token_matches(actual: &str, expected_token: &str) -> bool {
-    let mut parts = actual.split_ascii_whitespace();
-    let Some(scheme) = parts.next() else {
-        return false;
-    };
-    let Some(token) = parts.next() else {
-        return false;
-    };
-    if parts.next().is_some() {
-        return false;
-    }
-    scheme.eq_ignore_ascii_case("Bearer") && token == expected_token
+    Ok(())
 }
 
 pub(super) fn http_json_response(
@@ -896,7 +872,6 @@ pub(super) fn http_json_response(
     let body = serde_json::to_string(value)?;
     let reason = match status {
         200 => "OK",
-        401 => "Unauthorized",
         403 => "Forbidden",
         405 => "Method Not Allowed",
         _ => "Bad Request",

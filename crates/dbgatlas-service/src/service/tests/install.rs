@@ -68,10 +68,6 @@ fn service_paths_are_rooted_under_dbgatlas_install_dir() {
         paths.config_path,
         PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\etc\runtime.toml")
     );
-    assert_eq!(
-        paths.token_file,
-        PathBuf::from(r"C:\Users\dstars\AppData\Local\Programs\dbgatlas\etc\token")
-    );
 }
 
 #[test]
@@ -94,7 +90,7 @@ fn service_paths_can_be_inferred_from_installed_executable() {
 #[test]
 fn service_paths_can_be_inferred_from_quoted_scm_command_line_with_install_root() {
     let command_line = PathBuf::from(
-        r#""C:\Users\d stars\AppData\Local\Programs\dbgatlas\bin\dbgatlas.exe" service run --windows-service --install-root "C:\Users\d stars\AppData\Local\Programs\dbgatlas" --config "C:\ignored\etc\runtime.toml" --token-file "C:\ignored\etc\token""#,
+        r#""C:\Users\d stars\AppData\Local\Programs\dbgatlas\bin\dbgatlas.exe" service run --windows-service --install-root "C:\Users\d stars\AppData\Local\Programs\dbgatlas" --config "C:\ignored\etc\runtime.toml""#,
     );
 
     let paths = service_paths_from_scm_binary_path(&command_line).unwrap();
@@ -112,7 +108,7 @@ fn service_paths_can_be_inferred_from_quoted_scm_command_line_with_install_root(
 #[test]
 fn service_paths_can_be_inferred_from_legacy_scm_config_argument() {
     let command_line = PathBuf::from(
-        r#""C:\ProgramData\DbgAtlas\bin\dbgatlas.exe" service run --windows-service --config "C:\ProgramData\DbgAtlas\etc\runtime.toml" --token-file "C:\ProgramData\DbgAtlas\etc\token""#,
+        r#""C:\ProgramData\DbgAtlas\bin\dbgatlas.exe" service run --windows-service --config "C:\ProgramData\DbgAtlas\etc\runtime.toml""#,
     );
 
     let paths = service_paths_from_scm_binary_path(&command_line).unwrap();
@@ -373,7 +369,7 @@ fn service_update_accepted_response_maps_payload() {
 }
 
 #[test]
-fn service_update_can_replace_runtime_config_but_not_token() {
+fn service_update_can_replace_runtime_config() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("payload");
     let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
@@ -387,13 +383,11 @@ fn service_update_can_replace_runtime_config_but_not_token() {
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
     )
     .unwrap();
-    fs::write(source.join(WINDOWS_SERVICE_TOKEN_FILE), "payload-token\n").unwrap();
     fs::write(
         &paths.config_path,
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7331\"\n",
     )
     .unwrap();
-    fs::write(&paths.token_file, "installed-token\n").unwrap();
 
     let prepared = prepare_service_update(&source, &paths, false).unwrap();
     let config_payload = prepared
@@ -409,13 +403,6 @@ fn service_update_can_replace_runtime_config_but_not_token() {
             .iter()
             .any(|file| file.destination == paths.config_path)
     );
-    assert!(
-        !prepared
-            .response
-            .payload
-            .iter()
-            .any(|file| file.destination == paths.token_file)
-    );
 
     let staging = temp.path().join("config-staging");
     let staged_payload = copy_update_config_to_staging(config_payload, &staging, &paths).unwrap();
@@ -428,31 +415,6 @@ fn service_update_can_replace_runtime_config_but_not_token() {
             .unwrap()
             .contains("127.0.0.1:7444")
     );
-    assert_eq!(
-        fs::read_to_string(&paths.token_file).unwrap(),
-        "installed-token\n"
-    );
-}
-
-#[test]
-fn service_update_rejects_token_fields_in_runtime_config() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("payload");
-    let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
-    fs::create_dir_all(&source).unwrap();
-    for file_name in WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES {
-        fs::write(source.join(file_name), file_name).unwrap();
-    }
-    fs::write(
-        source.join(WINDOWS_SERVICE_CONFIG_FILE),
-        "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\ntoken = \"secret\"\n",
-    )
-    .unwrap();
-
-    let error = prepare_service_update(&source, &paths, false).unwrap_err();
-
-    assert!(error.to_string().contains("must not contain token fields"));
-    assert!(error.to_string().contains("server.token"));
 }
 
 #[test]
@@ -514,7 +476,7 @@ fn detects_installing_from_installed_bin_directory() {
 }
 
 #[test]
-fn installed_client_config_reads_runtime_config_and_token() {
+fn installed_client_config_reads_runtime_config_without_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
     fs::create_dir_all(&paths.bin_dir).unwrap();
@@ -525,85 +487,10 @@ fn installed_client_config_reads_runtime_config_and_token() {
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
     )
     .unwrap();
-    fs::write(&paths.token_file, "installed-token\n").unwrap();
 
     let config = installed_client_config_from_paths(&paths).unwrap().unwrap();
 
     assert_eq!(config.bind, "127.0.0.1:7444".parse().unwrap());
-    assert_eq!(config.bearer_token, "installed-token");
-}
-
-#[test]
-fn install_token_prefers_system_environment_token() {
-    let generated = std::cell::Cell::new(false);
-
-    let selection = resolve_install_token(Some(" system-token \n"), Some("file-token"), || {
-        generated.set(true);
-        Ok("generated-token".to_string())
-    })
-    .unwrap();
-
-    assert_eq!(
-        selection,
-        InstallTokenSelection {
-            token: "system-token".to_string(),
-            write_system_env: false,
-        }
-    );
-    assert!(!generated.get());
-}
-
-#[test]
-fn install_token_reuses_file_token_when_system_environment_is_missing() {
-    let generated = std::cell::Cell::new(false);
-
-    let selection = resolve_install_token(None, Some(" file-token \n"), || {
-        generated.set(true);
-        Ok("generated-token".to_string())
-    })
-    .unwrap();
-
-    assert_eq!(
-        selection,
-        InstallTokenSelection {
-            token: "file-token".to_string(),
-            write_system_env: true,
-        }
-    );
-    assert!(!generated.get());
-}
-
-#[test]
-fn install_token_generates_token_when_system_environment_and_file_are_missing() {
-    let selection =
-        resolve_install_token(None, None, || Ok("generated-token".to_string())).unwrap();
-
-    assert_eq!(
-        selection,
-        InstallTokenSelection {
-            token: "generated-token".to_string(),
-            write_system_env: true,
-        }
-    );
-}
-
-#[test]
-fn install_token_treats_blank_values_as_missing() {
-    let selection =
-        resolve_install_token(
-            Some(" \n"),
-            Some("\t"),
-            || Ok("generated-token".to_string()),
-        )
-        .unwrap();
-
-    assert_eq!(
-        selection,
-        InstallTokenSelection {
-            token: "generated-token".to_string(),
-            write_system_env: true,
-        }
-    );
 }
 
 #[test]
@@ -632,7 +519,6 @@ fn installed_client_config_ignores_stale_config_without_installed_binary() {
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
     )
     .unwrap();
-    fs::write(&paths.token_file, "installed-token\n").unwrap();
 
     assert!(
         installed_client_config_from_paths(&paths)
@@ -658,7 +544,7 @@ fn runtime_config_creation_rejects_non_loopback_bind() {
 }
 
 #[test]
-fn install_layout_migrates_legacy_config_and_token() {
+fn install_layout_migrates_legacy_config() {
     let temp = tempfile::tempdir().unwrap();
     let paths = ServiceInstallPaths::for_root(temp.path().join("DbgAtlas"));
     fs::create_dir_all(&paths.root_dir).unwrap();
@@ -667,7 +553,6 @@ fn install_layout_migrates_legacy_config_and_token() {
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n",
     )
     .unwrap();
-    fs::write(paths.legacy_token_file(), "legacy-token\n").unwrap();
 
     prepare_install_layout(&paths).unwrap();
 
@@ -678,16 +563,11 @@ fn install_layout_migrates_legacy_config_and_token() {
         fs::read_to_string(&paths.config_path).unwrap(),
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7444\"\n"
     );
-    assert_eq!(
-        fs::read_to_string(&paths.token_file).unwrap(),
-        "legacy-token\n"
-    );
     assert!(!paths.legacy_config_path().exists());
-    assert!(!paths.legacy_token_file().exists());
 }
 
 #[test]
-fn install_state_copy_preserves_previous_token_when_new_etc_is_missing() {
+fn install_state_copy_preserves_previous_config_when_new_etc_is_missing() {
     let temp = tempfile::tempdir().unwrap();
     let previous = ServiceInstallPaths::for_root(temp.path().join("old"));
     let paths = ServiceInstallPaths::for_root(temp.path().join("new"));
@@ -698,17 +578,12 @@ fn install_state_copy_preserves_previous_token_when_new_etc_is_missing() {
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7331\"\n",
     )
     .unwrap();
-    fs::write(&previous.token_file, "previous-token\n").unwrap();
 
     copy_missing_install_state_from_paths(&paths, &previous).unwrap();
 
     assert_eq!(
         fs::read_to_string(&paths.config_path).unwrap(),
         "version = 1\n\n[server]\nbind = \"127.0.0.1:7331\"\n"
-    );
-    assert_eq!(
-        fs::read_to_string(&paths.token_file).unwrap(),
-        "previous-token\n"
     );
 }
 

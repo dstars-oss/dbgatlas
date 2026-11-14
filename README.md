@@ -28,7 +28,7 @@ cargo test --workspace
 cargo run -p dbgatlas-cli -- workspace init .\temp\scratch-workspace --with-inputs
 cargo run -p dbgatlas-cli -- workspace info .\temp\scratch-workspace
 cargo run -p dbgatlas-cli -- native version
-cargo run -p dbgatlas-cli -- service run --bind 127.0.0.1:7331 --token dev-token
+cargo run -p dbgatlas-cli -- service run --bind 127.0.0.1:7331
 .\script\build-release-install.ps1
 .\script\build-release-install.ps1 -BuildOnly
 .\script\build-msi.ps1
@@ -66,17 +66,14 @@ MCP by calling `service.update` with a built payload directory:
 }
 ```
 
-Codex can connect to the service-hosted HTTP MCP endpoint with a bearer token
-kept in the local environment:
+Codex connects directly to the loopback HTTP MCP endpoint without authentication:
 
 ```toml
 [mcp_servers.dbgatlas]
 url = "http://127.0.0.1:7331/mcp"
-bearer_token_env_var = "DBGATLAS_TOKEN"
 enabled = true
 startup_timeout_sec = 10
 tool_timeout_sec = 120
 ```
 
-For the development service command above, start Codex with
-`DBGATLAS_TOKEN=dev-token`.
+The service trusts local callers and retains loopback binding and browser `Origin` checks.

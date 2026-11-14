@@ -4,9 +4,6 @@ pub(super) fn validate_config(config: &ServiceConfig) -> Result<(), ServiceError
     if !config.bind.ip().is_loopback() {
         return Err(ServiceError::NonLoopbackBind(config.bind));
     }
-    if config.bearer_token.trim().is_empty() {
-        return Err(ServiceError::EmptyBearerToken);
-    }
     Ok(())
 }
 
@@ -201,7 +198,6 @@ pub(super) fn next_artifact_ref() -> ArtifactRef {
 
 pub(super) fn rpc_error_for(error: ServiceError) -> JsonRpcError {
     let code = match error {
-        ServiceError::Unauthorized => -32001,
         ServiceError::InvalidOrigin(_) => -32002,
         ServiceError::SessionNotFound(_) => -32010,
         ServiceError::OperationNotFound(_) => -32011,
@@ -229,7 +225,6 @@ pub(super) fn mcp_error_for(error: ServiceError) -> JsonRpcError {
 
 pub(super) fn http_status_for(error: &ServiceError) -> u16 {
     match error {
-        ServiceError::Unauthorized => 401,
         ServiceError::InvalidOrigin(_) => 403,
         ServiceError::UnsupportedHttpMethod(_) => 405,
         _ => 400,

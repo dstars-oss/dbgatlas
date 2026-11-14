@@ -187,14 +187,7 @@ fn start_mock_http_service_with_host(host: ServiceHost) -> TestServer {
     let shutdown = ServiceShutdown::new();
     let server_shutdown = shutdown.clone();
     let handle = std::thread::spawn(move || {
-        run_http_service_until(
-            ServiceConfig {
-                bind: endpoint,
-                bearer_token: "test-token".to_string(),
-            },
-            host,
-            server_shutdown,
-        )
+        run_http_service_until(ServiceConfig { bind: endpoint }, host, server_shutdown)
     });
     wait_for_service(endpoint);
     TestServer {
@@ -222,24 +215,7 @@ fn wait_for_service(endpoint: SocketAddr) {
     panic!("service did not start at {endpoint}");
 }
 
-fn post_json(
-    endpoint: SocketAddr,
-    path: &str,
-    token: Option<&str>,
-    origin: Option<&str>,
-    body: Value,
-) -> String {
-    let authorization = token.map(|token| format!("Bearer {token}"));
-    post_json_with_authorization_header(endpoint, path, authorization.as_deref(), origin, body)
-}
-
-fn post_json_with_authorization_header(
-    endpoint: SocketAddr,
-    path: &str,
-    authorization: Option<&str>,
-    origin: Option<&str>,
-    body: Value,
-) -> String {
+fn post_json(endpoint: SocketAddr, path: &str, origin: Option<&str>, body: Value) -> String {
     let body = serde_json::to_string(&body).unwrap();
     let mut stream = TcpStream::connect(endpoint).unwrap();
     write!(
@@ -248,9 +224,6 @@ fn post_json_with_authorization_header(
             body.len()
         )
         .unwrap();
-    if let Some(authorization) = authorization {
-        write!(stream, "Authorization: {authorization}\r\n").unwrap();
-    }
     if let Some(origin) = origin {
         write!(stream, "Origin: {origin}\r\n").unwrap();
     }
@@ -311,7 +284,6 @@ fn mcp_tool_call_body(endpoint: SocketAddr, name: &str, arguments: Value) -> Val
     let response = post_json(
         endpoint,
         "/mcp",
-        Some("test-token"),
         None,
         json!({
             "jsonrpc": "2.0",

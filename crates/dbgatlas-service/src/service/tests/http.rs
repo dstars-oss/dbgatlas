@@ -1,22 +1,9 @@
 use super::*;
 
 #[test]
-fn rejects_missing_bearer_token() {
-    let request = HttpRequest {
-        method: "POST".to_string(),
-        path: "/rpc".to_string(),
-        headers: HashMap::new(),
-        body: Vec::new(),
-    };
-    let error = authorize_http_request(&request, &ServiceConfig::dev_default()).unwrap_err();
-    assert!(matches!(error, ServiceError::Unauthorized));
-}
-
-#[test]
 fn validates_loopback_service_bind() {
     let config = ServiceConfig {
         bind: "0.0.0.0:7331".parse().unwrap(),
-        bearer_token: "token".to_string(),
     };
 
     assert!(matches!(
@@ -41,7 +28,6 @@ fn http_mcp_initialize_returns_capabilities() {
     let response = post_json(
         server.endpoint,
         "/mcp",
-        Some("test-token"),
         None,
         json!({
             "jsonrpc": "2.0",
@@ -72,7 +58,7 @@ fn http_handler_waits_for_a_delayed_request_body() {
     let mut stream = TcpStream::connect(server.endpoint).unwrap();
     write!(
         stream,
-        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         server.endpoint,
         body.len()
     )
@@ -100,7 +86,6 @@ fn http_mcp_tools_list_returns_current_tools() {
     let response = post_json(
         server.endpoint,
         "/mcp",
-        Some("test-token"),
         None,
         json!({
             "jsonrpc": "2.0",
@@ -153,7 +138,6 @@ fn http_mcp_ping_returns_empty_result() {
     let response = post_json(
         server.endpoint,
         "/mcp",
-        Some("test-token"),
         None,
         json!({
             "jsonrpc": "2.0",
@@ -174,7 +158,6 @@ fn http_mcp_notifications_return_accepted_without_body() {
     let response = post_json(
         server.endpoint,
         "/mcp",
-        Some("test-token"),
         None,
         json!({
             "jsonrpc": "2.0",
@@ -302,7 +285,6 @@ fn http_mcp_project_fact_lists_read_persisted_layers() {
     let removed = post_json(
         server.endpoint,
         "/mcp",
-        Some("test-token"),
         None,
         json!({
             "jsonrpc": "2.0",
@@ -563,33 +545,11 @@ fn workspace_facts_falls_back_to_project_artifacts_without_manifest() {
 }
 
 #[test]
-fn http_mcp_rejects_missing_bearer_token() {
+fn http_mcp_accepts_requests_without_authentication() {
     let server = start_mock_http_service();
     let response = post_json(
         server.endpoint,
         "/mcp",
-        None,
-        None,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }),
-    );
-
-    assert_eq!(http_status(&response), 401);
-    assert_eq!(http_body_json(&response)["error"]["code"], -32001);
-    server.stop();
-}
-
-#[test]
-fn http_mcp_accepts_case_insensitive_bearer_scheme() {
-    let server = start_mock_http_service();
-    let response = post_json_with_authorization_header(
-        server.endpoint,
-        "/mcp",
-        Some("bearer test-token"),
         None,
         json!({
             "jsonrpc": "2.0",
@@ -605,65 +565,20 @@ fn http_mcp_accepts_case_insensitive_bearer_scheme() {
 }
 
 #[test]
-fn http_mcp_accepts_extra_bearer_header_spacing() {
+fn http_endpoints_reject_invalid_origins_without_authentication() {
     let server = start_mock_http_service();
-    let response = post_json_with_authorization_header(
-        server.endpoint,
-        "/mcp",
-        Some("Bearer    test-token"),
-        None,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }),
-    );
-
-    assert_eq!(http_status(&response), 200);
-    assert!(http_body_json(&response)["result"]["tools"].is_array());
-    server.stop();
-}
-
-#[test]
-fn http_mcp_rejects_bearer_header_with_extra_parts() {
-    let server = start_mock_http_service();
-    let response = post_json_with_authorization_header(
-        server.endpoint,
-        "/mcp",
-        Some("Bearer test-token extra"),
-        None,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }),
-    );
-
-    assert_eq!(http_status(&response), 401);
-    assert_eq!(http_body_json(&response)["error"]["code"], -32001);
-    server.stop();
-}
-
-#[test]
-fn http_mcp_rejects_non_loopback_origin() {
-    let server = start_mock_http_service();
-    let response = post_json(
-        server.endpoint,
-        "/mcp",
-        Some("test-token"),
-        Some("http://localhost.evil.test"),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }),
-    );
-
-    assert_eq!(http_status(&response), 403);
-    assert_eq!(http_body_json(&response)["error"]["code"], -32002);
+    for (path, method) in [("/mcp", "tools/list"), ("/rpc", "service.health")] {
+        for origin in ["http://localhost.evil.test", "https://example.com", "null"] {
+            let response = post_json(
+                server.endpoint,
+                path,
+                Some(origin),
+                json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}),
+            );
+            assert_eq!(http_status(&response), 403, "{path} {origin}");
+            assert_eq!(http_body_json(&response)["error"]["code"], -32002);
+        }
+    }
     server.stop();
 }
 
@@ -673,7 +588,6 @@ fn http_rpc_path_still_returns_health() {
     let response = post_json(
         server.endpoint,
         "/rpc",
-        Some("test-token"),
         None,
         json!({
             "jsonrpc": "2.0",
