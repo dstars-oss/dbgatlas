@@ -4,9 +4,13 @@
 
 ## 项目定位
 
-DbgAtlas 是一个面向 Windows 的调试、逆向、事件录制与问题分析平台。项目以工具会话、原始输出、artifact 和可复现操作为基础，串联 WinDbg / CDB / DbgEng、IDA、Dump、ETW、TTD、Symbol / PDB / DIA / DbgHelp 等能力。
+DbgAtlas 的目标是打造面向 AI 的调试平台：让 AI 使用原生调试命令，可靠地操作本机或远端的调试后端，查询状态，并检索、引用可跨会话继承的操作历史与输出。先完善 Windows 调试链路，再逐步接入 Linux 等平台。
 
-MCP、CLI 和后续 UI 都是入口层，不是架构核心。底层 Windows native 能力通过 C++ adapter 暴露为 C ABI，由 Rust 侧安全封装后进入平台核心。
+IDA 静态分析属于外部工具职责，现有 IDA 集成按迭代计划退役，不再扩展自有 IDA SDK 适配路线。调试所需的符号、类型、局部反汇编和地址信息仍在项目范围内；更高层的逆向知识是否产品化，随实际需求决定。
+
+MCP、CLI 和后续管理页面都是入口层，不是架构核心。平台负责后端连接、会话、操作、状态和历史留存；调试后端保留原生语义，执行位置与控制端位置解耦。虚拟化管理后续独立设计。
+
+根目录 `GOALS.md` 是当前迭代计划和进度的依据。计划描述目标形态，不代表能力已经实现；现有实现与旧架构文档随对应迭代逐步迁移，不做一次性整体重写。
 
 ## 总体目录结构
 
@@ -15,6 +19,7 @@ MCP、CLI 和后续 UI 都是入口层，不是架构核心。底层 Windows nat
 ```text
 dbgatlas/
   AGENTS.md
+  GOALS.md
   Cargo.toml
   CMakePresets.json
   README.md
@@ -41,14 +46,16 @@ analysis workspace 的框架先保持简单、可见、可扩展：
 
 ```text
 analysis-workspace/
-  artifacts/              # DbgAtlas 管理的工具产物、原始输出、元数据和可重建索引
+  artifacts/              # DbgAtlas 管理的工具产物、原始输出及相关记录
   analysis/               # 人/模型输出的 Markdown 笔记、假设、结论和报告
   inputs/                 # 可选：人工放入的初始输入材料
 ```
 
-`artifacts/` 是工具事实层，记录和组织 DbgAtlas 实际接触到的 target、session、工具输入输出、文件材料和低层可机械提取信息。`analysis/` 是解释层，由人或模型用 Markdown 写作；高层语义、假设、结论和报告不应伪装成 DbgAtlas 自己产生的客观 JSONL 事实。
+操作记录统一关联输入、执行上下文、状态与输出；不额外引入面向调用者的 Observation 对象。文件产物通过引用关联，异步事件可以归入会话记录，不强行假定一个输入只有一个输出。
 
-workspace 内部是否需要具体的 JSONL 文件、索引目录或 artifact 子目录，应随功能逐步引入。不要在尚未实现相关能力前预设过细的持久化结构。
+`artifacts/` 是工具事实层，`analysis/` 是解释层，由人或模型用 Markdown 写作；高层语义、假设、结论和报告不应伪装成工具事实。历史按目标身份关联，允许跨会话检索，但不同会话的当前线程、回放位置等运行状态保持独立。
+
+按 `GOALS.md` 引入每个 analysis workspace 的本地 SQLite，管理操作记录和输出索引；大产物保留为文件。区分不可丢失的原始记录与可重建的派生索引，不让多个节点直接共享写入同一个数据库文件。具体数据库路径、表结构和文件布局在对应迭代确定，不提前铺设。
 
 ## 开发语言
 
@@ -74,17 +81,23 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 ## 架构原则
 
 1. Rust-first，而不是 Rust-only。
-2. Rust 主进程负责平台核心和编排。
-3. C++ DLL 负责 Windows native 能力，尤其是 DbgEng、DIA、ETW、DbgHelp、MiniDump 等。
+2. Rust 负责平台核心和编排；控制端、调试后端及目标的位置分别表达，本机与远端后端复用执行契约。
+3. 自有 Windows native adapter 通过 C++ DLL 和 Rust safe wrapper 接入；其他后端可通过原生协议、库或子进程接入，不要求全部使用 C ABI。
 4. `core` 层不得直接散落 unsafe FFI。
 5. CLI、MCP 和后续 UI 必须调用 Rust core / wrapper 层，不得绕过 core 重复实现底层调试逻辑。
 6. 项目命名、模块命名和目录结构不得绑定到 MCP、IDA、WinDbg、TTD 任一单点能力。
 7. 在真实使用体验和需求边界明确前，不要过早设计完整 GUI、完整 DbgEng wrapper 或复杂序列化框架。
 8. 持久化优先服务 AI 输入、审计和复现；具体格式随功能演进，优先保持可读、可审计、可迁移。
+9. 面向 AI 优先提供原生命令执行与少量会话、状态、中断、历史接口，不将全部调试器命令重新包装成自有工具；内部状态应优先来自后端 API 或结构化事件。
+10. 区分调用等待超时、操作取消、目标中断、目标终止及会话关闭；客户端或网络断开不能直接等同于目标退出。明确后端进程所有权及关闭策略。
+11. 长操作优先复用经实际客户端验证的 MCP 标准能力，并保留必要的兼容路径；协议任务状态不能替代真实调试状态，持久化历史不能依赖协议任务的保留期限。
+12. 跨平台采用小公共契约、能力声明和平台扩展；不假定所有后端具备相同功能，也不将 Windows 路径、PID 或 x64 寄存器模型固化为公共语义。
 
 ## 工程协作要求
 
 修改前应先阅读相关目录的 `AGENTS.md`、相邻代码、测试和文档。改动应遵循最小必要变更原则，不做与任务无关的重构、格式化或目录迁移。
+
+每个迭代聚焦 `GOALS.md` 中的 1—2 个目标，按验收场景推进。完成时同步更新进度、验证证据和未覆盖项；计划、静态检查、测试通过与安装态验证必须区分。纯文档调整执行 `git diff --check` 并检查语义一致性，无需构建或更新安装态服务。
 
 ## Git 分支协作
 
@@ -112,3 +125,5 @@ Rust/C++ 边界不通过中心化 `protocol` 模块定义。每个 native adapte
 `dbgatlas service` 是当前安装态和开发态的主入口。它在同一个 loopback HTTP listener 上暴露两个 endpoint：`/rpc` 是 DbgAtlas 自有 JSON-RPC API，`/mcp` 是 Codex 等 MCP 客户端使用的 HTTP MCP endpoint。项目不再维护独立的 stdio MCP server 或 `dbgatlas-mcp` crate。
 
 `/rpc` 和 `/mcp` 共享 bearer token、loopback bind 限制和浏览器类客户端的 `Origin` 校验。Codex 项目配置可放在本地 `.codex/config.toml`，但 `.codex/` 应保持 ignored，不提交；token 通过 `DBGATLAS_TOKEN` 等本机环境变量传入，不写进仓库。
+
+上述约定描述当前入口。未来远端后端通信在对应迭代单独设计，不通过直接放宽现有 listener 的 loopback 限制来替代远程连接设计。
