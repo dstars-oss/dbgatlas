@@ -4,7 +4,7 @@
 
 ## 最小概念
 
-- `AdapterId`：稳定 adapter 标识，例如 `dbgeng`、`etw`、`ida`。
+- `AdapterId`：稳定 adapter 标识，例如 `dbgeng`、`etw`。
 - `Capability`：能力标识，例如 `native.version`、`debug.raw_command`。
 - `Invocation`：一次调用，包含 operation id、adapter id、capability、参数、可选 workspace root 和 artifact 输出目录。
 - `InvocationResult`：调用结果，包含状态、摘要、machine payload、created artifact 输出和 raw output 输出；core 负责把 artifact 输出登记到 workspace metadata。

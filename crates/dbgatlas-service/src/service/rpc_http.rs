@@ -325,9 +325,6 @@ pub(super) fn worker_response_kind(response: &WorkerResponse) -> &'static str {
         WorkerResponse::Ok { .. } => "ok",
         WorkerResponse::DebugCommand { .. } => "debug_command",
         WorkerResponse::DebugMemory { .. } => "debug_memory",
-        WorkerResponse::ReverseSessionOpened { .. } => "reverse_session_opened",
-        WorkerResponse::ReverseFunctionLookup { .. } => "reverse_function_lookup",
-        WorkerResponse::ReverseCoreFunction { .. } => "reverse_core_function",
         WorkerResponse::Failed { .. } => "failed",
     }
 }
@@ -537,34 +534,6 @@ pub(super) struct DebugReadMemoryParams {
     pub(super) session_id: SessionRef,
     pub(super) address: Value,
     pub(super) length: u64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(super) struct ReverseSessionOpenParams {
-    pub(super) project_root: PathBuf,
-    pub(super) database_path: PathBuf,
-    #[serde(default)]
-    pub(super) ida_install_dir: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(super) struct ReverseLookupFunctionParams {
-    pub(super) session_id: SessionRef,
-    pub(super) runtime_address: Value,
-    pub(super) runtime_module_base: Value,
-    pub(super) ida_image_base: Value,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(super) struct ReverseCoreFunctionParams {
-    pub(super) session_id: SessionRef,
-    #[serde(flatten)]
-    pub(super) arguments: HashMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(super) struct ReverseSessionCloseParams {
-    pub(super) session_id: SessionRef,
 }
 
 #[derive(Clone, Debug, Deserialize)]

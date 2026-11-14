@@ -2,7 +2,7 @@
 
 DbgAtlas 的 recording 能力负责采集、过滤和归档低层运行时事件材料。Recording 以 ETW API 为主线，TTD recording 也归入同一个 `recording` namespace，而不是单独暴露一套平行概念。
 
-recording 是独立产品能力，不依赖 debug session。debug、reverse 和 report workflow 可以引用 recording artifact，但 recording lifecycle 本身不要求已有 debug session。
+recording 是独立产品能力，不依赖 debug session。调试和外部分析 workflow 可以引用 recording artifact，但 recording lifecycle 本身不要求已有 debug session。
 
 ## Goals
 

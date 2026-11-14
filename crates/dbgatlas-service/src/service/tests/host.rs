@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn unknown_methods_do_not_create_worker_or_operation() {
+    let host = ServiceHost::new(Arc::new(FailingCreateWorkerSupervisor));
+    let response = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(1)),
+        method: "unsupported.method".to_string(),
+        params: Some(json!({})),
+    });
+    assert!(response.error.unwrap().message.contains("unknown method"));
+    assert!(
+        matches!(host.call_mcp_tool_output("unsupported.method", json!({})),
+        Err(ServiceError::Rpc(message)) if message.contains("unknown DbgAtlas tool"))
+    );
+    assert!(host.lock_state().unwrap().sessions.is_empty());
+    assert!(host.lock_state().unwrap().operations.is_empty());
+}
+
+#[test]
 fn health_rpc_returns_ok() {
     let host = ServiceHost::with_mock_workers();
     let response = host.handle_rpc(JsonRpcRequest {
@@ -736,87 +754,6 @@ fn mcp_tool_schemas_expose_structured_targets_and_write_items() {
             .as_str()
             .unwrap()
             .contains("does not replace")
-    );
-
-    let open = tools
-        .iter()
-        .find(|tool| tool["name"] == "reverse.session.open")
-        .unwrap();
-    assert!(
-        open["description"]
-            .as_str()
-            .unwrap()
-            .contains("not a read-only clone")
-    );
-
-    let decompile = tools
-        .iter()
-        .find(|tool| tool["name"] == "reverse.decompile")
-        .unwrap();
-    let session_schema = &decompile["inputSchema"]["properties"]["session_id"];
-    assert_eq!(session_schema["oneOf"][0]["type"], "string");
-    assert_eq!(
-        session_schema["oneOf"][1]["properties"]["id"]["type"],
-        "string"
-    );
-    assert!(
-        session_schema["description"]
-            .as_str()
-            .unwrap()
-            .contains("\"session-")
-    );
-
-    let inspect_item = tools
-        .iter()
-        .find(|tool| tool["name"] == "reverse.inspect_item")
-        .unwrap();
-    assert!(
-        inspect_item["description"]
-            .as_str()
-            .unwrap()
-            .contains("without mutating")
-    );
-
-    let rename = tools
-        .iter()
-        .find(|tool| tool["name"] == "reverse.rename")
-        .unwrap();
-    assert!(
-        rename["description"]
-            .as_str()
-            .unwrap()
-            .contains("call reverse.idb_save")
-    );
-    assert!(
-        rename["inputSchema"]["properties"]["items"]["items"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("addr or name")
-    );
-    assert_eq!(
-        rename["inputSchema"]["properties"]["items"]["items"]["properties"]["new_name"]["type"],
-        "string"
-    );
-
-    let set_type = tools
-        .iter()
-        .find(|tool| tool["name"] == "reverse.set_type")
-        .unwrap();
-    assert!(set_type["inputSchema"]["properties"]["items"]["items"]["properties"]["kind"]
-            ["description"]
-            .as_str()
-            .unwrap()
-            .contains("function declaration"));
-
-    let idb_save = tools
-        .iter()
-        .find(|tool| tool["name"] == "reverse.idb_save")
-        .unwrap();
-    assert!(
-        idb_save["description"]
-            .as_str()
-            .unwrap()
-            .contains("save in place")
     );
 
     let close = tools

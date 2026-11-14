@@ -17,7 +17,6 @@ pub const SESSIONS_DIR: &str = "sessions";
 pub const RECORDINGS_DIR: &str = "recordings";
 pub const PROFILES_DIR: &str = "profiles";
 pub const TTD_RECORDINGS_DIR: &str = "ttd_recordings";
-pub const REVERSE_SESSIONS_DIR: &str = "reverse_sessions";
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -239,13 +238,6 @@ impl Workspace {
         recording_id: &Id,
     ) -> Result<PathBuf, WorkspaceError> {
         self.ensure_domain_artifact_dir(TTD_RECORDINGS_DIR, recording_id)
-    }
-
-    pub fn ensure_reverse_session_artifact_dir(
-        &self,
-        session_id: &Id,
-    ) -> Result<PathBuf, WorkspaceError> {
-        self.ensure_domain_artifact_dir(REVERSE_SESSIONS_DIR, session_id)
     }
 
     pub fn resolve_artifact_relative_path(
@@ -594,12 +586,6 @@ mod tests {
         assert!(
             workspace
                 .ensure_ttd_recording_artifact_dir(&id)
-                .unwrap()
-                .is_dir()
-        );
-        assert!(
-            workspace
-                .ensure_reverse_session_artifact_dir(&id)
                 .unwrap()
                 .is_dir()
         );

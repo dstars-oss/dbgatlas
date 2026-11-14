@@ -1,10 +1,20 @@
 use super::*;
 
 #[test]
-fn required_payload_uses_only_versioned_ida_providers() {
-    assert!(WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.contains(&"dbgatlas_ida_sdk_930.dll"));
-    assert!(WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.contains(&"dbgatlas_ida_sdk_940.dll"));
-    assert!(!WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES.contains(&"dbgatlas_ida.dll"));
+fn release_payload_includes_only_required_files() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in [
+        "dbgatlas.exe",
+        "dbgatlas-worker.exe",
+        "dbgatlas_dbgeng.dll",
+        "dbgatlas_etw.dll",
+    ] {
+        fs::write(temp.path().join(name), b"test payload").unwrap();
+    }
+    fs::write(temp.path().join("unrelated.dll"), b"extra file").unwrap();
+    let payload = discover_service_payload(temp.path(), &temp.path().join("destination")).unwrap();
+    assert_eq!(payload.len(), 4);
+    assert!(payload.iter().all(|file| file.file_name != "unrelated.dll"));
 }
 
 #[test]
@@ -303,8 +313,6 @@ fn copy_payload_installs_files_into_bin() {
         fs::read_to_string(paths.bin_dir.join("dbgatlas.exe")).unwrap(),
         "dbgatlas.exe"
     );
-    assert!(paths.bin_dir.join("dbgatlas_ida_sdk_930.dll").is_file());
-    assert!(paths.bin_dir.join("dbgatlas_ida_sdk_940.dll").is_file());
 }
 
 #[test]

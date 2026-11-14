@@ -117,39 +117,12 @@ impl Default for ServerRuntimeConfig {
 pub struct ToolRuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_path: Option<String>,
-    #[serde(default)]
-    pub ida: IdaRuntimeConfig,
 }
 
 impl ToolRuntimeConfig {
     fn validate(&self) -> Result<(), RuntimeConfigError> {
         if let Some(symbol_path) = &self.symbol_path {
             validate_text_value(symbol_path, "tools.symbol_path")?;
-        }
-        self.ida.validate()
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IdaRuntimeConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub install_dir: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub python_executable: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vendor_src_dir: Option<PathBuf>,
-}
-
-impl IdaRuntimeConfig {
-    fn validate(&self) -> Result<(), RuntimeConfigError> {
-        if let Some(path) = &self.install_dir {
-            validate_path_value(path, "tools.ida.install_dir")?;
-        }
-        if let Some(path) = &self.python_executable {
-            validate_path_value(path, "tools.ida.python_executable")?;
-        }
-        if let Some(path) = &self.vendor_src_dir {
-            validate_path_value(path, "tools.ida.vendor_src_dir")?;
         }
         Ok(())
     }
@@ -237,13 +210,6 @@ const KNOWN_PROXY_KEYS: &[&str] = &[
 
 fn default_bind() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
-
-fn validate_path_value(path: &Path, field: &'static str) -> Result<(), RuntimeConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(RuntimeConfigError::EmptyValue { field });
-    }
-    validate_text_value(&path.as_os_str().to_string_lossy(), field)
 }
 
 fn validate_text_value(value: &str, field: &'static str) -> Result<(), RuntimeConfigError> {

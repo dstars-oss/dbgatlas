@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn session_ref_deserializes_from_object_and_ignores_kind() {
         let session: SessionRef =
-            serde_json::from_str(r#"{"kind":"reverse","id":"session-001"}"#).unwrap();
+            serde_json::from_str(r#"{"kind":"debug","id":"session-001"}"#).unwrap();
         assert_eq!(session.id.as_str(), "session-001");
     }
 

@@ -35,8 +35,6 @@
       <File Source="$(var.ReleaseDir)\dbgatlas-worker.exe" />
       <File Source="$(var.ReleaseDir)\dbgatlas_dbgeng.dll" />
       <File Source="$(var.ReleaseDir)\dbgatlas_etw.dll" />
-      <File Source="$(var.ReleaseDir)\dbgatlas_ida_sdk_930.dll" />
-      <File Source="$(var.ReleaseDir)\dbgatlas_ida_sdk_940.dll" />
     </Component>
 
     <!-- MSI directory properties end with '\'; appending '.' keeps the closing quote from being escaped. -->

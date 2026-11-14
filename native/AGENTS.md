@@ -8,3 +8,5 @@ Native code is project-owned C++ and uses C++20.
 - Every exported function must catch exceptions and return an explicit status code.
 - Use fixed-width integer types, UTF-8 strings at the boundary, and view + owner for returned buffers.
 - Memory allocated by native code must be released by native release functions.
+
+- Current native adapters cover debugging and recording. IDA SDK integration is outside this repository; debugger symbols, types, and disassembly remain in scope.

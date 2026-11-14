@@ -631,3 +631,45 @@ impl ServiceHost {
         recording_response(&recording, &operation_id, status, &registered)
     }
 }
+
+pub(super) fn recording_response(
+    recording: &ManagedRecording,
+    operation_id: &OperationRef,
+    status: OperationStatus,
+    writes: &RegisteredWorkerWrites,
+) -> Result<Value, ServiceError> {
+    Ok(json!({
+        "recording_id": recording.recording_id,
+        "state": recording.state,
+        "target": recording.target,
+        "root_pid": recording.root_pid,
+        "presets": recording.presets,
+        "cpu_sampling": recording.cpu_sampling,
+        "cpu_summary": recording.cpu_summary,
+        "operation_id": operation_id,
+        "operation_status": status,
+        "artifact_refs": writes.artifacts,
+        "raw_output_ref": writes.raw_output,
+        "operation": {
+            "status": status,
+            "artifact_refs": writes.artifacts,
+            "raw_output_ref": writes.raw_output,
+        }
+    }))
+}
+
+pub(super) fn recording_status_response(recording: &ManagedRecording) -> Value {
+    json!({
+        "recording_id": recording.recording_id,
+        "state": recording.state,
+        "target": recording.target,
+        "root_pid": recording.root_pid,
+        "presets": recording.presets,
+        "cpu_sampling": recording.cpu_sampling,
+        "cpu_summary": recording.cpu_summary,
+        "created_at": recording.created_at,
+        "updated_at": recording.updated_at,
+        "last_operation": recording.last_operation,
+        "artifact_refs": recording.artifacts,
+    })
+}

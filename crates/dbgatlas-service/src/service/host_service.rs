@@ -81,9 +81,6 @@ impl ServiceHost {
             match session.request_lock.try_lock() {
                 Ok(_guard) => {
                     let request = match session.capability.as_str() {
-                        "reverse" => WorkerRequest::CloseReverseSession {
-                            session_id: session.session_id.clone(),
-                        },
                         "debug" => WorkerRequest::CloseSession {
                             session_id: session.session_id.clone(),
                         },
@@ -216,16 +213,6 @@ impl ServiceHost {
                 "debug.add_symbols" => self.debug_add_symbols(params),
                 "debug.read_memory" => self.debug_read_memory(params),
                 _ => unhandled_registered_method(name),
-            },
-            MethodRoute::Reverse => match name {
-                "reverse.session.open" => self.reverse_session_open(params),
-                "reverse.lookup_function" => self.reverse_lookup_function(params),
-                "reverse.session.close" => self.reverse_session_close(params),
-                _ => self.reverse_core_function(
-                    name.strip_prefix("reverse.")
-                        .expect("reverse method has reverse namespace"),
-                    params,
-                ),
             },
             MethodRoute::Recording => match name {
                 "recording.start" => self.recording_start(params),

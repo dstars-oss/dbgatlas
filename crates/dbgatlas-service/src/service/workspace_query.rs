@@ -154,9 +154,6 @@ pub(super) fn infer_synthetic_artifact_kind(artifacts_root: &Path, path: &Path) 
             "recording.recorder_output".to_string()
         }
         ["sessions", ..] => "debug.artifact".to_string(),
-        ["reverse_sessions", _, "core", ..] => "reverse.core".to_string(),
-        ["reverse_sessions", _, "errors", ..] => "reverse.adapter_error".to_string(),
-        ["reverse_sessions", ..] => "reverse.artifact".to_string(),
         _ => "artifact.file".to_string(),
     }
 }

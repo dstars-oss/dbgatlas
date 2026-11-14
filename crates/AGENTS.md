@@ -9,3 +9,5 @@ Rust crates use the workspace stable toolchain and the edition configured in the
 - `dbgatlas-runtime` owns machine/runtime configuration types; do not store runtime install paths or proxy settings in workspace manifests.
 - `dbgatlas-core` orchestrates workspace and adapters, and must not directly contain unsafe FFI calls.
 - `*-sys` crates are the only Rust layer allowed to expose raw native ABI bindings.
+
+- IDA static analysis belongs to external tools; do not reintroduce IDA bindings, wrappers, or reverse workers. Do not maintain IDA-specific compatibility layers.

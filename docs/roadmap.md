@@ -1,5 +1,7 @@
 # Roadmap
 
+[GOALS.md](../GOALS.md) is the authoritative iteration plan. This document describes the current local implementation; remote backends, SQLite history, Linux, and management UI are future iterations.
+
 ## Current Baseline
 
 - Cargo workspace and native CMake project.
@@ -7,7 +9,7 @@
 - Minimal adapter contract with Rust core orchestration.
 - Runtime config separated from workspace manifests.
 - Domain artifact layout helpers and artifact path validation.
-- Native C ABI boundaries for DbgEng, ETW, and IDA adapters with matching Rust `*-sys` crates and safe wrappers.
+- Native C ABI boundaries for DbgEng and ETW adapters with matching Rust `*-sys` crates and safe wrappers.
 - Installed Windows service lifecycle, development service mode, JSON-RPC `/rpc`, and HTTP MCP `/mcp`.
 - A shared service method registry that keeps JSON-RPC routes and MCP tool schemas aligned.
 - `--json` output for the main CLI workflows.
@@ -29,18 +31,13 @@
 - Built-in process/thread/image/file/registry/network presets.
 - Filtered ETL, recording metadata, and category event JSONL artifacts.
 - TTD one-shot recording under the shared recording namespace.
-- Low-level recording materials available as inputs for report, reverse, and future timeline views.
+- Low-level recording materials available as inputs for external analysis and future timeline views.
 
-## Reverse Workflow
+## Product boundary and next iterations
 
-- IDA database target opening through native IDA adapter dynamic loading.
-- Reverse sessions in active interactive user workers.
-- Explicit runtime address / module base / IDA image base to IDA function mapping.
-- Core Functions exposed through service RPC and MCP tools with stable JSON result shape; inputs and artifacts are described in `docs/reverse-core-functions.md`.
-- Reverse workflow outputs, operation records, and artifact metadata are referenceable from `analysis/` notes.
+IDA static analysis uses external tools.
+Debugger-native symbols, types, disassembly, and address information remain in scope.
 
-## Next Directions
-
-- Markdown report workflow that cites artifact ids and operation ids.
-- Agent-oriented workflows over the service-hosted MCP endpoint.
-- Timeline/report views derived from low-level recording materials without storing high-level conclusions as tool facts.
+The next iteration separates session management from backend execution and validates
+the current local debugging chain across that boundary. Later iterations follow
+GOALS.md; those capabilities are not part of the current implementation.

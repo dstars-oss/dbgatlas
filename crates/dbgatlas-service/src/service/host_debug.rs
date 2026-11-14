@@ -80,8 +80,6 @@ impl ServiceHost {
             internal_workspace_root: workspace.root().to_path_buf(),
             artifact_dir: session_dir,
             target: Some(target),
-            database_path: None,
-            ida_install_dir: None,
             state: DebugSessionState::Ready,
             worker,
             request_lock: Arc::new(Mutex::new(())),

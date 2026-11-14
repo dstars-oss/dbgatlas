@@ -53,26 +53,6 @@ typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
 
 当前实现按自动 resolver 给出的 Store WinDbg / SDK / System32 候选目录动态加载 `dbgeng.dll`，通过 `DebugCreate` 建立 session。Rust worker 会在 `LoadLibrary` 失败时尝试下一个候选；一旦某个 `dbgeng.dll` 成功加载，native adapter 不在同一进程内切换版本。`.dmp`、`.run` 等 DbgEng 支持的文件统一通过 `da_dbgeng_session_open_file` 进入，内部使用 `OpenDumpFile` 打开；attach 使用非侵入 attach，不在 close 时终止目标进程。raw command 通过 `IDebugControl::Execute` 执行，并用 output callbacks 捕获输出。安装态 worker 使用 `*_to_file` ABI 将完整文本直接流式写入 `.part` 文件，仅跨 FFI 返回 bounded preview、完整 UTF-8 字节数和截断状态；旧内存返回 ABI 仅为兼容保留。`add_symbols` 追加当前 session 的 symbol path，可选执行 `.reload`。`read_virtual` 用 `IDebugDataSpaces::ReadVirtual` 返回二进制 view。
 
-## IDA native adapter ABI
-
-IDA adapter 使用 `native/include/dbgatlas_ida.h` 定义 ABI 0.3。`da_ida_provider_info` 可在不加载 IDA runtime 的情况下报告 provider ABI、SDK 和目标 IDA major/minor。Rust safe wrapper 读取安装目录中 `idalib.dll` 的 VERSIONINFO，并只从 DbgAtlas executable、`deps` 和既有父目录中发现版本化 provider；当前分别使用 `3rdpart/cpp/ida-sdk/930/include` 与 `940/include` 构建 `dbgatlas_ida_sdk_930.dll` 和 `dbgatlas_ida_sdk_940.dll`。provider 在 session open 时按需加载用户本机的 `ida.dll` / `idalib.dll` / Hex-Rays dispatcher，初始化后通过 `get_library_version` 再次校验 major/minor。构建不链接 IDA SDK import libs，未知版本、缺失 provider 或 metadata 不匹配都会失败，不回退到相邻版本。导出边界只暴露 opaque handle、固定宽度整数和 text view。
-
-IDA provider 默认维护当前 minor 和前一 minor；同一 major/minor 下的 service pack/build 复用同一 provider，build 号仅用于诊断记录。当前范围是 Windows x64 的 IDA 9.4 和 9.3，不包含 Windows ARM64。
-
-当前最小 ABI：
-
-- `da_ida_abi_version(out)`
-- `da_ida_provider_info(out)`
-- `da_ida_session_open(install_dir_utf8, database_path_utf8, out_handle)`
-- `da_ida_lookup_function(handle, runtime_address, runtime_module_base, ida_image_base, out)`
-- `da_ida_core_function(handle, function_utf8, arguments_json_utf8, out)`
-- `da_ida_core_function_to_file(handle, function_utf8, arguments_json_utf8, output_path_utf8, inline_byte_limit, out_artifact)`
-- `da_ida_session_close(handle)`
-- `da_ida_last_error(buffer, buffer_len, required_len)`
-- `da_ida_release_view(owner)`
-
-早期 reverse 链路只做定位和记录，不写 IDA comment，不保存 IDB。
-
 `DA_DbgEngTextView` 也用于 read memory 的 byte view；Rust safe wrapper 按 `data/len` 复制为 `Vec<u8>` 后调用 `da_dbgeng_release_view(owner)`。
 
 ## 错误处理

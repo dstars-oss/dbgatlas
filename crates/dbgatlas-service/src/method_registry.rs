@@ -9,7 +9,6 @@ pub(super) enum MethodRoute {
     Service,
     Session,
     Debug,
-    Reverse,
     Recording,
     Operation,
     Artifact,
@@ -65,7 +64,6 @@ fn method_route(name: &str) -> MethodRoute {
         Some("service") => MethodRoute::Service,
         Some("session") => MethodRoute::Session,
         Some("debug") => MethodRoute::Debug,
-        Some("reverse") => MethodRoute::Reverse,
         Some("recording") => MethodRoute::Recording,
         Some("operation") => MethodRoute::Operation,
         Some("artifact") => MethodRoute::Artifact,
@@ -101,7 +99,7 @@ fn registered_method_descriptors() -> Vec<Value> {
         ),
         mcp_tool(
             "session.list",
-            "List current debug and reverse sessions known to this service process.",
+            "List current debug sessions known to this service process.",
             json!({ "type": "object", "properties": {} }),
         ),
         mcp_tool(
@@ -263,336 +261,6 @@ fn registered_method_descriptors() -> Vec<Value> {
                     "length": { "type": "integer" }
                 },
                 "required": ["session_id", "address", "length"]
-            }),
-        ),
-        mcp_tool(
-            "reverse.session.open",
-            "Open an IDA reverse session for an IDB/database path. This is not a read-only clone; opening an IDB already held by another IDA instance can fail with lock/availability diagnostics.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "project_root": { "type": "string" },
-                    "database_path": {
-                        "type": "string",
-                        "description": "Path to the IDA database or input file to open in the session."
-                    },
-                    "ida_install_dir": {
-                        "type": "string",
-                        "description": "Optional IDA installation directory override."
-                    }
-                },
-                "required": ["project_root", "database_path"]
-            }),
-        ),
-        mcp_tool(
-            "reverse.lookup_function",
-            "Map a runtime address to an IDA function and record the lookup.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": session_ref_schema(),
-                    "runtime_address": {},
-                    "runtime_module_base": {},
-                    "ida_image_base": {}
-                },
-                "required": [
-                    "session_id",
-                    "runtime_address",
-                    "runtime_module_base",
-                    "ida_image_base"
-                ]
-            }),
-        ),
-        mcp_tool(
-            "reverse.lookup_funcs",
-            "Lookup IDA functions by address, module+RVA, or name.",
-            mcp_reverse_core_schema_required(
-                json!({
-                "queries": {
-                    "description": "Address or name queries. Address strings may be IDA EA values such as 0x180093660 or module+RVA values such as libxsse+0x93660."
-                },
-                "runtime_module_base": {},
-                "ida_image_base": {}
-                }),
-                &["queries"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.int_convert",
-            "Convert decimal, hex, bytes, ASCII, and binary integer representations.",
-            mcp_reverse_core_schema_required(json!({ "inputs": {} }), &["inputs"]),
-        ),
-        mcp_tool(
-            "reverse.list_funcs",
-            "List IDA functions with pagination and optional filtering.",
-            mcp_reverse_core_schema(json!({
-                "offset": { "type": "integer" },
-                "count": { "type": "integer" },
-                "filter": { "type": "string" }
-            })),
-        ),
-        mcp_tool(
-            "reverse.list_globals",
-            "List IDA global variables with pagination and optional filtering.",
-            mcp_reverse_core_schema(json!({
-                "offset": { "type": "integer" },
-                "count": { "type": "integer" },
-                "filter": { "type": "string" }
-            })),
-        ),
-        mcp_tool(
-            "reverse.list_imports",
-            "List imported symbols and module names with pagination.",
-            mcp_reverse_core_schema(json!({
-                "offset": { "type": "integer" },
-                "count": { "type": "integer" },
-                "filter": { "type": "string" }
-            })),
-        ),
-        mcp_tool(
-            "reverse.list_strings",
-            "List IDA strings with pagination and optional substring filtering.",
-            mcp_reverse_core_schema(json!({
-                "offset": { "type": "integer" },
-                "count": { "type": "integer" },
-                "filter": { "type": "string" }
-            })),
-        ),
-        mcp_tool(
-            "reverse.get_string",
-            "Read an IDA string at an address.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "addr": reverse_address_schema(),
-                    "length": { "type": "integer" },
-                    "type": { "type": "integer" }
-                }),
-                &["addr"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.get_bytes",
-            "Read IDB bytes at an address.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "addr": reverse_address_schema(),
-                    "length": { "type": "integer" }
-                }),
-                &["addr", "length"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.get_int",
-            "Read an integer from IDB bytes at an address.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "addr": reverse_address_schema(),
-                    "size": { "type": "integer" },
-                    "endian": {
-                        "type": "string",
-                        "enum": ["little", "big"],
-                        "default": "little"
-                    }
-                }),
-                &["addr"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.decompile",
-            "Decompile the function containing an IDA address.",
-            mcp_reverse_core_schema_required(
-                json!({ "addr": reverse_address_schema() }),
-                &["addr"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.disasm",
-            "Disassemble the function containing an IDA address.",
-            mcp_reverse_core_schema_required(
-                json!({ "addr": reverse_address_schema() }),
-                &["addr"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.xrefs_to",
-            "Find cross-references to one or more IDA addresses.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "addrs": {
-                        "description": "One or more IDA EA or module+RVA code addresses."
-                    }
-                }),
-                &["addrs"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.xrefs_to_field",
-            "Find cross-references to struct fields.",
-            mcp_reverse_core_schema_required(json!({ "queries": {} }), &["queries"]),
-        ),
-        mcp_tool(
-            "reverse.callees",
-            "List callees for one or more IDA functions.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "addrs": {
-                        "description": "One or more IDA EA or module+RVA code addresses."
-                    }
-                }),
-                &["addrs"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.rename",
-            "Rename IDA functions or globals in the current session. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
-            mcp_reverse_core_schema_required(
-                json!({ "items": reverse_rename_items_schema() }),
-                &["items"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.set_comments",
-            "Set IDA comments in the current session. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
-            mcp_reverse_core_schema_required(
-                json!({ "items": reverse_set_comments_items_schema() }),
-                &["items"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.set_type",
-            "Apply C types to IDA functions, globals, or addresses in the current session. This mutates the IDB; call reverse.idb_save to persist changes when needed.",
-            mcp_reverse_core_schema_required(
-                json!({ "items": reverse_set_type_items_schema() }),
-                &["items"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.declare_type",
-            "Atomically declare one C declaration block or an array of blocks in the IDA local type library. The complete input is validated before any declarations are committed. This mutates the IDB on success; call reverse.idb_save to persist changes when needed.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "decls": {
-                        "oneOf": [
-                            { "type": "string" },
-                            {
-                                "type": "array",
-                                "items": { "type": "string" }
-                            }
-                        ],
-                        "description": "A complete C declaration block or an array of complete declaration blocks. Commas inside function prototypes are preserved."
-                    }
-                }),
-                &["decls"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.inspect_item",
-            "Inspect IDA item boundaries, head address, current name, and data/code state without mutating the IDB.",
-            mcp_reverse_core_schema_required(json!({ "queries": {} }), &["queries"]),
-        ),
-        mcp_tool(
-            "reverse.force_recompile",
-            "Invalidate Hex-Rays cached decompilation for functions or all functions in the current session.",
-            mcp_reverse_core_schema(json!({ "addrs": {} })),
-        ),
-        mcp_tool(
-            "reverse.idb_save",
-            "Save the current IDA database. When path is omitted, save in place.",
-            mcp_reverse_core_schema(json!({
-                "path": {
-                    "type": "string",
-                    "description": "Optional output path. Omit to save the currently opened database in place."
-                }
-            })),
-        ),
-        mcp_tool(
-            "reverse.py_eval",
-            "Execute Python code in the IDA context.",
-            mcp_reverse_core_schema_required(json!({ "code": { "type": "string" } }), &["code"]),
-        ),
-        mcp_tool(
-            "reverse.find_bytes",
-            "Find byte patterns in the IDA database.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "patterns": {},
-                    "offset": { "type": "integer" },
-                    "limit": { "type": "integer" }
-                }),
-                &["patterns"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.search_text",
-            "Search IDA strings, names, disassembly, and comments by substring.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "query": { "type": "string" },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["strings", "names", "disasm", "comments", "all"]
-                    },
-                    "offset": { "type": "integer" },
-                    "limit": { "type": "integer" }
-                }),
-                &["query"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.query_xrefs",
-            "Query cross-references to or from an address or name.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "target": {},
-                    "direction": { "type": "string", "enum": ["to", "from"] },
-                    "xref_type": { "type": "string", "enum": ["code", "data", "all"] },
-                    "offset": { "type": "integer" },
-                    "limit": { "type": "integer" }
-                }),
-                &["target"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.query_funcs",
-            "Query IDA functions with richer filtering and sorting.",
-            mcp_reverse_core_schema(json!({
-                "filter": { "type": "string" },
-                "name_regex": { "type": "string" },
-                "min_size": { "type": "integer" },
-                "max_size": { "type": "integer" },
-                "has_type": { "type": "boolean" },
-                "sort_by": { "type": "string", "enum": ["addr", "name", "size"] },
-                "descending": { "type": "boolean" },
-                "offset": { "type": "integer" },
-                "count": { "type": "integer" }
-            })),
-        ),
-        mcp_tool(
-            "reverse.query_entities",
-            "Query IDB entities with filtering and pagination.",
-            mcp_reverse_core_schema_required(
-                json!({
-                    "kind": {
-                        "type": "string",
-                        "enum": ["functions", "globals", "imports", "strings", "names"]
-                    },
-                    "filter": { "type": "string" },
-                    "fields": {},
-                    "offset": { "type": "integer" },
-                    "count": { "type": "integer" }
-                }),
-                &["kind"],
-            ),
-        ),
-        mcp_tool(
-            "reverse.session.close",
-            "Close an IDA reverse session.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": session_ref_schema()
-                },
-                "required": ["session_id"]
             }),
         ),
         mcp_tool(
@@ -847,80 +515,6 @@ fn ttd_recording_options_schema() -> Value {
     })
 }
 
-fn reverse_rename_items_schema() -> Value {
-    json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "description": "Each item must include addr or name to identify the target.",
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "enum": ["function", "global"],
-                    "description": "Use function to normalize addr/name to the containing function start; use global for the exact named/addressed item."
-                },
-                "addr": {
-                    "description": "IDA address to rename. Provide addr or name."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Existing IDA name to rename. Provide addr or name."
-                },
-                "new_name": { "type": "string" }
-            },
-            "required": ["kind", "new_name"]
-        }
-    })
-}
-
-fn reverse_set_comments_items_schema() -> Value {
-    json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "description": "Each item must include addr or name to identify the comment location.",
-            "properties": {
-                "addr": {
-                    "description": "IDA address to comment. Provide addr or name."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Existing IDA name whose address should receive the comment. Provide addr or name."
-                },
-                "text": { "type": "string" },
-                "repeatable": { "type": "boolean", "default": false }
-            },
-            "required": ["text"]
-        }
-    })
-}
-
-fn reverse_set_type_items_schema() -> Value {
-    json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "description": "Each item must include addr or name to identify where the type is applied.",
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "enum": ["function", "global", "addr"],
-                    "description": "Use function to apply a function declaration at the function start; global or addr applies at the resolved address."
-                },
-                "addr": {
-                    "description": "IDA address to type. Provide addr or name."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Existing IDA name to type. Provide addr or name."
-                },
-                "type": { "type": "string" }
-            },
-            "required": ["kind", "type"]
-        }
-    })
-}
-
 fn ref_id_schema(label: &str, example: &str) -> Value {
     json!({
         "oneOf": [
@@ -966,33 +560,6 @@ fn mcp_session_schema() -> Value {
     })
 }
 
-fn mcp_reverse_core_schema(extra_properties: Value) -> Value {
-    mcp_reverse_core_schema_required(extra_properties, &[])
-}
-
-fn mcp_reverse_core_schema_required(extra_properties: Value, extra_required: &[&str]) -> Value {
-    let mut properties = serde_json::Map::new();
-    properties.insert("session_id".to_string(), session_ref_schema());
-    if let Value::Object(extra) = extra_properties {
-        for (key, value) in extra {
-            properties.insert(key, value);
-        }
-    }
-    let mut required = vec![json!("session_id")];
-    required.extend(extra_required.iter().map(|field| json!(field)));
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required
-    })
-}
-
-fn reverse_address_schema() -> Value {
-    json!({
-        "description": "IDA EA, decimal integer, WinDbg-style hex integer, or module+RVA string such as libxsse+0x93660. TTD positions such as 151E:2020 are rejected because they are not code addresses."
-    })
-}
-
 fn mcp_operation_schema() -> Value {
     json!({
         "type": "object",
@@ -1030,13 +597,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_inventory_includes_py_eval_and_excludes_removed_methods() {
+    fn canonical_inventory_excludes_retired_methods() {
         let names = method_specs()
             .into_iter()
             .map(|spec| spec.name)
             .collect::<HashSet<_>>();
-        assert!(names.contains("reverse.py_eval"));
-        assert!(method_spec("reverse.py_eval").is_some());
+        assert!(names.iter().all(|name| !name.starts_with("reverse.")));
+        assert!(method_spec("reverse.py_eval").is_none());
         assert!(!names.contains("workspace.facts"));
         for name in [
             "artifact.list",

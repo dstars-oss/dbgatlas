@@ -610,7 +610,7 @@ pub(super) fn load_doctor_runtime_config(
 
 pub(super) fn collect_windows_service_doctor_report(
     paths: &ServiceInstallPaths,
-    runtime: &RuntimeConfig,
+    _runtime: &RuntimeConfig,
     tools: &dbgatlas_runtime::ResolvedToolPaths,
     config_check: DoctorCheck,
     report_path: Option<PathBuf>,
@@ -624,7 +624,6 @@ pub(super) fn collect_windows_service_doctor_report(
         service_health_doctor_check(paths),
         dbgeng_doctor_check(tools),
         ttd_doctor_check(tools),
-        ida_doctor_check(runtime),
     ];
     let warnings = checks
         .iter()
@@ -839,59 +838,6 @@ pub(super) fn ttd_doctor_check(tools: &dbgatlas_runtime::ResolvedToolPaths) -> D
     }
 }
 
-pub(super) fn ida_doctor_check(runtime: &RuntimeConfig) -> DoctorCheck {
-    let candidates = ida_install_candidates(runtime.tools.ida.install_dir.as_deref());
-    if let Some(install_dir) = candidates
-        .iter()
-        .find(|candidate| is_ida_install_dir(candidate))
-    {
-        return match dbgatlas_ida::detect_runtime_info(install_dir) {
-            Ok(info) => doctor_check(
-                "ida",
-                "IDA",
-                DoctorCheckStatus::Ok,
-                format!(
-                    "IDA {}.{} runtime will use {}",
-                    info.runtime_major, info.runtime_minor, info.provider_file_name
-                ),
-                Some(format!(
-                    "SDK provider {}, ABI {}.{}.{}, runtime build {}",
-                    info.ida_sdk_version,
-                    info.abi_major,
-                    info.abi_minor,
-                    info.abi_patch,
-                    info.runtime_build
-                )),
-                Some(install_dir.clone()),
-            ),
-            Err(error) => doctor_check(
-                "ida",
-                "IDA",
-                DoctorCheckStatus::Warning,
-                "IDA runtime files were found but no compatible provider is available".to_string(),
-                Some(error.to_string()),
-                Some(install_dir.clone()),
-            ),
-        };
-    }
-    doctor_check(
-        "ida",
-        "IDA",
-        DoctorCheckStatus::Warning,
-        "No supported IDA runtime was detected; reverse features require a valid ida_install_dir"
-            .to_string(),
-        Some(format!(
-            "checked {}",
-            candidates
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-        runtime.tools.ida.install_dir.clone(),
-    )
-}
-
 pub(super) fn doctor_check(
     id: &str,
     label: &str,
@@ -1006,8 +952,6 @@ pub(super) fn doctor_msi_warning_line(check: &DoctorCheck) -> String {
         "service_health" => "Installed service health check did not pass.".to_string(),
         "dbgeng" => "WinDbg DbgEng runtime was not detected; debug sessions may fail.".to_string(),
         "ttd" => "TTD.exe was not detected; TTD recording is unavailable.".to_string(),
-        "ida" => "A supported IDA runtime/provider pair was not detected; reverse features are unavailable."
-            .to_string(),
         _ => format!("{}: {}", check.label, check.summary),
     }
 }

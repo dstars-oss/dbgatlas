@@ -873,40 +873,6 @@ impl ServiceHost {
         Ok(())
     }
 
-    pub(super) fn record_failed_operation_in_memory(
-        &self,
-        operation_id: &OperationRef,
-        capability: &str,
-        session_id: Option<SessionRef>,
-        summary: String,
-        artifacts: Vec<ArtifactRef>,
-        raw_output: Option<ArtifactRef>,
-    ) -> Result<(), ServiceError> {
-        let now = Timestamp::now();
-        let mut operation = ServiceOperation::failed(
-            operation_id.clone(),
-            capability,
-            session_id.clone(),
-            summary,
-        );
-        operation.artifacts = artifacts.clone();
-        operation.raw_output = raw_output;
-        operation.updated_at = now;
-
-        let mut state = self.lock_state()?;
-        state
-            .operations
-            .insert(operation_id.id.as_str().to_string(), operation);
-        if let Some(session_id) = session_id {
-            if let Some(session) = state.sessions.get_mut(session_id.id.as_str()) {
-                session.updated_at = now;
-                session.last_operation = Some(operation_id.clone());
-                session.artifacts.extend(artifacts);
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn record_failed_session_create(
         &self,
         workspace: &Workspace,
@@ -945,13 +911,6 @@ impl ServiceHost {
         session_id: &SessionRef,
     ) -> Result<ManagedSession, ServiceError> {
         self.reusable_session_with_capability(session_id, "debug")
-    }
-
-    pub(super) fn reusable_reverse_session(
-        &self,
-        session_id: &SessionRef,
-    ) -> Result<ManagedSession, ServiceError> {
-        self.reusable_session_with_capability(session_id, "reverse")
     }
 
     pub(super) fn reusable_session_with_capability(

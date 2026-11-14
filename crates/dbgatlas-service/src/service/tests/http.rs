@@ -128,51 +128,6 @@ fn http_mcp_tools_list_returns_current_tools() {
         true
     );
     for tool_name in [
-        "reverse.lookup_funcs",
-        "reverse.int_convert",
-        "reverse.list_funcs",
-        "reverse.list_globals",
-        "reverse.list_imports",
-        "reverse.list_strings",
-        "reverse.get_string",
-        "reverse.get_bytes",
-        "reverse.get_int",
-        "reverse.decompile",
-        "reverse.disasm",
-        "reverse.xrefs_to",
-        "reverse.xrefs_to_field",
-        "reverse.callees",
-        "reverse.rename",
-        "reverse.set_comments",
-        "reverse.set_type",
-        "reverse.declare_type",
-        "reverse.inspect_item",
-        "reverse.force_recompile",
-        "reverse.idb_save",
-        "reverse.py_eval",
-        "reverse.find_bytes",
-        "reverse.search_text",
-        "reverse.query_xrefs",
-        "reverse.query_funcs",
-        "reverse.query_entities",
-    ] {
-        assert!(
-            tools.iter().any(|tool| tool["name"] == tool_name),
-            "{tool_name} tool is listed"
-        );
-    }
-    for legacy_tool_name in [
-        "reverse.imports",
-        "reverse.xref_query",
-        "reverse.func_query",
-        "reverse.entity_query",
-    ] {
-        assert!(
-            !tools.iter().any(|tool| tool["name"] == legacy_tool_name),
-            "{legacy_tool_name} legacy tool name is not listed"
-        );
-    }
-    for tool_name in [
         "recording.start",
         "recording.ttd",
         "recording.status",
@@ -189,35 +144,6 @@ fn http_mcp_tools_list_returns_current_tools() {
         );
     }
     assert!(!tools.iter().any(|tool| tool["name"] == "workspace.facts"));
-    server.stop();
-}
-
-#[test]
-fn http_mcp_py_eval_is_available_without_opt_in() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server = start_mock_http_service();
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let result = mcp_tool_call(
-        server.endpoint,
-        "reverse.py_eval",
-        json!({
-            "session_id": open["session_id"],
-            "code": "print('runs without an opt-in')"
-        }),
-    );
-
-    assert_eq!(result["operation_status"], "success");
-    assert_eq!(result["function"], "py_eval");
-    assert!(result.get("result").is_some());
     server.stop();
 }
 
@@ -297,180 +223,7 @@ fn http_mcp_debug_workflow_uses_service_results_with_refs() {
 }
 
 #[test]
-fn http_mcp_reverse_core_function_uses_service_results_with_refs() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server = start_mock_http_service();
-    let create = mcp_tool_call(
-        server.endpoint,
-        "debug.session.create",
-        json!({
-            "project_root": temp.path(),
-            "target": { "kind": "file", "path": "sample.dmp" }
-        }),
-    );
-    assert!(create.get("session_id").is_some());
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let result = mcp_tool_call(
-        server.endpoint,
-        "reverse.list_funcs",
-        json!({
-            "session_id": open["session_id"],
-            "offset": 0,
-            "count": 1
-        }),
-    );
-
-    assert_eq!(result["operation_status"], "success");
-    assert_eq!(result["function"], "list_funcs");
-    assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 2);
-    assert_eq!(result["result"]["count"], 1);
-    assert_eq!(result["result_delivery"]["truncated"], false);
-    server.stop();
-}
-
-#[test]
-fn http_mcp_reverse_decompile_accepts_module_rva_without_new_tool() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server = start_mock_http_service();
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let result = mcp_tool_call(
-        server.endpoint,
-        "reverse.decompile",
-        json!({
-            "session_id": open["session_id"],
-            "addr": "libxsse+0x93660"
-        }),
-    );
-
-    assert_eq!(result["operation_status"], "success");
-    assert_eq!(result["function"], "decompile");
-    assert_eq!(result["result"]["addr"], 0x140093660u64);
-    assert_eq!(result["result"]["normalized_address"]["kind"], "module_rva");
-    assert_eq!(result["normalized_addresses"][0]["module"], "libxsse");
-    assert_eq!(result["address_warnings"].as_array().unwrap().len(), 0);
-    server.stop();
-}
-
-#[test]
-fn http_mcp_reverse_decompile_accepts_windbg_backtick_hex() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server = start_mock_http_service();
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let result = mcp_tool_call(
-        server.endpoint,
-        "reverse.decompile",
-        json!({
-            "session_id": open["session_id"],
-            "addr": "00000001`40093660"
-        }),
-    );
-
-    assert_eq!(result["operation_status"], "success");
-    assert_eq!(result["result"]["addr"], 0x140093660u64);
-    assert_eq!(result["result"]["normalized_address"]["kind"], "ida_ea");
-    server.stop();
-}
-
-#[test]
-fn http_mcp_reverse_lookup_funcs_rejects_ttd_position() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server = start_mock_http_service();
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let body = mcp_tool_call_body(
-        server.endpoint,
-        "reverse.lookup_funcs",
-        json!({
-            "session_id": open["session_id"],
-            "queries": ["151E:2020"]
-        }),
-    );
-
-    assert_eq!(body["result"]["isError"], true, "{body}");
-    let text: Value =
-        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert!(
-        text["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("TTD position")
-    );
-    server.stop();
-}
-
-#[test]
-fn http_mcp_reverse_write_tool_returns_normalized_address_summary() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server = start_mock_http_service();
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let result = mcp_tool_call(
-        server.endpoint,
-        "reverse.rename",
-        json!({
-            "session_id": open["session_id"],
-            "items": [{
-                "kind": "function",
-                "addr": "libxsse+0x93660",
-                "new_name": "Detect_FormatCandidates_0x93660"
-            }]
-        }),
-    );
-
-    assert_eq!(result["operation_status"], "success");
-    assert_eq!(
-        result["result"]["items"][0]["normalized_address"]["kind"],
-        "module_rva"
-    );
-    assert_eq!(result["normalized_addresses"][0]["rva"], 0x93660u64);
-    server.stop();
-}
-
-#[test]
-fn http_mcp_session_list_returns_debug_and_reverse_sessions() {
+fn http_mcp_session_list_returns_debug_sessions() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("sample.exe");
     fs::write(&database, b"sample").unwrap();
@@ -483,146 +236,18 @@ fn http_mcp_session_list_returns_debug_and_reverse_sessions() {
             "target": { "kind": "file", "path": "sample.dmp" }
         }),
     );
-    let reverse = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-
     let list = mcp_tool_call(server.endpoint, "session.list", json!({}));
     let sessions = list["sessions"].as_array().unwrap();
     let debug_session = sessions
         .iter()
         .find(|session| session["session_id"] == debug["session_id"])
         .expect("debug session is listed");
-    let reverse_session = sessions
-        .iter()
-        .find(|session| session["session_id"] == reverse["session_id"])
-        .expect("reverse session is listed");
-
-    assert_eq!(list["count"], 2);
+    assert_eq!(list["count"], 1);
     assert_eq!(debug_session["capability"], "debug");
     assert_eq!(debug_session["state"], "Ready");
     assert_eq!(debug_session["close_tool"], "debug.session.close");
     assert_eq!(debug_session["kill_tool"], "debug.session.kill");
     assert!(debug_session["target"].is_object());
-    assert_eq!(reverse_session["capability"], "reverse");
-    assert_eq!(reverse_session["state"], "Ready");
-    assert_eq!(reverse_session["close_tool"], "reverse.session.close");
-    assert!(reverse_session["kill_tool"].is_null());
-    assert!(
-        reverse_session["database_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("sample.exe")
-    );
-    server.stop();
-}
-
-#[test]
-fn http_mcp_reverse_query_funcs_sort_by_returns_tool_result() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server = start_mock_http_service();
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let result = mcp_tool_call(
-        server.endpoint,
-        "reverse.query_funcs",
-        json!({
-            "session_id": open["session_id"],
-            "filter": "parse",
-            "sort_by": "name",
-            "offset": 0,
-            "count": 20
-        }),
-    );
-
-    assert_eq!(result["operation_status"], "success");
-    assert_eq!(result["function"], "query_funcs");
-    assert_eq!(result["result"]["items"][0]["name"], "parse_args");
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
-    assert!(
-        workspace
-            .list_operations()
-            .unwrap()
-            .iter()
-            .any(|operation| {
-                operation.capability == "reverse.query_funcs"
-                    && matches!(operation.status, OperationStatus::Success)
-            })
-    );
-    server.stop();
-}
-
-#[test]
-fn http_mcp_reverse_core_error_is_tool_error() {
-    let temp = tempfile::tempdir().unwrap();
-    let database = temp.path().join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let server =
-        start_mock_http_service_with_host(ServiceHost::new(Arc::new(FailingReverseCoreSupervisor)));
-    let open = mcp_tool_call(
-        server.endpoint,
-        "reverse.session.open",
-        json!({
-            "project_root": temp.path(),
-            "database_path": database
-        }),
-    );
-    let body = mcp_tool_call_body(
-        server.endpoint,
-        "reverse.decompile",
-        json!({
-            "session_id": open["session_id"],
-            "addr": "0x140001000"
-        }),
-    );
-
-    assert_eq!(body["result"]["isError"], true, "{body}");
-    let text: Value =
-        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(text["error"]["code"], -32000);
-    assert!(
-        text["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("mock IDA core function failed")
-    );
-    assert!(
-        text["operation_id"]["id"]
-            .as_str()
-            .unwrap()
-            .starts_with("op-")
-    );
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
-    assert!(
-        workspace
-            .list_artifacts()
-            .unwrap()
-            .iter()
-            .any(|artifact| artifact.kind == "reverse.adapter_error")
-    );
-    assert!(
-        workspace
-            .list_operations()
-            .unwrap()
-            .iter()
-            .any(|operation| {
-                operation.capability == "reverse.decompile"
-                    && matches!(operation.status, OperationStatus::Failed)
-            })
-    );
     server.stop();
 }
 
@@ -1064,20 +689,18 @@ fn http_rpc_path_still_returns_health() {
 }
 
 #[test]
-fn service_shutdown_closes_debug_and_reverse_workers() {
+fn service_shutdown_closes_debug_workers() {
     let temp = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(ShutdownRecordingSupervisor::new());
     let host = ServiceHost::new(supervisor.clone());
     let debug = create_debug_session(&host, temp.path());
     assert!(debug.error.is_none(), "{:?}", debug.error);
-    let _reverse_session_id = open_reverse_session(&host, temp.path());
 
     host.shutdown_workers_gracefully(Duration::from_millis(200));
 
     let requests = supervisor.requests.lock().unwrap();
     assert!(requests.contains(&"close_session"));
-    assert!(requests.contains(&"close_reverse_session"));
-    assert_eq!(supervisor.close_count.load(Ordering::SeqCst), 2);
+    assert_eq!(supervisor.close_count.load(Ordering::SeqCst), 1);
     assert_eq!(supervisor.kill_count.load(Ordering::SeqCst), 0);
 }
 
@@ -1086,7 +709,7 @@ fn service_shutdown_kills_worker_when_request_lock_is_busy() {
     let temp = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(ShutdownRecordingSupervisor::new());
     let host = ServiceHost::new(supervisor.clone());
-    let session_id = open_reverse_session(&host, temp.path());
+    let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
     let session_id = session_id["id"].as_str().unwrap().to_string();
     let request_lock = {
         let state = host.lock_state().unwrap();

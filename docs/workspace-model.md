@@ -14,7 +14,6 @@ analysis-workspace/
     recordings/            # recording artifacts
     profiles/
     ttd_recordings/
-    reverse_sessions/
   analysis/
   inputs/                 # 可选
 ```
@@ -33,7 +32,6 @@ analysis-workspace/
 - `artifacts/recordings/<recording_id>/`：统一 recording namespace，承载 ETW recording 和 TTD recording 的低层输出。
 - `artifacts/profiles/<profile_id>/`：早期 profiling / sampling 预留布局；后续需要时再决定迁移、兼容或保留策略。
 - `artifacts/ttd_recordings/<recording_id>/`：早期 TTD recording 预留布局；后续 TTD 应优先并入统一 `recordings` namespace。
-- `artifacts/reverse_sessions/<session_id>/`：IDA 或其他 reverse workflow 的低层工具输出；`results/` 保存完整纯 JSON，`core/` 保存引用结果的审计事件。
 
 workspace API 只接受位于 `artifacts/` 下的相对路径，拒绝绝对路径和 `..` 穿越。dump、trace、transcript、memory output 都按敏感 artifact 处理。
 
@@ -75,7 +73,7 @@ artifacts/recordings/<recording_id>/
 
 当前仓库没有独立 `schemas/` 目录作为稳定交换格式来源；service 和 workspace 代码中的 JSON/JSONL shape 先服务已实现能力。新增 Case/Evidence/Timeline 等 schema 前，需要先有对应能力、迁移策略和验证入口，避免把尚未实现的高层解释层伪装成工具事实层。
 
-runtime config 不属于 manifest。DbgEng/ETW/TTD/IDA 安装路径、symbol path、proxy、recording presets 和 worker process policy 由 `dbgatlas-runtime` 管理。
+runtime config 不属于 manifest。调试/录制工具发现、symbol path、proxy、recording presets 和 worker process policy 由 `dbgatlas-runtime` 管理。
 
 ## Metadata
 
@@ -130,7 +128,7 @@ debug workflow 的 CLI 和 MCP 调用都返回同一组引用字段：
 - `raw_output_ref`：若存在，指向原始工具输出 artifact。
 - `memory_ref`：`debug.read_memory` 成功时指向 memory artifact。
 
-debug 文本命令与 reverse Core Functions 统一使用 `result` 返回最多 64 KiB
+debug 文本命令使用 `result` 返回最多 64 KiB
 的 inline preview，并用 `result_delivery` 返回 `truncated`、完整字节数、
 inline 上限和完整 artifact 引用。完整结果在 worker 回复前原子落盘；小结果
 同样保留完整 artifact。

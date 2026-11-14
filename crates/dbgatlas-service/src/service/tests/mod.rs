@@ -159,7 +159,6 @@ mod host;
 mod http;
 mod install;
 mod recording;
-mod reverse;
 
 struct TestServer {
     endpoint: SocketAddr,
@@ -346,38 +345,6 @@ fn create_debug_session(host: &ServiceHost, project_root: &Path) -> JsonRpcRespo
     })
 }
 
-fn open_reverse_session(host: &ServiceHost, project_root: &Path) -> Value {
-    let database = project_root.join("sample.exe");
-    fs::write(&database, b"sample").unwrap();
-    let open = host.handle_rpc(JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(json!(2)),
-        method: "reverse.session.open".to_string(),
-        params: Some(json!({
-            "project_root": project_root,
-            "database_path": database
-        })),
-    });
-    assert!(open.error.is_none(), "{:?}", open.error);
-    let result = open.result.unwrap();
-    result["session_id"].clone()
-}
-
-fn reverse_core_rpc(
-    host: &ServiceHost,
-    method: &str,
-    session_id: Value,
-    mut arguments: Value,
-) -> JsonRpcResponse {
-    arguments["session_id"] = session_id;
-    host.handle_rpc(JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(json!(3)),
-        method: method.to_string(),
-        params: Some(arguments),
-    })
-}
-
 fn create_recording(host: &ServiceHost, project_root: &Path, target: Value) -> JsonRpcResponse {
     host.handle_rpc(JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -544,12 +511,6 @@ struct FailingEvalSupervisor;
 struct ArtifactThenTransportFailureSupervisor;
 
 struct BadEvalWriteSupervisor;
-
-struct FailingReverseOpenSupervisor;
-
-struct FailingReverseCloseSupervisor;
-
-struct FailingReverseCoreSupervisor;
 
 struct ShutdownRecordingSupervisor {
     requests: Mutex<Vec<&'static str>>,
@@ -836,23 +797,6 @@ impl WorkerSupervisor for ArtifactThenTransportFailureSupervisor {
         request: WorkerRequest,
     ) -> Result<WorkerResponse, ServiceError> {
         match request {
-            WorkerRequest::ReverseCoreFunction {
-                operation_id,
-                artifact_dir,
-                ..
-            } => {
-                let final_path = artifact_dir
-                    .join("results")
-                    .join(format!("{}.json", operation_id.id.as_str()));
-                fs::create_dir_all(final_path.parent().unwrap())?;
-                fs::write(
-                    PathBuf::from(format!("{}.part", final_path.display())),
-                    b"{\"incomplete\":",
-                )?;
-                Err(ServiceError::Worker(
-                    "simulated reverse transport failure".to_string(),
-                ))
-            }
             WorkerRequest::EvalDebugCommand {
                 operation_id,
                 artifact_dir,
@@ -907,29 +851,6 @@ impl WorkerSupervisor for BadEvalWriteSupervisor {
         request: WorkerRequest,
     ) -> Result<WorkerResponse, ServiceError> {
         match request {
-            WorkerRequest::ReverseCoreFunction { function, .. } => {
-                let value = json!({"found": true});
-                let bytes = serde_json::to_vec(&value).unwrap();
-                Ok(WorkerResponse::ReverseCoreFunction {
-                    result: ReverseCoreFunctionResult {
-                        function,
-                        result: ResultPreview {
-                            value,
-                            truncated: false,
-                            full_byte_len: bytes.len() as u64,
-                            inline_byte_limit: DEFAULT_INLINE_RESULT_BYTE_LIMIT as u64,
-                        },
-                        warnings: Vec::new(),
-                    },
-                    writes: vec![WorkerArtifactWrite {
-                        relative_path: PathBuf::from("outside.json"),
-                        kind: "reverse.result".to_string(),
-                        role: Some(WorkerArtifactRole::FullResult),
-                        byte_len: bytes.len() as u64,
-                        description: Some("invalid reverse test write".to_string()),
-                    }],
-                })
-            }
             WorkerRequest::EvalDebugCommand {
                 session_id,
                 operation_id: _,
@@ -952,120 +873,6 @@ impl WorkerSupervisor for BadEvalWriteSupervisor {
                     byte_len: 9,
                     description: Some("invalid test write".to_string()),
                 }],
-            }),
-            other => mock_worker_response(other),
-        }
-    }
-
-    fn cancel_worker_operation(
-        &self,
-        _worker: &WorkerHandle,
-        _session_id: &SessionRef,
-        _operation_id: &OperationRef,
-    ) -> Result<WorkerCancelOutcome, ServiceError> {
-        Ok(WorkerCancelOutcome::Notified)
-    }
-
-    fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
-        Ok(())
-    }
-
-    fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
-        Ok(())
-    }
-}
-
-impl WorkerSupervisor for FailingReverseOpenSupervisor {
-    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
-        Ok(test_worker_handle(request.session_id))
-    }
-
-    fn request_worker(
-        &self,
-        _worker: &WorkerHandle,
-        request: WorkerRequest,
-    ) -> Result<WorkerResponse, ServiceError> {
-        match request {
-            WorkerRequest::OpenReverseSession { .. } => Ok(WorkerResponse::Failed {
-                code: "reverse_open_failed".to_string(),
-                message: "open_database failed with result 4".to_string(),
-                writes: Vec::new(),
-            }),
-            other => mock_worker_response(other),
-        }
-    }
-
-    fn cancel_worker_operation(
-        &self,
-        _worker: &WorkerHandle,
-        _session_id: &SessionRef,
-        _operation_id: &OperationRef,
-    ) -> Result<WorkerCancelOutcome, ServiceError> {
-        Ok(WorkerCancelOutcome::Notified)
-    }
-
-    fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
-        Ok(())
-    }
-
-    fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
-        Ok(())
-    }
-}
-
-impl WorkerSupervisor for FailingReverseCloseSupervisor {
-    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
-        Ok(test_worker_handle(request.session_id))
-    }
-
-    fn request_worker(
-        &self,
-        _worker: &WorkerHandle,
-        request: WorkerRequest,
-    ) -> Result<WorkerResponse, ServiceError> {
-        match request {
-            WorkerRequest::CloseReverseSession { .. } => Ok(WorkerResponse::Failed {
-                code: "reverse_close_failed".to_string(),
-                message: "mock IDA close failed".to_string(),
-                writes: Vec::new(),
-            }),
-            other => mock_worker_response(other),
-        }
-    }
-
-    fn cancel_worker_operation(
-        &self,
-        _worker: &WorkerHandle,
-        _session_id: &SessionRef,
-        _operation_id: &OperationRef,
-    ) -> Result<WorkerCancelOutcome, ServiceError> {
-        Ok(WorkerCancelOutcome::Notified)
-    }
-
-    fn close_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
-        Ok(())
-    }
-
-    fn kill_worker(&self, _worker: &WorkerHandle) -> Result<(), ServiceError> {
-        Ok(())
-    }
-}
-
-impl WorkerSupervisor for FailingReverseCoreSupervisor {
-    fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
-        Ok(test_worker_handle(request.session_id))
-    }
-
-    fn request_worker(
-        &self,
-        _worker: &WorkerHandle,
-        request: WorkerRequest,
-    ) -> Result<WorkerResponse, ServiceError> {
-        match request {
-            WorkerRequest::ReverseCoreFunction { .. } => Ok(WorkerResponse::Failed {
-                code: "reverse_core_failed".to_string(),
-                message: "mock IDA core function failed".to_string(),
-                writes: Vec::new(),
             }),
             other => mock_worker_response(other),
         }

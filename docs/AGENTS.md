@@ -7,3 +7,5 @@ Architecture documents must follow the current confirmed DbgAtlas direction.
 - Do not reintroduce hidden `.dbgatlas` workspace state.
 - Keep architecture documentation focused on workspace, adapter boundaries, runtime separation, worker/session boundaries, native ABI, service entry points, and CLI validation.
 - Avoid specifying full GUI, full DbgEng wrapper, or complex serialization frameworks before the corresponding capability exists.
+
+- Follow root `GOALS.md` for iteration status; distinguish implemented local behavior from planned remote/history/Linux/UI capabilities. IDA static analysis is external; document current supported behavior without IDA migration or retirement guides.

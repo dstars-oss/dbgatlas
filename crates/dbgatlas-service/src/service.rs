@@ -13,9 +13,8 @@ use dbgatlas_recording::{
 };
 use dbgatlas_runtime::{RuntimeConfig, resolve_store_windbg_dbgeng_dir};
 use dbgatlas_worker_protocol::{
-    ReverseCoreFunctionResult, ReverseFunctionLookupResult, ReverseRuntimeInfo, WorkerArtifactRole,
-    WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError, WorkerRequest, WorkerResponse,
-    decode_jsonl, encode_jsonl, json_result_preview, write_atomic_bytes,
+    WorkerArtifactRole, WorkerArtifactWrite, WorkerEnvelope, WorkerProtocolError, WorkerRequest,
+    WorkerResponse, decode_jsonl, encode_jsonl, write_atomic_bytes,
 };
 use dbgatlas_workspace::{
     ArtifactMetadata, CommandAuditRecord, OperationRecord, OperationStatus, Workspace,
@@ -90,14 +89,6 @@ pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
     "dbgatlas-worker.exe",
     "dbgatlas_dbgeng.dll",
     "dbgatlas_etw.dll",
-    "dbgatlas_ida_sdk_930.dll",
-    "dbgatlas_ida_sdk_940.dll",
-];
-pub const DEFAULT_IDA_INSTALL_DIR: &str = r"C:\Program Files\IDA Professional 9.3";
-pub const IDA_DEFAULT_INSTALL_DIRS: &[&str] = &[
-    r"C:\Program Files\IDA Professional 9.4",
-    r"C:\Program Files\IDA Home 9.4",
-    DEFAULT_IDA_INSTALL_DIR,
 ];
 const TTD_COMMAND_HELPER_ERROR_PREFIX: &str = "dbgatlas TTD command helper error:";
 
@@ -311,8 +302,6 @@ pub enum ServiceError {
     #[error(transparent)]
     Recording(#[from] dbgatlas_recording::RecordingError),
     #[error(transparent)]
-    Ida(#[from] dbgatlas_ida::IdaError),
-    #[error(transparent)]
     Runtime(#[from] dbgatlas_runtime::RuntimeConfigError),
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
@@ -337,19 +326,17 @@ pub struct ServiceHost {
 pub struct ServiceCapabilities {
     pub dbgeng_dirs: Vec<PathBuf>,
     pub ttd_dir: Option<PathBuf>,
-    pub ida_install_dir: Option<PathBuf>,
 }
 
 mod host_debug;
 mod host_recording;
-mod host_reverse;
 mod host_service;
 mod host_worker_ops;
 
 impl ServiceCapabilities {
     pub fn from_runtime_config(runtime: &RuntimeConfig) -> Self {
         let tools = runtime.resolve_tool_paths();
-        Self::from_resolved_tools(tools, runtime.tools.ida.install_dir.clone())
+        Self::from_resolved_tools(tools)
     }
 
     pub fn from_runtime_config_with_install_paths(
@@ -358,13 +345,10 @@ impl ServiceCapabilities {
     ) -> Self {
         let tools =
             runtime.resolve_tool_paths_with_dbgatlas_windbg_runtime_dir(&paths.windbg_runtime_dir);
-        Self::from_resolved_tools(tools, runtime.tools.ida.install_dir.clone())
+        Self::from_resolved_tools(tools)
     }
 
-    fn from_resolved_tools(
-        tools: dbgatlas_runtime::ResolvedToolPaths,
-        ida_install_dir: Option<PathBuf>,
-    ) -> Self {
+    fn from_resolved_tools(tools: dbgatlas_runtime::ResolvedToolPaths) -> Self {
         Self {
             dbgeng_dirs: tools
                 .dbgeng_candidates
@@ -372,63 +356,8 @@ impl ServiceCapabilities {
                 .map(|location| location.dir.clone())
                 .collect(),
             ttd_dir: tools.ttd.map(|location| location.dir),
-            ida_install_dir,
         }
     }
-}
-
-fn ida_install_candidates(configured: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(configured) = configured {
-        candidates.push(configured.to_path_buf());
-    }
-    for candidate in IDA_DEFAULT_INSTALL_DIRS {
-        let candidate = PathBuf::from(candidate);
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    candidates
-}
-
-fn is_ida_install_dir(path: &Path) -> bool {
-    path.is_dir() && path.join("ida.dll").is_file() && path.join("idalib.dll").is_file()
-}
-
-fn resolve_ida_install_dir(explicit: Option<&Path>, configured: Option<&Path>) -> PathBuf {
-    let defaults = IDA_DEFAULT_INSTALL_DIRS
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    resolve_ida_install_dir_from(explicit, configured, &defaults)
-}
-
-fn resolve_ida_install_dir_from(
-    explicit: Option<&Path>,
-    configured: Option<&Path>,
-    defaults: &[PathBuf],
-) -> PathBuf {
-    if let Some(explicit) = explicit {
-        return explicit.to_path_buf();
-    }
-    let mut candidates = configured
-        .into_iter()
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
-    for default in defaults {
-        if !candidates.contains(default) {
-            candidates.push(default.clone());
-        }
-    }
-    candidates
-        .into_iter()
-        .find(|candidate| is_ida_install_dir(candidate))
-        .unwrap_or_else(|| {
-            defaults
-                .last()
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_IDA_INSTALL_DIR))
-        })
 }
 
 #[derive(Default)]
@@ -517,8 +446,6 @@ struct ManagedSession {
     internal_workspace_root: PathBuf,
     artifact_dir: PathBuf,
     target: Option<DebugTarget>,
-    database_path: Option<PathBuf>,
-    ida_install_dir: Option<PathBuf>,
     state: DebugSessionState,
     worker: WorkerHandle,
     #[serde(skip)]
@@ -536,8 +463,6 @@ struct SessionListItem {
     state: DebugSessionState,
     project_root: PathBuf,
     target: Option<DebugTarget>,
-    database_path: Option<PathBuf>,
-    ida_install_dir: Option<PathBuf>,
     worker_id: Id,
     worker_identity: WorkerIdentity,
     created_at: Timestamp,
@@ -556,8 +481,6 @@ impl From<&ManagedSession> for SessionListItem {
             state: session.state,
             project_root: session.project_root.clone(),
             target: session.target.clone(),
-            database_path: session.database_path.clone(),
-            ida_install_dir: session.ida_install_dir.clone(),
             worker_id: session.worker.worker_id.clone(),
             worker_identity: session.worker.identity.clone(),
             created_at: session.created_at,
@@ -1390,9 +1313,6 @@ fn append_worker_create_failed_log(
 
 mod recording_support;
 use recording_support::*;
-
-mod reverse_support;
-use reverse_support::*;
 
 mod mock_worker;
 use mock_worker::*;

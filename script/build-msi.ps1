@@ -75,9 +75,7 @@ function Assert-ReleasePayload {
         "dbgatlas.exe",
         "dbgatlas-worker.exe",
         "dbgatlas_dbgeng.dll",
-        "dbgatlas_etw.dll",
-        "dbgatlas_ida_sdk_930.dll",
-        "dbgatlas_ida_sdk_940.dll"
+        "dbgatlas_etw.dll"
     )
 
     foreach ($name in $required) {
@@ -85,10 +83,6 @@ function Assert-ReleasePayload {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Release payload is incomplete: missing $path"
         }
-    }
-    $legacyIdaAdapter = Join-Path $ReleaseDir "dbgatlas_ida.dll"
-    if (Test-Path -LiteralPath $legacyIdaAdapter -PathType Leaf) {
-        throw "Release payload contains the retired unversioned IDA adapter: $legacyIdaAdapter"
     }
 }
 

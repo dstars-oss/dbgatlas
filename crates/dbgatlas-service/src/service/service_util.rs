@@ -62,43 +62,6 @@ pub(super) fn parse_u64_param(value: &Value, field: &'static str) -> Result<u64,
     }
 }
 
-pub(super) fn worker_failed_message(code: String, message: String) -> String {
-    format!("{code}: {message}")
-}
-
-pub(super) fn diagnose_reverse_open_error(message: String) -> String {
-    if !message.contains("open_database failed with result")
-        || message.contains("ida_error_kind=open_database_failed")
-    {
-        return message;
-    }
-    let Some(result) = open_database_result_code(&message) else {
-        return format!(
-            "{message}; ida_error_kind=open_database_failed; possible_reason=ida_rejected_database; suggestion=verify the database path, IDA version compatibility, file permissions, and whether another process has the database open"
-        );
-    };
-    if result == 4 {
-        format!(
-            "{message}; ida_error_kind=open_database_failed; possible_reason=database_locked_or_unavailable; suggestion=close other IDA/IDALib sessions using this database, wait for file locks to release, or copy the IDB manually for review"
-        )
-    } else {
-        format!(
-            "{message}; ida_error_kind=open_database_failed; possible_reason=ida_rejected_database; suggestion=verify the database path, IDA version compatibility, file permissions, and whether another process has the database open"
-        )
-    }
-}
-
-pub(super) fn open_database_result_code(message: &str) -> Option<i32> {
-    let marker = "open_database failed with result";
-    let tail = message.split(marker).nth(1)?;
-    let digits = tail
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
-        .collect::<String>();
-    digits.parse().ok()
-}
-
 pub(super) struct DebugStartFailure {
     pub(super) code: String,
     pub(super) message: String,
@@ -194,13 +157,6 @@ pub(super) fn recording_relative_path(recording_id: &RecordingRef, suffix: &str)
     PathBuf::from("artifacts")
         .join("recordings")
         .join(recording_id.id.as_str())
-        .join(suffix)
-}
-
-pub(super) fn reverse_relative_path(session_id: &SessionRef, suffix: &str) -> PathBuf {
-    PathBuf::from("artifacts")
-        .join("reverse_sessions")
-        .join(session_id.id.as_str())
         .join(suffix)
 }
 
