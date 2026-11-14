@@ -10,6 +10,7 @@ enum MockEtwMode {
     StartFailure,
     ConsumerFailure,
     ZeroSamples,
+    RestoreFailure,
 }
 
 #[derive(Debug)]
@@ -135,7 +136,7 @@ impl EtwSessionControl for MockEtwSession {
             events_lost: u32::from(has_samples),
             buffers_written: 4,
             interval_restore_attempted: true,
-            interval_restored: true,
+            interval_restored: !matches!(self.mode, MockEtwMode::RestoreFailure),
             events_written: if has_samples { 3 } else { 0 },
             cpu_samples_written: if has_samples { 3 } else { 0 },
             cpu_samples_with_stack: if has_samples { 2 } else { 0 },

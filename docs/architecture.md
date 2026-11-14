@@ -48,7 +48,7 @@ flowchart TB
 
 ## 会话、历史与存储
 
-会话绑定一份可操作的调试上下文，包含后端关联和目标/目标集合引用。会话不是 worker PID，也不拥有目标全部历史。不同会话可以引用同一份离线记录，但当前线程、栈帧、回放位置和符号设置独立。
+Session 和 Operation 是两个核心业务资源。会话在工作区内固定绑定一个专用工作进程，承载调试或录制生命周期，包含环境、后端、目标、执行身份和处置策略。会话不是 worker PID，也不拥有目标全部历史。不同会话可以引用同一份离线记录，但当前线程、栈帧、回放位置和符号设置独立。
 
 历史归入显式 analysis workspace。当前使用 JSONL 和产物文件；迭代 4 引入本地 SQLite，迭代 6 完善稳定目标身份与跨会话检索。迭代 2 只建立关联位置和运行实例边界，不提前实现内容寻址、SQLite 表结构或自动结果缓存。
 
@@ -59,9 +59,10 @@ flowchart TB
 | 当前代码 | 已有职责 | 迭代 2 调整方向 |
 | --- | --- | --- |
 | `dbgatlas-service` / `ServiceHost` | HTTP/MCP 路由、会话、worker、录制及工作区编排 | 分清入口、控制与执行依赖，不能只给现有 supervisor 换名 |
+| `dbgatlas-model` | 公共 Session、OperationDetails、环境/进程身份与状态 | 与本机运行对象分开 |
 | `dbgatlas-debug` | 目标、会话、命令及 manager 类型 | 引入环境/后端关联和生命周期边界，避免公共模型绑定本机 worker |
 | `dbgatlas-core` / `dbgatlas-adapter` | 通用短调用与产物登记 | 不是现有所有调试调用的必经路径；同步 invoke 不等于完整后端协议 |
-| `dbgatlas-worker-protocol` | 本地调试 worker 的 v6 JSONL 消息 | 是既有实现协议，含本机路径；不直接宣称可用于远端执行 |
+| `dbgatlas-worker-protocol` | DbgEng/ETW/TTD 专用 worker 的 v7 JSONL 消息 | 是既有实现协议，含本机路径；不直接宣称可用于远端执行 |
 | `dbgatlas-runtime` | 工具发现、安装和本机身份策略 | 将执行侧配置归属到对应环境，不在控制层解释远端安装路径 |
 | `dbgatlas-workspace` | 工作区、操作与产物记录 | 保留当前落盘路径，逐步接收与执行位置解耦的输出关联 |
 | native adapter / safe wrapper | DbgEng、ETW 本地能力 | 留在执行侧，FFI 不成为跨机器协议 |

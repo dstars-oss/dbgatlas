@@ -129,6 +129,13 @@ pub struct DA_EtwSessionHandle {
 #[cfg(windows)]
 #[link(name = "dbgatlas_etw")]
 unsafe extern "C" {
+    pub fn da_etw_profile_interval(interval_us: *mut u32) -> i32;
+    pub fn da_etw_recover_session(
+        name: *const c_char,
+        trace: *const c_char,
+        previous: u32,
+        applied: u32,
+    ) -> i32;
     pub fn da_etw_abi_version(out: *mut DA_EtwVersion) -> i32;
     pub fn da_etw_adapter_info(out: *mut DA_EtwAdapterInfo) -> i32;
     pub fn da_etw_last_error(

@@ -273,9 +273,11 @@ struct DbgEngSession final {
     ComPtr<IDebugSymbols> symbols;
     ComPtr<IDebugDataSpaces> data_spaces;
     bool detach_processes_on_close = false;
+    bool unpublished_launch = false;
 
     ~DbgEngSession() {
         if (client) {
+            if (unpublished_launch) client->TerminateProcesses();
             if (detach_processes_on_close) {
                 client->DetachProcesses();
             }
@@ -701,15 +703,18 @@ int32_t execute_command_to_file(
     if (previous != nullptr) previous->Release();
     const BOOL flush_ok = FlushFileBuffers(file);
     const BOOL close_ok = CloseHandle(file);
+    const DA_DbgEngStatus output_error = (callback_installed || command_utf8 == nullptr)
+        ? (SUCCEEDED(execute_hr) ? DA_DBGENG_ERR_OUTPUT_AFTER_SUCCESS : DA_DBGENG_ERR_OUTPUT_AFTER_FAILURE)
+        : DA_DBGENG_ERR_INTERNAL;
     if (callbacks.error() != ERROR_SUCCESS) {
-        return fail(DA_DBGENG_ERR_INTERNAL, "WriteFile(output artifact) failed: " + windows_error_message(callbacks.error()));
+        return fail(output_error, "WriteFile(output artifact) failed: " + windows_error_message(callbacks.error()));
     }
     if (FAILED(get_hr)) return fail_hr("IDebugClient::GetOutputCallbacks", get_hr);
     if (FAILED(set_hr)) return fail_hr("IDebugClient::SetOutputCallbacks", set_hr);
     if (FAILED(execute_hr)) return fail_hr("IDebugControl::Execute", execute_hr);
-    if (FAILED(restore_hr)) return fail_hr("IDebugClient::SetOutputCallbacks(restore)", restore_hr);
+    if (FAILED(restore_hr)) return fail(output_error, "failed to restore output callback after execution");
     if (!flush_ok || !close_ok) {
-        return fail(DA_DBGENG_ERR_INTERNAL, "failed to flush or close output artifact");
+        return fail(output_error, "failed to flush or close output artifact");
     }
     const std::string preview = utf8_safe_preview(callbacks.preview());
     out->full_byte_len = callbacks.full_byte_len();
@@ -884,6 +889,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_launch_process(
             return status;
         }
         session->detach_processes_on_close = true;
+        session->unpublished_launch = true;
         status = wait_for_launch_initial_event(*session);
         if (status != DA_DBGENG_OK) {
             return status;
@@ -1093,6 +1099,82 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_read_virtual(
         g_last_error.clear();
         return DA_DBGENG_OK;
 #endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_state(DA_DbgEngSessionHandle* handle, DA_DbgEngState* out) {
+    return guard([&]() -> int32_t {
+        if (!handle || !out || out->struct_size < sizeof(DA_DbgEngState)) {
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "invalid state arguments");
+        }
+        out->target_state = 0;
+        out->process_id = 0;
+        out->thread_id = UINT32_MAX;
+        out->frame_index = UINT32_MAX;
+#ifdef _WIN32
+        auto& session = *session_from_handle(handle);
+        ULONG status = 0;
+        if (SUCCEEDED(session.control->GetExecutionStatus(&status))) {
+            switch (status & DEBUG_STATUS_MASK) {
+            case DEBUG_STATUS_BREAK: out->target_state = 2; break;
+            case DEBUG_STATUS_NO_DEBUGGEE: out->target_state = 3; break;
+            case DEBUG_STATUS_GO:
+            case DEBUG_STATUS_GO_HANDLED:
+            case DEBUG_STATUS_GO_NOT_HANDLED:
+            case DEBUG_STATUS_STEP_OVER:
+            case DEBUG_STATUS_STEP_INTO:
+            case DEBUG_STATUS_STEP_BRANCH: out->target_state = 1; break;
+            default: break;
+            }
+        }
+        ComPtr<IDebugSymbols3> scoped_symbols;
+        if (SUCCEEDED(session.client->QueryInterface(__uuidof(IDebugSymbols3), reinterpret_cast<void**>(scoped_symbols.put())))) {
+            ULONG frame = 0;
+            if (SUCCEEDED(scoped_symbols->GetCurrentScopeFrameIndex(&frame))) out->frame_index = frame;
+        }
+        ComPtr<IDebugSystemObjects> systems;
+        if (SUCCEEDED(session.client->QueryInterface(__uuidof(IDebugSystemObjects), reinterpret_cast<void**>(systems.put())))) {
+            ULONG pid = 0;
+            if (SUCCEEDED(systems->GetCurrentProcessSystemId(&pid))) out->process_id = pid;
+            ULONG tid = 0;
+            if (SUCCEEDED(systems->GetCurrentThreadId(&tid))) out->thread_id = tid;
+        }
+#endif
+        return DA_DBGENG_OK;
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_commit_launch(DA_DbgEngSessionHandle* handle) {
+    return guard([&]() -> int32_t {
+        if (!handle) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "session handle is null");
+#ifdef _WIN32
+        session_from_handle(handle)->unpublished_launch = false;
+#endif
+        return DA_DBGENG_OK;
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_detach(DA_DbgEngSessionHandle* handle) {
+    return guard([&]() -> int32_t {
+        if (!handle) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "session handle is null");
+#ifdef _WIN32
+        auto& session = *session_from_handle(handle);
+        if (!session.client) return DA_DBGENG_OK;
+        if (session.detach_processes_on_close) {
+            ULONG status = 0;
+            const bool no_debuggee = SUCCEEDED(session.control->GetExecutionStatus(&status)) &&
+                (status & DEBUG_STATUS_MASK) == DEBUG_STATUS_NO_DEBUGGEE;
+            if (!no_debuggee) {
+                const HRESULT hr = session.client->DetachProcesses();
+                if (FAILED(hr)) return fail_hr("IDebugClient::DetachProcesses", hr);
+            }
+            session.detach_processes_on_close = false;
+        }
+        const HRESULT hr = session.client->EndSession(DEBUG_END_PASSIVE);
+        if (FAILED(hr)) return fail_hr("IDebugClient::EndSession", hr);
+        session.client.reset();
+#endif
+        return DA_DBGENG_OK;
     });
 }
 

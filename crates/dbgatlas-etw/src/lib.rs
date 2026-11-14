@@ -2,6 +2,45 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
+pub fn profile_interval() -> Result<u32, EtwError> {
+    #[cfg(windows)]
+    {
+        let mut interval = 0;
+        status_to_result(unsafe { dbgatlas_etw_sys::da_etw_profile_interval(&mut interval) })?;
+        Ok(interval)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(EtwError::UnsupportedPlatform)
+    }
+}
+
+pub fn recover_session(
+    name: &str,
+    trace: &Path,
+    previous: u32,
+    applied: u32,
+) -> Result<(), EtwError> {
+    #[cfg(windows)]
+    {
+        let name = session_name_to_cstring(name)?;
+        let trace = path_to_cstring(trace)?;
+        status_to_result(unsafe {
+            dbgatlas_etw_sys::da_etw_recover_session(
+                name.as_ptr(),
+                trace.as_ptr(),
+                previous,
+                applied,
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (name, trace, previous, applied);
+        Err(EtwError::UnsupportedPlatform)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeVersion {
     pub abi_major: u32,

@@ -16,6 +16,15 @@ impl ServiceHost {
         let operation_id = next_operation_ref();
         let workspace = ensure_project_workspace(&params.project_root)?;
         let session_dir = workspace.ensure_session_artifact_dir(&session_id.id)?;
+        self.open_session_record(
+            &session_id,
+            &workspace,
+            dbgatlas_model::SessionKind::Debug,
+            serde_json::to_value(&target)?,
+            &operation_id,
+            "debug.session.create",
+            serde_json::to_value(&request)?,
+        )?;
         let mut start = self.try_start_debug_worker(
             &params,
             &request,
@@ -26,7 +35,9 @@ impl ServiceHost {
             params.worker_identity.worker_create_identity(),
             params.worker_identity,
         );
-        if start.worker.is_none()
+        if !matches!(request.target, DebugTarget::Launch { .. })
+            && start.worker.is_none()
+            && !start.failures.iter().any(|f| f.contains("cleanup"))
             && should_auto_retry_active_interactive_user(
                 params.worker_identity,
                 &request.target,
@@ -53,10 +64,35 @@ impl ServiceHost {
                 start = retry;
             } else {
                 start.failures.extend(retry.failures);
+                start.uncleaned_worker = retry.uncleaned_worker;
             }
         }
         let Some(worker) = start.worker else {
             let message = start.failures.join(" | ");
+            let cleanup_complete = start.uncleaned_worker.is_none();
+            if let Some(worker) = start.uncleaned_worker {
+                let now = Timestamp::now();
+                self.lock_state()?.sessions.insert(
+                    session_id.to_string(),
+                    ManagedSession {
+                        session_id: session_id.clone(),
+                        capability: "debug".into(),
+                        project_root: params.project_root.clone(),
+                        internal_workspace_root: workspace.root().into(),
+                        artifact_dir: session_dir.clone(),
+                        target: Some(target.clone()),
+                        state: DebugSessionState::Error,
+                        worker: worker.clone(),
+                        request_lock: Arc::new(Mutex::new(())),
+                        created_at: now,
+                        updated_at: now,
+                        last_operation: Some(operation_id.clone()),
+                        artifacts: vec![],
+                    },
+                );
+                self.bind_session_worker(&session_id, &worker, "dbgeng")?;
+            }
+            self.set_session_terminal(&session_id, true, cleanup_complete, Some(message.clone()))?;
             self.record_failed_session_create(&workspace, &operation_id, &session_id, &message)?;
             append_service_diagnostic_log(&format!(
                 "debug_session_create_failed session_id={} operation_id={} error={}",
@@ -64,15 +100,14 @@ impl ServiceHost {
                 sanitize_log_value(operation_id.id.as_str()),
                 sanitize_log_value(&message)
             ));
-            return Err(ServiceError::Worker(message));
+            return Err(ServiceError::Worker(format!(
+                "{message}; session_id={session_id}; operation_id={operation_id}"
+            )));
         };
         let start_writes = start
             .writes
             .expect("worker start writes are set with started worker");
         let now = Timestamp::now();
-        let registered_start_writes =
-            register_worker_writes(&workspace, &operation_id, &start_writes)?;
-
         let session = ManagedSession {
             session_id: session_id.clone(),
             capability: "debug".to_string(),
@@ -86,9 +121,35 @@ impl ServiceHost {
             created_at: now,
             updated_at: now,
             last_operation: Some(operation_id.clone()),
-            artifacts: registered_start_writes.artifacts.clone(),
+            artifacts: vec![],
         };
 
+        self.lock_state()?
+            .sessions
+            .insert(session_id.to_string(), session.clone());
+        self.bind_session_worker(&session_id, &session.worker, "dbgeng")?;
+        let registered_start_writes = match register_worker_writes(
+            &workspace,
+            &operation_id,
+            &start_writes,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.record_debug_artifact_registration_failure(
+                    &session,
+                    &workspace,
+                    &operation_id,
+                    "debug.session.create",
+                    "create",
+                    OperationStatus::Success,
+                    &error,
+                )?;
+                return Ok(
+                    json!({"session_id":session_id,"operation_id":operation_id,"operation_status":"success",
+                    "output_error":error.to_string(),"artifact_refs":[],"state":"ready"}),
+                );
+            }
+        };
         let mut operation = ServiceOperation::success(
             operation_id.clone(),
             "debug.session.create",
@@ -96,16 +157,20 @@ impl ServiceHost {
             "debug session created",
         );
         operation.artifacts = registered_start_writes.artifacts.clone();
-        workspace.append_operation(&OperationRecord {
-            operation_id: operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: "debug.session.create".to_string(),
-            status: OperationStatus::Success,
-            created_at: now,
-            summary: "debug session created".to_string(),
-            artifacts: registered_start_writes.artifacts.clone(),
-            raw_output: registered_start_writes.raw_output.clone(),
-        })?;
+        self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: Default::default(),
+                operation_id: operation_id.clone(),
+                adapter_id: "service".to_string(),
+                capability: "debug.session.create".to_string(),
+                status: OperationStatus::Success,
+                created_at: now,
+                summary: "debug session created".to_string(),
+                artifacts: registered_start_writes.artifacts.clone(),
+                raw_output: registered_start_writes.raw_output.clone(),
+            },
+        )?;
 
         let mut state = self.lock_state()?;
         state
@@ -151,141 +216,120 @@ impl ServiceHost {
         mode: SessionFinishMode,
     ) -> Result<Value, ServiceError> {
         let params: SessionParams = parse_params(params)?;
-        let mut session = {
-            let state = self.lock_state()?;
-            state
-                .sessions
-                .get(params.session_id.id.as_str())
-                .cloned()
-                .ok_or_else(|| ServiceError::SessionNotFound(params.session_id.to_string()))?
+        let session = self
+            .lock_state()?
+            .sessions
+            .get(params.session_id.id.as_str())
+            .cloned()
+            .ok_or_else(|| ServiceError::SessionNotFound(params.session_id.to_string()))?;
+        let _guard = if matches!(mode, SessionFinishMode::Close) {
+            Some(
+                session
+                    .request_lock
+                    .try_lock()
+                    .map_err(|_| ServiceError::SessionBusy(params.session_id.to_string()))?,
+            )
+        } else {
+            None
         };
-        if session.state == DebugSessionState::Closed {
-            return Err(ServiceError::SessionAlreadyTerminal(
-                params.session_id.to_string(),
-            ));
-        }
-        if session.capability != "debug" {
-            return Err(ServiceError::Rpc(format!(
-                "session {} is {}, expected debug",
-                params.session_id, session.capability
-            )));
-        }
-        let request_lock = session.request_lock.clone();
-        let _request_guard = match mode {
-            SessionFinishMode::Close => Some(
-                request_lock
-                    .lock()
-                    .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?,
-            ),
-            SessionFinishMode::Kill => None,
-        };
-        session = {
-            let state = self.lock_state()?;
-            state
-                .sessions
-                .get(params.session_id.id.as_str())
-                .cloned()
-                .ok_or_else(|| ServiceError::SessionNotFound(params.session_id.to_string()))?
-        };
-        if session.state == DebugSessionState::Closed {
-            return Err(ServiceError::SessionAlreadyTerminal(
-                params.session_id.to_string(),
-            ));
-        }
-        if session.capability != "debug" {
-            return Err(ServiceError::Rpc(format!(
-                "session {} is {}, expected debug",
-                params.session_id, session.capability
-            )));
+        if !self
+            .lock_state()?
+            .sessions
+            .contains_key(params.session_id.id.as_str())
+        {
+            return Err(ServiceError::SessionNotFound(params.session_id.to_string()));
         }
         let operation_id = next_operation_ref();
-        if session.state != DebugSessionState::Error {
-            match mode {
-                SessionFinishMode::Close => {
-                    let close_response = self.supervisor.request_worker(
-                        &session.worker,
-                        WorkerRequest::CloseSession {
-                            session_id: session.session_id.clone(),
-                        },
-                    );
-                    match close_response {
-                        Err(error) => {
-                            let cleanup = self.supervisor.kill_worker(&session.worker);
-                            self.mark_debug_session_error(&session.session_id)?;
-                            let cleanup_message = match cleanup {
-                                Ok(()) => "worker was killed after close failure".to_string(),
-                                Err(cleanup_error) => format!(
-                                    "worker cleanup also failed: {cleanup_error}; use debug.session.kill"
-                                ),
-                            };
-                            return Err(ServiceError::Worker(format!(
-                                "debug.session.close could not complete cooperatively: {error}; {cleanup_message}"
-                            )));
-                        }
-                        Ok(WorkerResponse::Ok { .. }) => {
-                            self.supervisor.close_worker(&session.worker)?
-                        }
-                        Ok(WorkerResponse::Failed { code, message, .. }) => {
-                            return Err(ServiceError::Worker(format!(
-                                "{code}: {message}; use debug.session.kill if the worker is stuck"
-                            )));
-                        }
-                        Ok(other) => {
-                            return Err(ServiceError::Worker(format!(
-                                "unexpected close response: {other:?}; use debug.session.kill if the worker is stuck"
-                            )));
-                        }
-                    }
-                }
-                SessionFinishMode::Kill => self.supervisor.kill_worker(&session.worker)?,
-            }
-        }
-        session.state = DebugSessionState::Closed;
-        session.updated_at = Timestamp::now();
-        session.last_operation = Some(operation_id.clone());
-        {
-            let mut state = self.lock_state()?;
-            state.sessions.remove(session.session_id.id.as_str());
-        }
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
-        let capability = match mode {
-            SessionFinishMode::Close => "debug.session.close",
-            SessionFinishMode::Kill => "debug.session.kill",
+        let capability = if matches!(mode, SessionFinishMode::Close) {
+            "debug.session.close"
+        } else {
+            "debug.session.kill"
         };
-        workspace.append_operation(&OperationRecord {
-            operation_id: operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: capability.to_string(),
-            status: OperationStatus::Success,
-            created_at: Timestamp::now(),
-            summary: format!("{capability} complete"),
-            artifacts: Vec::new(),
-            raw_output: None,
-        })?;
-
-        let operation = ServiceOperation::success(
-            operation_id.clone(),
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        self.begin_operation_record(
+            &workspace,
+            &operation_id,
+            &session.session_id,
             capability,
-            Some(session.session_id.clone()),
-            format!("{capability} complete"),
-        );
-        let mut state = self.lock_state()?;
-        state
-            .operations
-            .insert(operation_id.id.as_str().to_string(), operation);
-        Ok(json!({
-            "session_id": session.session_id,
-            "state": session.state,
-            "operation_id": operation_id,
-            "operation_status": "success",
-            "artifact_refs": [],
-            "raw_output_ref": null,
-            "operation": {
-                "status": "success",
-                "artifact_refs": [],
-                "raw_output_ref": null,
+            json!({"session_id":session.session_id}),
+        )?;
+        if let Some(summary) = self
+            .lock_state()?
+            .summaries
+            .get_mut(session.session_id.id.as_str())
+        {
+            summary.lifecycle = dbgatlas_model::SessionLifecycle::Closing;
+            self.persist_session(summary)?;
+        }
+        let result = if matches!(mode, SessionFinishMode::Kill) {
+            self.supervisor.kill_worker(&session.worker)
+        } else {
+            match self.supervisor.request_worker(
+                &session.worker,
+                WorkerRequest::CloseSession {
+                    session_id: session.session_id.clone(),
+                },
+            ) {
+                Ok(WorkerResponse::Ok { .. }) => self.supervisor.close_worker(&session.worker),
+                Ok(other) => Err(ServiceError::Worker(format!(
+                    "cooperative close failed: {other:?}; explicit force close is available"
+                ))),
+                Err(error) => Err(error),
+            }
+        };
+        let complete = result.is_ok();
+        let message = result.as_ref().err().map(ToString::to_string);
+        self.set_session_terminal(
+            &session.session_id,
+            !complete || matches!(mode, SessionFinishMode::Kill),
+            complete,
+            message.clone(),
+        )?;
+        if complete {
+            self.lock_state()?
+                .sessions
+                .remove(session.session_id.id.as_str());
+        } else if let Some(current) = self
+            .lock_state()?
+            .sessions
+            .get_mut(session.session_id.id.as_str())
+        {
+            current.state = DebugSessionState::Error;
+        }
+        let status = if complete {
+            OperationStatus::Success
+        } else {
+            OperationStatus::Failed
+        };
+        self.finish_operation_in_memory(
+            &operation_id,
+            status.clone(),
+            message
+                .clone()
+                .unwrap_or_else(|| format!("{capability} complete")),
+            vec![],
+            None,
+        )?;
+        self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: Default::default(),
+                operation_id: operation_id.clone(),
+                adapter_id: "service".into(),
+                capability: capability.into(),
+                status,
+                created_at: Timestamp::now(),
+                summary: message.unwrap_or_else(|| format!("{capability} complete")),
+                artifacts: vec![],
+                raw_output: None,
             },
-        }))
+        )?;
+        result?;
+        Ok(
+            json!({"session_id":session.session_id,"state":DebugSessionState::Closed,"operation_id":operation_id,
+            "operation_status":"success","artifact_refs":[],"raw_output_ref":null,
+            "operation":{"status":"success","artifact_refs":[],"raw_output_ref":null}}),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -300,34 +344,24 @@ impl ServiceHost {
         worker_identity: Option<WorkerIdentity>,
         failure_identity: DebugWorkerIdentity,
     ) -> DebugSessionStartAttempt {
-        let mut started_worker = None;
-        let mut start_writes = None;
-        let mut start_failures = Vec::new();
-        let dbgeng_attempts =
-            debug_worker_dbgeng_attempts(&request.target, &self.capabilities.dbgeng_dirs);
-        append_service_diagnostic_log(&format!(
-            "debug_session_create_start session_id={} operation_id={} target_kind={} identity={} attempt_count={} workspace={}",
-            sanitize_log_value(session_id.id.as_str()),
-            sanitize_log_value(operation_id.id.as_str()),
-            sanitize_log_value(debug_target_kind(&request.target)),
-            sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
-            dbgeng_attempts.len(),
-            sanitize_log_value(&workspace.root().display().to_string())
-        ));
-        for (attempt_index, dbgeng_dirs) in dbgeng_attempts.into_iter().enumerate() {
+        let mut result = DebugSessionStartAttempt {
+            worker: None,
+            writes: None,
+            failures: vec![],
+            uncleaned_worker: None,
+        };
+        for dbgeng_dirs in
+            debug_worker_dbgeng_attempts(&request.target, &self.capabilities.dbgeng_dirs)
+        {
             append_service_diagnostic_log(&format!(
-                "debug_session_create_attempt session_id={} operation_id={} identity={} attempt={} dbgeng_dir_count={}",
-                sanitize_log_value(session_id.id.as_str()),
-                sanitize_log_value(operation_id.id.as_str()),
-                sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
-                attempt_index + 1,
-                dbgeng_dirs.len()
+                "debug_open_candidate session_id={session_id} operation_id={operation_id} identity={}",
+                debug_worker_identity_label(worker_identity.as_ref())
             ));
             let worker = match self.supervisor.create_worker(WorkerCreateRequest {
                 session_id: session_id.clone(),
                 project_root: params.project_root.clone(),
-                internal_workspace_root: workspace.root().to_path_buf(),
-                artifact_dir: session_dir.to_path_buf(),
+                internal_workspace_root: workspace.root().into(),
+                artifact_dir: session_dir.into(),
                 startup_timeout_ms: request
                     .startup_timeout_ms
                     .unwrap_or(DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS),
@@ -336,89 +370,59 @@ impl ServiceHost {
             }) {
                 Ok(worker) => worker,
                 Err(error) => {
-                    let message = add_debug_access_denied_hint(error.to_string(), failure_identity);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_error session_id={} operation_id={} identity={} attempt={} error={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
-                        attempt_index + 1,
-                        sanitize_log_value(&message)
+                    result.failures.push(add_debug_access_denied_hint(
+                        error.to_string(),
+                        failure_identity,
                     ));
-                    start_failures.push(message);
                     break;
                 }
             };
-            let start = self.supervisor.request_worker(
-                &worker,
-                WorkerRequest::StartDebugSession {
-                    session_id: session_id.clone(),
-                    target: request.target.clone(),
-                    artifact_dir: session_dir.to_path_buf(),
-                },
-            );
-            match start {
+            let response = self
+                .start_open_operation(workspace, operation_id, session_id, &worker, "dbgeng")
+                .and_then(|()| {
+                    self.supervisor.request_worker(
+                        &worker,
+                        WorkerRequest::StartDebugSession {
+                            session_id: session_id.clone(),
+                            target: request.target.clone(),
+                            artifact_dir: session_dir.into(),
+                        },
+                    )
+                });
+            let retry_safe = matches!(response, Ok(WorkerResponse::Failed { .. }))
+                && !matches!(request.target, DebugTarget::Launch { .. });
+            match response {
                 Ok(WorkerResponse::Ok { writes, .. }) => {
-                    started_worker = Some(worker);
-                    start_writes = Some(writes);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_ok session_id={} operation_id={} identity={} attempt={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
-                        attempt_index + 1
-                    ));
+                    result.worker = Some(worker);
+                    result.writes = Some(writes);
                     break;
                 }
-                Ok(WorkerResponse::Failed { code, message, .. }) => {
-                    let _ = self.supervisor.kill_worker(&worker);
-                    let failure = debug_start_failure_message(code, message, failure_identity);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_failed session_id={} operation_id={} identity={} attempt={} code={} error={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
-                        attempt_index + 1,
-                        sanitize_log_value(failure.code.as_str()),
-                        sanitize_log_value(failure.message.as_str())
-                    ));
-                    start_failures.push(failure.to_string());
-                }
-                Ok(other) => {
-                    let _ = self.supervisor.kill_worker(&worker);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_unexpected session_id={} operation_id={} identity={} attempt={} response={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
-                        attempt_index + 1,
-                        sanitize_log_value(&format!("{other:?}"))
-                    ));
-                    start_failures.push(format!("unexpected start response: {other:?}"));
-                    break;
-                }
+                Ok(WorkerResponse::Failed { code, message, .. }) => result
+                    .failures
+                    .push(debug_start_failure_message(code, message, failure_identity).to_string()),
+                Ok(other) => result
+                    .failures
+                    .push(format!("unexpected opening response: {other:?}")),
+                Err(error) => result.failures.push(add_debug_access_denied_hint(
+                    error.to_string(),
+                    failure_identity,
+                )),
+            }
+            match self.supervisor.kill_worker(&worker) {
+                Ok(()) => {}
                 Err(error) => {
-                    let _ = self.supervisor.kill_worker(&worker);
-                    let message = add_debug_access_denied_hint(error.to_string(), failure_identity);
-                    append_service_diagnostic_log(&format!(
-                        "debug_session_create_attempt_error session_id={} operation_id={} identity={} attempt={} error={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        sanitize_log_value(debug_worker_identity_label(worker_identity.as_ref())),
-                        attempt_index + 1,
-                        sanitize_log_value(&message)
+                    result.failures.push(format!(
+                        "candidate cleanup failed: {error}; retry prohibited"
                     ));
-                    start_failures.push(message);
+                    result.uncleaned_worker = Some(worker);
                     break;
                 }
             }
+            if !retry_safe {
+                break;
+            }
         }
-
-        DebugSessionStartAttempt {
-            worker: started_worker,
-            writes: start_writes,
-            failures: start_failures,
-        }
+        result
     }
 
     pub(super) fn debug_eval(&self, params: Option<Value>) -> Result<Value, ServiceError> {
@@ -453,8 +457,8 @@ impl ServiceHost {
         let session = self.reusable_debug_session(&params.session_id)?;
         let request_lock = session.request_lock.clone();
         let _request_guard = request_lock
-            .lock()
-            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+            .try_lock()
+            .map_err(|_| ServiceError::SessionBusy(params.session_id.to_string()))?;
         let session = self.reusable_debug_session(&params.session_id)?;
         let workspace = Workspace::open(&session.internal_workspace_root)?;
         let batch_operation_id = next_operation_ref();
@@ -472,6 +476,10 @@ impl ServiceHost {
             );
         }
 
+        self.begin_operation_record(&workspace, &batch_operation_id, &session.session_id,
+            "debug.eval_steps", json!({"commands":params.commands,"continue_on_error":params.continue_on_error,"timeout_ms":params.timeout_ms}))?;
+        let mut unknown_step = false;
+        let mut output_error = None;
         let mut steps = Vec::new();
         let mut artifact_refs = Vec::new();
         let mut raw_output_ref = None;
@@ -492,6 +500,8 @@ impl ServiceHost {
                 );
             }
 
+            self.begin_operation_record(&workspace, &step_operation_id, &session.session_id,
+                "debug.eval_steps.step", json!({"command":command,"batch_operation_id":batch_operation_id,"step_index":index}))?;
             let worker_response = self.request_worker_with_optional_timeout(
                 &session,
                 WorkerRequest::EvalDebugCommand {
@@ -542,6 +552,7 @@ impl ServiceHost {
                         })
                         .unwrap_or((ServiceOperationStatus::Running, Vec::new(), None));
                     drop(state);
+                    unknown_step |= step_status == ServiceOperationStatus::Unknown;
                     if step_status == ServiceOperationStatus::Running {
                         self.finish_operation_in_memory(
                             &step_operation_id,
@@ -562,6 +573,16 @@ impl ServiceHost {
                     artifact_refs.extend(step_artifacts);
                     raw_output_ref = step_raw_output.or(raw_output_ref);
                     let operation_status = match step_status {
+                        ServiceOperationStatus::Success => {
+                            output_error = Some(error.to_string());
+                            "success"
+                        }
+                        ServiceOperationStatus::Unknown => {
+                            if failed_step_index.is_none() {
+                                failed_step_index = Some(index);
+                            }
+                            "unknown"
+                        }
                         ServiceOperationStatus::Canceled => {
                             if canceled_step_index.is_none() {
                                 canceled_step_index = Some(index);
@@ -613,6 +634,8 @@ impl ServiceHost {
             self.operation_status(&batch_operation_id)? == Some(ServiceOperationStatus::Canceled);
         let status = if batch_was_canceled || canceled_step_index.is_some() {
             OperationStatus::Canceled
+        } else if unknown_step {
+            OperationStatus::Unknown
         } else if failed_step_index.is_some() {
             OperationStatus::Failed
         } else {
@@ -624,16 +647,23 @@ impl ServiceHost {
             _ if batch_was_canceled => "debug.eval_steps canceled".to_string(),
             _ => "debug.eval_steps completed".to_string(),
         };
-        workspace.append_operation(&OperationRecord {
-            operation_id: batch_operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: "debug.eval_steps".to_string(),
-            status: status.clone(),
-            created_at: now,
-            summary: summary.clone(),
-            artifacts: artifact_refs.clone(),
-            raw_output: raw_output_ref.clone(),
-        })?;
+        self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: dbgatlas_model::OperationDetails {
+                    output_error: output_error.clone(),
+                    ..Default::default()
+                },
+                operation_id: batch_operation_id.clone(),
+                adapter_id: "service".to_string(),
+                capability: "debug.eval_steps".to_string(),
+                status: status.clone(),
+                created_at: now,
+                summary: summary.clone(),
+                artifacts: artifact_refs.clone(),
+                raw_output: raw_output_ref.clone(),
+            },
+        )?;
         workspace.append_command_audit(&CommandAuditRecord {
             operation_id: batch_operation_id.clone(),
             session_id: Some(session.session_id.clone()),
@@ -645,11 +675,7 @@ impl ServiceHost {
             raw_output: raw_output_ref.clone(),
         })?;
 
-        let service_status = match status {
-            OperationStatus::Failed => ServiceOperationStatus::Failed,
-            OperationStatus::Canceled => ServiceOperationStatus::Canceled,
-            _ => ServiceOperationStatus::Success,
-        };
+        let service_status = status.clone();
         self.finish_operation_in_memory(
             &batch_operation_id,
             service_status,
@@ -659,6 +685,12 @@ impl ServiceHost {
         )?;
         {
             let mut state = self.lock_state()?;
+            if let Some(op) = state.operations.get_mut(batch_operation_id.id.as_str()) {
+                op.details.output_error = output_error.clone();
+            }
+            if let Some(summary) = state.summaries.get_mut(session.session_id.id.as_str()) {
+                summary.last_operation_id = Some(batch_operation_id.clone());
+            }
             if let Some(session_state) = state.sessions.get_mut(session.session_id.id.as_str()) {
                 session_state.last_operation = Some(batch_operation_id.clone());
                 session_state.updated_at = Timestamp::now();
@@ -670,6 +702,7 @@ impl ServiceHost {
             "operation_id": batch_operation_id,
             "operation_status": status,
             "failed_step_index": failed_step_index,
+            "output_error": output_error,
             "steps": steps,
             "artifact_refs": artifact_refs,
             "raw_output_ref": raw_output_ref,

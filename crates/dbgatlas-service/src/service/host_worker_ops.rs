@@ -27,8 +27,8 @@ impl ServiceHost {
         }
         let request_lock = session.request_lock.clone();
         let _request_guard = request_lock
-            .lock()
-            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+            .try_lock()
+            .map_err(|_| ServiceError::SessionBusy(session.session_id.to_string()))?;
         let session = {
             let state = self.lock_state()?;
             state
@@ -58,6 +58,13 @@ impl ServiceHost {
                 .insert(operation_id.id.as_str().to_string(), operation);
         }
 
+        self.begin_operation_record(
+            &workspace,
+            &operation_id,
+            &session.session_id,
+            capability,
+            json!({"command": request.command, "timeout_ms": request.timeout_ms}),
+        )?;
         let worker_response = self.request_worker_with_optional_timeout(
             &session,
             WorkerRequest::EvalDebugCommand {
@@ -84,8 +91,8 @@ impl ServiceHost {
         let session = self.reusable_debug_session(&request.session_id)?;
         let request_lock = session.request_lock.clone();
         let _request_guard = request_lock
-            .lock()
-            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+            .try_lock()
+            .map_err(|_| ServiceError::SessionBusy(session.session_id.to_string()))?;
         let session = self.reusable_debug_session(&request.session_id)?;
 
         let operation_id = next_operation_ref();
@@ -108,6 +115,13 @@ impl ServiceHost {
                 .insert(operation_id.id.as_str().to_string(), operation);
         }
 
+        self.begin_operation_record(
+            &workspace,
+            &operation_id,
+            &session.session_id,
+            "debug.add_symbols",
+            serde_json::to_value(&request)?,
+        )?;
         let worker_response = self.supervisor.request_worker(
             &session.worker,
             WorkerRequest::AddSymbols {
@@ -133,8 +147,8 @@ impl ServiceHost {
         let session = self.reusable_debug_session(&request.session_id)?;
         let request_lock = session.request_lock.clone();
         let _request_guard = request_lock
-            .lock()
-            .map_err(|_| ServiceError::Rpc("session request lock poisoned".to_string()))?;
+            .try_lock()
+            .map_err(|_| ServiceError::SessionBusy(session.session_id.to_string()))?;
         let session = self.reusable_debug_session(&request.session_id)?;
 
         let operation_id = next_operation_ref();
@@ -156,6 +170,13 @@ impl ServiceHost {
                 .insert(operation_id.id.as_str().to_string(), operation);
         }
 
+        self.begin_operation_record(
+            &workspace,
+            &operation_id,
+            &session.session_id,
+            "debug.read_memory",
+            serde_json::to_value(&request)?,
+        )?;
         let worker_response = self.supervisor.request_worker(
             &session.worker,
             WorkerRequest::ReadMemory {
@@ -196,6 +217,7 @@ impl ServiceHost {
                             &operation_id,
                             capability,
                             &audit_command,
+                            OperationStatus::Success,
                             &error,
                         )?;
                         return Err(error);
@@ -217,16 +239,20 @@ impl ServiceHost {
                 } else {
                     format!("{capability} completed by worker")
                 };
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: capability.to_string(),
-                    status: workspace_status.clone(),
-                    created_at: Timestamp::now(),
-                    summary: summary.clone(),
-                    artifacts: registered.artifacts.clone(),
-                    raw_output: registered.raw_output.clone(),
-                })?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: capability.to_string(),
+                        status: workspace_status.clone(),
+                        created_at: Timestamp::now(),
+                        summary: summary.clone(),
+                        artifacts: registered.artifacts.clone(),
+                        raw_output: registered.raw_output.clone(),
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -276,6 +302,28 @@ impl ServiceHost {
                 message,
                 writes,
             }) => {
+                if code == "execution_succeeded_output_failed"
+                    || code == "execution_failed_output_failed"
+                {
+                    let status = if code == "execution_succeeded_output_failed" {
+                        OperationStatus::Success
+                    } else {
+                        OperationStatus::Failed
+                    };
+                    self.record_debug_artifact_registration_failure(
+                        session,
+                        workspace,
+                        &operation_id,
+                        capability,
+                        &audit_command,
+                        status.clone(),
+                        &ServiceError::Worker(message.clone()),
+                    )?;
+                    return Ok(
+                        json!({"session_id":session.session_id,"operation_id":operation_id,"operation_status":status,
+                        "artifact_refs":[],"output_error":message,"warnings":["execution result known; do not replay to recover output"]}),
+                    );
+                }
                 let registered = match register_worker_writes(workspace, &operation_id, &writes) {
                     Ok(registered) => registered,
                     Err(error) => {
@@ -285,21 +333,26 @@ impl ServiceHost {
                             &operation_id,
                             capability,
                             &audit_command,
+                            OperationStatus::Failed,
                             &error,
                         )?;
                         return Err(error);
                     }
                 };
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: capability.to_string(),
-                    status: OperationStatus::Failed,
-                    created_at: Timestamp::now(),
-                    summary: message.clone(),
-                    artifacts: registered.artifacts.clone(),
-                    raw_output: registered.raw_output.clone(),
-                })?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: capability.to_string(),
+                        status: OperationStatus::Failed,
+                        created_at: Timestamp::now(),
+                        summary: message.clone(),
+                        artifacts: registered.artifacts.clone(),
+                        raw_output: registered.raw_output.clone(),
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -330,16 +383,20 @@ impl ServiceHost {
             }
             Ok(other) => {
                 let message = format!("unexpected eval response: {other:?}");
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: capability.to_string(),
-                    status: OperationStatus::Failed,
-                    created_at: Timestamp::now(),
-                    summary: message.clone(),
-                    artifacts: Vec::new(),
-                    raw_output: None,
-                })?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: capability.to_string(),
+                        status: OperationStatus::Failed,
+                        created_at: Timestamp::now(),
+                        summary: message.clone(),
+                        artifacts: Vec::new(),
+                        raw_output: None,
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -374,7 +431,7 @@ impl ServiceHost {
                 let status = if was_canceled {
                     OperationStatus::Canceled
                 } else {
-                    OperationStatus::Failed
+                    OperationStatus::Unknown
                 };
                 let final_output_path = session
                     .artifact_dir
@@ -399,16 +456,20 @@ impl ServiceHost {
                     "debug.raw_output",
                     "recovered debug raw command output",
                 )?;
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: capability.to_string(),
-                    status: status.clone(),
-                    created_at: Timestamp::now(),
-                    summary: error.to_string(),
-                    artifacts: recovered.artifacts.clone(),
-                    raw_output: recovered.raw_output.clone(),
-                })?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: capability.to_string(),
+                        status: status.clone(),
+                        created_at: Timestamp::now(),
+                        summary: error.to_string(),
+                        artifacts: recovered.artifacts.clone(),
+                        raw_output: recovered.raw_output.clone(),
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -422,7 +483,7 @@ impl ServiceHost {
                 if !was_canceled {
                     self.finish_operation_in_memory(
                         &operation_id,
-                        ServiceOperationStatus::Failed,
+                        ServiceOperationStatus::Unknown,
                         error.to_string(),
                         recovered.artifacts.clone(),
                         recovered.raw_output.clone(),
@@ -442,52 +503,60 @@ impl ServiceHost {
         }
     }
 
-    fn record_debug_artifact_registration_failure(
+    pub(super) fn record_debug_artifact_registration_failure(
         &self,
         session: &ManagedSession,
         workspace: &Workspace,
         operation_id: &OperationRef,
         capability: &str,
         audit_command: &str,
+        execution_status: OperationStatus,
         error: &ServiceError,
     ) -> Result<(), ServiceError> {
-        let message = format!("worker artifact registration failed: {error}");
-        workspace.append_operation(&OperationRecord {
-            operation_id: operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: capability.to_string(),
-            status: OperationStatus::Failed,
-            created_at: Timestamp::now(),
-            summary: message.clone(),
-            artifacts: Vec::new(),
-            raw_output: None,
-        })?;
+        let message = format!(
+            "execution status {execution_status:?}; output registration failed: {error}; do not replay the operation"
+        );
+        self.finish_operation_in_memory(
+            operation_id,
+            execution_status.clone(),
+            message.clone(),
+            vec![],
+            None,
+        )?;
+        if let Some(op) = self
+            .lock_state()?
+            .operations
+            .get_mut(operation_id.id.as_str())
+        {
+            op.details.output_error = Some(message.clone());
+        }
+        self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: dbgatlas_model::OperationDetails {
+                    output_error: Some(message.clone()),
+                    ..Default::default()
+                },
+                operation_id: operation_id.clone(),
+                adapter_id: "service".into(),
+                capability: capability.into(),
+                status: execution_status.clone(),
+                created_at: Timestamp::now(),
+                summary: message,
+                artifacts: vec![],
+                raw_output: None,
+            },
+        )?;
         workspace.append_command_audit(&CommandAuditRecord {
             operation_id: operation_id.clone(),
             session_id: Some(session.session_id.clone()),
-            capability: capability.to_string(),
-            command: audit_command.to_string(),
+            capability: capability.into(),
+            command: audit_command.into(),
             created_at: Timestamp::now(),
-            status: OperationStatus::Failed,
-            artifacts: Vec::new(),
+            status: execution_status,
+            artifacts: vec![],
             raw_output: None,
         })?;
-        self.finish_operation_in_memory(
-            operation_id,
-            ServiceOperationStatus::Failed,
-            message.clone(),
-            Vec::new(),
-            None,
-        )?;
-        append_operation_diagnostic_log(
-            capability,
-            &session.session_id,
-            operation_id,
-            &OperationStatus::Failed,
-            0,
-            None,
-            Some(&message),
-        );
         Ok(())
     }
 
@@ -551,7 +620,21 @@ impl ServiceHost {
     ) -> Result<Value, ServiceError> {
         match worker_response {
             Ok(WorkerResponse::DebugMemory { mut result, writes }) => {
-                let registered = register_worker_writes(workspace, &operation_id, &writes)?;
+                let registered = match register_worker_writes(workspace, &operation_id, &writes) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.record_debug_artifact_registration_failure(
+                            session,
+                            workspace,
+                            &operation_id,
+                            "debug.read_memory",
+                            &audit_command,
+                            OperationStatus::Success,
+                            &error,
+                        )?;
+                        return Err(error);
+                    }
+                };
                 result.operation_id = Some(operation_id.clone());
                 result.memory = registered.memory.clone();
                 let was_canceled =
@@ -569,16 +652,20 @@ impl ServiceHost {
                 } else {
                     "debug.read_memory completed by worker"
                 };
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: "debug.read_memory".to_string(),
-                    status: status.clone(),
-                    created_at: Timestamp::now(),
-                    summary: summary.to_string(),
-                    artifacts: registered.artifacts.clone(),
-                    raw_output: registered.raw_output.clone(),
-                })?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: "debug.read_memory".to_string(),
+                        status: status.clone(),
+                        created_at: Timestamp::now(),
+                        summary: summary.to_string(),
+                        artifacts: registered.artifacts.clone(),
+                        raw_output: registered.raw_output.clone(),
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -622,17 +709,35 @@ impl ServiceHost {
                 message,
                 writes,
             }) => {
-                let registered = register_worker_writes(workspace, &operation_id, &writes)?;
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: "debug.read_memory".to_string(),
-                    status: OperationStatus::Failed,
-                    created_at: Timestamp::now(),
-                    summary: message.clone(),
-                    artifacts: registered.artifacts.clone(),
-                    raw_output: registered.raw_output.clone(),
-                })?;
+                let registered = match register_worker_writes(workspace, &operation_id, &writes) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.record_debug_artifact_registration_failure(
+                            session,
+                            workspace,
+                            &operation_id,
+                            "debug.read_memory",
+                            &audit_command,
+                            OperationStatus::Failed,
+                            &error,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: "debug.read_memory".to_string(),
+                        status: OperationStatus::Failed,
+                        created_at: Timestamp::now(),
+                        summary: message.clone(),
+                        artifacts: registered.artifacts.clone(),
+                        raw_output: registered.raw_output.clone(),
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -663,16 +768,20 @@ impl ServiceHost {
             }
             Ok(other) => {
                 let message = format!("unexpected read memory response: {other:?}");
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: "debug.read_memory".to_string(),
-                    status: OperationStatus::Failed,
-                    created_at: Timestamp::now(),
-                    summary: message.clone(),
-                    artifacts: Vec::new(),
-                    raw_output: None,
-                })?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: "debug.read_memory".to_string(),
+                        status: OperationStatus::Failed,
+                        created_at: Timestamp::now(),
+                        summary: message.clone(),
+                        artifacts: Vec::new(),
+                        raw_output: None,
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -707,18 +816,22 @@ impl ServiceHost {
                 let status = if was_canceled {
                     OperationStatus::Canceled
                 } else {
-                    OperationStatus::Failed
+                    OperationStatus::Unknown
                 };
-                workspace.append_operation(&OperationRecord {
-                    operation_id: operation_id.clone(),
-                    adapter_id: "service".to_string(),
-                    capability: "debug.read_memory".to_string(),
-                    status: status.clone(),
-                    created_at: Timestamp::now(),
-                    summary: error.to_string(),
-                    artifacts: Vec::new(),
-                    raw_output: None,
-                })?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".to_string(),
+                        capability: "debug.read_memory".to_string(),
+                        status: status.clone(),
+                        created_at: Timestamp::now(),
+                        summary: error.to_string(),
+                        artifacts: Vec::new(),
+                        raw_output: None,
+                    },
+                )?;
                 workspace.append_command_audit(&CommandAuditRecord {
                     operation_id: operation_id.clone(),
                     session_id: Some(session.session_id.clone()),
@@ -732,7 +845,7 @@ impl ServiceHost {
                 if !was_canceled {
                     self.finish_operation_in_memory(
                         &operation_id,
-                        ServiceOperationStatus::Failed,
+                        ServiceOperationStatus::Unknown,
                         error.to_string(),
                         Vec::new(),
                         None,
@@ -769,7 +882,13 @@ impl ServiceHost {
             session.state = DebugSessionState::Error;
             session.updated_at = Timestamp::now();
         }
-        Ok(())
+        drop(state);
+        self.set_session_terminal(
+            session_id,
+            true,
+            false,
+            Some("worker execution unavailable".into()),
+        )
     }
 
     pub(super) fn operation_status(
@@ -805,6 +924,7 @@ impl ServiceHost {
         }
         state.active_ttd_recording = Some(recording_id.clone());
         Ok(TtdActiveGuard {
+            committed: false,
             state: self.state.clone(),
             recording_id,
         })
@@ -826,32 +946,6 @@ impl ServiceHost {
             recording_id,
             committed: false,
         })
-    }
-
-    pub(super) fn resolve_ttd_exe(&self) -> Result<PathBuf, ServiceError> {
-        let ttd_dir = self
-            .capabilities
-            .ttd_dir
-            .clone()
-            .or_else(|| {
-                RuntimeConfig::default()
-                    .resolve_tool_paths()
-                    .ttd
-                    .map(|location| location.dir)
-            })
-            .ok_or_else(|| {
-                ServiceError::Rpc(
-                    "TTD.exe was not found in the automatic tool search path".to_string(),
-                )
-            })?;
-        let ttd_exe = ttd_dir.join("TTD.exe");
-        if !ttd_exe.is_file() {
-            return Err(ServiceError::Rpc(format!(
-                "TTD.exe was not found under {}",
-                ttd_dir.display()
-            )));
-        }
-        Ok(ttd_exe)
     }
 
     pub(super) fn finish_operation_in_memory(
@@ -881,16 +975,20 @@ impl ServiceHost {
         summary: impl Into<String>,
     ) -> Result<(), ServiceError> {
         let summary = summary.into();
-        workspace.append_operation(&OperationRecord {
-            operation_id: operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: "debug.session.create".to_string(),
-            status: OperationStatus::Failed,
-            created_at: Timestamp::now(),
-            summary: summary.clone(),
-            artifacts: Vec::new(),
-            raw_output: None,
-        })?;
+        self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: Default::default(),
+                operation_id: operation_id.clone(),
+                adapter_id: "service".to_string(),
+                capability: "debug.session.create".to_string(),
+                status: OperationStatus::Failed,
+                created_at: Timestamp::now(),
+                summary: summary.clone(),
+                artifacts: Vec::new(),
+                raw_output: None,
+            },
+        )?;
 
         let mut operation = ServiceOperation::failed(
             operation_id.clone(),
@@ -910,6 +1008,14 @@ impl ServiceHost {
         &self,
         session_id: &SessionRef,
     ) -> Result<ManagedSession, ServiceError> {
+        if self
+            .lock_state()?
+            .summaries
+            .get(session_id.id.as_str())
+            .is_some_and(|s| s.lifecycle != dbgatlas_model::SessionLifecycle::Active)
+        {
+            return Err(ServiceError::SessionAlreadyTerminal(session_id.to_string()));
+        }
         self.reusable_session_with_capability(session_id, "debug")
     }
 

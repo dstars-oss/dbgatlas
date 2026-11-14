@@ -4,10 +4,20 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 6;
+pub const WORKER_PROTOCOL_VERSION: u32 = 7;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerSnapshot {
+    pub target_process: Option<dbgatlas_model::ProcessInstance>,
+    pub target_state: dbgatlas_model::TargetState,
+    pub observed_at: Timestamp,
+    pub context: serde_json::Value,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerEnvelope<T> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<WorkerSnapshot>,
     pub version: u32,
     pub request_id: String,
     pub message: T,
@@ -16,6 +26,7 @@ pub struct WorkerEnvelope<T> {
 impl<T> WorkerEnvelope<T> {
     pub fn new(request_id: impl Into<String>, message: T) -> Self {
         Self {
+            snapshot: None,
             version: WORKER_PROTOCOL_VERSION,
             request_id: request_id.into(),
             message,
@@ -26,6 +37,13 @@ impl<T> WorkerEnvelope<T> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum WorkerRequest {
+    Recording {
+        session_id: SessionRef,
+        operation_id: OperationRef,
+        action: String,
+        params: serde_json::Value,
+        ttd_dir: Option<PathBuf>,
+    },
     StartDebugSession {
         session_id: SessionRef,
         target: DebugTarget,
@@ -66,6 +84,7 @@ pub enum WorkerRequest {
 impl WorkerRequest {
     pub fn method_name(&self) -> &'static str {
         match self {
+            WorkerRequest::Recording { .. } => "recording",
             WorkerRequest::StartDebugSession { .. } => "start_debug_session",
             WorkerRequest::EvalDebugCommand { .. } => "eval_debug_command",
             WorkerRequest::AddSymbols { .. } => "add_symbols",
@@ -78,6 +97,7 @@ impl WorkerRequest {
 
     pub fn session_id(&self) -> &SessionRef {
         match self {
+            WorkerRequest::Recording { session_id, .. } => session_id,
             WorkerRequest::StartDebugSession { session_id, .. }
             | WorkerRequest::EvalDebugCommand { session_id, .. }
             | WorkerRequest::AddSymbols { session_id, .. }
@@ -90,6 +110,7 @@ impl WorkerRequest {
 
     pub fn operation_id(&self) -> Option<&OperationRef> {
         match self {
+            WorkerRequest::Recording { operation_id, .. } => Some(operation_id),
             WorkerRequest::EvalDebugCommand { operation_id, .. }
             | WorkerRequest::AddSymbols { operation_id, .. }
             | WorkerRequest::ReadMemory { operation_id, .. }
@@ -104,6 +125,10 @@ impl WorkerRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum WorkerResponse {
+    Recording {
+        result: serde_json::Value,
+        writes: Vec<WorkerArtifactWrite>,
+    },
     Ok {
         summary: String,
         writes: Vec<WorkerArtifactWrite>,
@@ -148,6 +173,7 @@ impl WorkerResponse {
 
     pub fn writes(&self) -> &[WorkerArtifactWrite] {
         match self {
+            WorkerResponse::Recording { writes, .. } => writes,
             WorkerResponse::Ok { writes, .. }
             | WorkerResponse::DebugCommand { writes, .. }
             | WorkerResponse::DebugMemory { writes, .. }

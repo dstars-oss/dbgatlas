@@ -80,7 +80,7 @@ debug worker 会按解析顺序接收 DbgEng 候选目录，并在 `LoadLibrary`
 
 ## Recording Runtime
 
-recording runtime config 只保存本机工具和进程策略，不进入 analysis workspace manifest。ETW 当前由 service 内的 NativeEtwController 调用 C++ ETW adapter，不经过独立 recording worker；adapter 负责 ETW session、provider enable、实时消费、过滤和 flush。
+recording runtime config 只保存本机工具和进程策略，不进入 analysis workspace manifest。ETW 由专用 recording worker 内的 NativeEtwController 调用 C++ ETW adapter；adapter 负责 ETW session、provider enable、实时消费、过滤和 flush。控制服务负责准入、公共会话和最终产物登记。
 
 recording policy 的文档目标：
 
@@ -90,7 +90,7 @@ recording policy 的文档目标：
 - attach 不回填历史，只记录 `recording.start` 之后的事件。
 - WPR/WPAExport 不作为主采集链路，只作为未来诊断、比对或 fallback 方向。
 
-ETW native controller 使用 service 进程身份，当前不提供独立采集 worker 的请求级身份切换；采集目标的启动身份不能替代采集器身份。安装态 debug worker 默认使用 LocalSystem，并支持请求级 active interactive user override；`recording.ttd` 默认在 service 进程身份下启动 `TTD.exe`，但请求可用 `worker_identity: "active_interactive_user"` 将 TTD recorder 和 timeout stop 命令切到当前交互用户会话，用于用户级 attach 到已运行 PID。开发态 `service run` 使用当前用户；权限不足时返回实际错误或已记录的降级信息，不声称自动获得采集权限。
+ETW worker 保持 service 的执行身份语义，当前不提供采集 worker 的请求级身份切换；采集目标的启动身份不能替代采集器身份。安装态 debug worker 默认使用 LocalSystem，并支持请求级 active interactive user override。`recording.ttd` 的专用 worker 默认沿用 service 身份，通过 helper 管理 `TTD.exe`；请求可用 `worker_identity: "active_interactive_user"` 将 recorder 和 timeout stop 命令切到当前交互用户会话，用于用户级 attach 到已运行 PID。helper 的 Job 在正常完成时解除终止约束，异常时清理其自建进程并保留失败退出码。开发态 `service run` 使用当前用户；权限不足时返回实际错误或已记录的降级信息，不声称自动获得采集权限。
 
 ## 校验原则
 

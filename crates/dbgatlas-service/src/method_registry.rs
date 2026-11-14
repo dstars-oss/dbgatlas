@@ -98,9 +98,17 @@ fn registered_method_descriptors() -> Vec<Value> {
             }),
         ),
         mcp_tool(
+            "session.get",
+            "Get a session summary, including terminal sessions from this service instance.",
+            mcp_session_schema(),
+        ),
+        mcp_tool(
             "session.list",
-            "List current debug sessions known to this service process.",
-            json!({ "type": "object", "properties": {} }),
+            "List sessions; defaults to active debug sessions.",
+            json!({ "type": "object", "properties": {
+                "kind": {"type":"string", "enum":["debug","recording","all"], "default":"debug"},
+                "include_terminal":{"type":"boolean", "default":false}
+            } }),
         ),
         mcp_tool(
             "debug.session.create",

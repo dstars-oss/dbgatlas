@@ -12,7 +12,7 @@ Current implementation includes:
 
 - A `0.3.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
 - A Rust workspace split into `model`, `workspace`, `adapter`, `core`, `cli`, and a minimal `dbgeng` native wrapper.
-- Debug session lifecycle, per-session worker supervision, named-pipe worker transport, and a minimal real DbgEng loop.
+- Session/Operation model with terminal summaries, immutable execution context and versioned JSONL updates. Dedicated workers for DbgEng, ETW and TTD recording, using local named-pipe protocol v7.
 - Runtime configuration types in `dbgatlas-runtime`, kept separate from workspace manifests.
 - A visible analysis workspace layout with `artifacts/`, `analysis/`, and optional `inputs/`.
 - Controlled artifact helpers for debug and recording sessions.

@@ -1,96 +1,5 @@
 use super::*;
 
-pub(super) mod job {
-    #[cfg(windows)]
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    #[cfg(windows)]
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
-    };
-
-    #[cfg(windows)]
-    pub struct ManagedJob {
-        handle: HANDLE,
-    }
-
-    unsafe impl Send for ManagedJob {}
-    unsafe impl Sync for ManagedJob {}
-
-    #[cfg(windows)]
-    impl ManagedJob {
-        pub fn create_result(_name: &str) -> Result<Self, std::io::Error> {
-            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if handle.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let ok = unsafe {
-                SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    &mut info as *mut _ as *mut _,
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            };
-            if ok == 0 {
-                unsafe {
-                    CloseHandle(handle);
-                }
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(Self { handle })
-        }
-
-        pub fn assign_child_process(
-            &self,
-            process: &std::process::Child,
-        ) -> Result<(), std::io::Error> {
-            use std::os::windows::io::AsRawHandle;
-
-            if self.handle.is_null() {
-                return Ok(());
-            }
-            let ok =
-                unsafe { AssignProcessToJobObject(self.handle, process.as_raw_handle() as HANDLE) };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        }
-    }
-
-    #[cfg(windows)]
-    impl Drop for ManagedJob {
-        fn drop(&mut self) {
-            if !self.handle.is_null() {
-                unsafe {
-                    CloseHandle(self.handle);
-                }
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    pub struct ManagedJob;
-
-    #[cfg(not(windows))]
-    impl ManagedJob {
-        pub fn create_result(_name: &str) -> Result<Self, std::io::Error> {
-            Ok(Self)
-        }
-
-        pub fn assign_child_process(
-            &self,
-            _process: &std::process::Child,
-        ) -> Result<(), std::io::Error> {
-            Ok(())
-        }
-    }
-}
-
 #[cfg(windows)]
 pub(super) mod windows_active_user_process {
     use super::{ServiceError, WINDOWS_SERVICE_NAME};
@@ -606,5 +515,77 @@ pub(super) mod suspended_process {
         quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
         quoted.push('"');
         quoted
+    }
+}
+
+/// A helper-owned job establishes kernel ownership before any recorder is created.
+/// It is disarmed after a normal recorder exit so launched targets can outlive recording.
+#[cfg(windows)]
+pub(super) mod helper_job {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject,
+            },
+            Threading::GetCurrentProcess,
+        },
+    };
+    pub struct HelperJob(HANDLE, std::cell::Cell<bool>, std::cell::Cell<u32>);
+    impl HelperJob {
+        pub fn create() -> std::io::Result<Self> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let job = Self(handle, std::cell::Cell::new(false), std::cell::Cell::new(1));
+            job.configure(true)?;
+            if unsafe { AssignProcessToJobObject(handle, GetCurrentProcess()) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            job.1.set(true);
+            Ok(job)
+        }
+        fn configure(&self, terminate: bool) -> std::io::Result<()> {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            if terminate {
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            }
+            if unsafe {
+                SetInformationJobObject(
+                    self.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as _,
+                    std::mem::size_of_val(&info) as u32,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        pub fn preserve_targets(&self) -> std::io::Result<()> {
+            self.configure(false)?;
+            self.1.set(false);
+            Ok(())
+        }
+        pub fn failure_exit_code(&self, code: Option<i32>) {
+            self.2
+                .set(code.filter(|code| *code != 0).unwrap_or(1) as u32);
+        }
+    }
+    impl Drop for HelperJob {
+        fn drop(&mut self) {
+            unsafe {
+                // Closing a kill-on-close job can report exit code zero for this
+                // helper. Preserve failure evidence even when a partial trace exists.
+                if self.1.get() {
+                    TerminateJobObject(self.0, self.2.get());
+                }
+                CloseHandle(self.0);
+            }
+        }
     }
 }

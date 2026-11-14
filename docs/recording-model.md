@@ -4,7 +4,7 @@ DbgAtlas 的 recording 能力负责采集、过滤和归档低层运行时事件
 
 recording 是独立产品能力，不依赖 debug session。调试和外部分析 workflow 可以引用 recording artifact，但 recording lifecycle 本身不要求已有 debug session。
 
-本文描述当前采集实现与产物。迭代 2 只调整执行依赖和环境归属，不要求所有采集器变成同一种 worker；后续目标边界见 [进程与生命周期](worker-model.md)。
+本文描述采集行为与产物。迭代 2 将 ETW 和 TTD 录制迁入各会话专用 worker；进程契约见[进程与生命周期](worker-model.md)，实测范围见[迭代 2 验证记录](iteration-2-validation.md)。
 
 ## Goals
 
@@ -28,7 +28,7 @@ recording 是独立产品能力，不依赖 debug session。调试和外部分�
 - `recording.stop`：停止 recording，flush 过滤后的 ETL 和事件文件，并登记最终 artifact metadata。
 - `recording.status`：查询 recording 状态、target、开始时间、已登记 artifact 和最近 operation。
 - `recording.cancel`：经 finish_recording 停止并归档当前 ETW recording，将状态记为 canceled。
-- `recording.kill`：经同一终结路径停止并归档 ETW recording，将 recording 记为 killed、operation 记为 failed；当前没有可供强杀的独立 ETW worker，不保证能打断阻塞的 native stop。
+- `recording.kill`：通过独立控制通路强制清理专用 worker 及确认归属的资源，recording 记为 killed、operation 记为 failed；保留部分输出和完整性未知标记，不伪造正常 stop 的 CPU 汇总或完整 ETL。
 - `recording.ttd`：用 `TTD.exe` 执行一次 launch / attach / monitor 录制，返回 `recording_id`、`operation_id`、状态和 artifact refs；该入口是一次性同步操作，不复用 ETW lifecycle 的 `recording.start/status/stop`。
 
 service `0.3` 在 JSON-RPC 和 MCP 上暴露相同的 `recording.start/status/stop/cancel/kill` lifecycle；MCP input schema 与 RPC 参数一致，并继续返回相同的 recording、operation 和 artifact 引用。
@@ -57,8 +57,8 @@ Recording 采用 C++ ETW adapter + Rust safe wrapper 的边界：
 
 - C++ adapter 负责 ETW session、provider enable、实时事件消费、基础预处理、过滤和输出 flush。
 - Rust wrapper 和 service 负责参数校验、operation 状态、artifact 登记和 service/CLI/MCP 入口。
-- 当前 ServiceHost 持有 EtwController，ManagedRecording 持有 service 进程内的 EtwSessionControl；ETW 不是独立 worker。TTD 通过 TtdRecorderRunner 启动 recorder 子进程，身份切换时使用辅助进程。
-- 迭代 2 将本机执行依赖收拢到明确边界，保持现有采集行为；若后续增加独立采集进程，需单独验证生命周期、停止和产物完整性。
+- ServiceHost 管理 RemoteRecording 和统一并发额度；RecordingExecutor 在 worker 中持有 EtwController、native 会话和 TtdRecorderRunner。TTD 使用受登记的身份 helper 启动 recorder/stop 工具。
+- 新录制 session_id 与 recording_id 相同。控制端完成最终产物登记，正常停止保留目标；异常清理以执行侧实例所有权为依据。
 
 首版 provider 配置使用内置 presets，而不是要求用户手写 provider GUID、keyword 和 level。内置 presets 至少覆盖：
 
@@ -127,7 +127,7 @@ TTD launch target 可用 `{ "kind": "launch", "executable": <path>, "start_direc
 
 TTD attach target 使用 `{ "kind": "attach", "pid": <pid> }`，CLI 对应 `--attach <pid>`。安装态 service 默认在 service 进程身份下启动 `TTD.exe`；当目标进程位于当前交互用户会话且 LocalSystem 无法完成用户级 attach 时，调用方可以传 `worker_identity: "active_interactive_user"` 或 CLI `--worker-identity active_interactive_user`，让 recorder 和 timeout stop 命令都在当前交互用户身份下执行。`recording.json` 和 tool result 会记录实际请求的 `worker_identity`。
 
-`timeout_ms` 到达时，DbgAtlas 会先执行 `TTD.exe -stop <target> -wait 10`，再等待 recorder 进程退出和落盘；只有 recorder 在 stop 后仍不退出时才兜底终止 recorder 进程，并在 metadata warnings 中记录。
+`timeout_ms` 到达时，DbgAtlas 会先执行 `TTD.exe -stop <target>`，再等待 recorder 进程退出和落盘；只有 recorder 在 stop 后仍不退出时才兜底终止 recorder 进程；此时操作失败并标记 output_complete=false，保留可用部分产物。
 
 若 native ETW session 启动或停止失败，`trace.etl` 可以退化为文本 fallback artifact，用于保留失败原因和审计线索。此时 `recording.json` 必须显式记录 `trace.valid_etl=false` 和 `trace.fallback_reason`，读取方不能把该文件当作可由 ETW/WPA/DbgEng 打开的有效 ETL。真实 ETL artifact 应记录 `trace.valid_etl=true`。
 

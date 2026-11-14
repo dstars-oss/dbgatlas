@@ -36,6 +36,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -60,6 +64,41 @@ enum Commands {
         #[command(subcommand)]
         command: NativeCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    Get {
+        session_id: String,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+    },
+    List {
+        #[arg(long, default_value="debug", value_parser=["debug","recording","all"])]
+        kind: String,
+        #[arg(long)]
+        include_terminal: bool,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+    },
+}
+fn run_session(command: SessionCommand, as_json: bool) -> Result<()> {
+    let response = match command {
+        SessionCommand::Get {
+            session_id,
+            endpoint,
+        } => call_service(endpoint, "session.get", json!({"session_id":session_id}))?,
+        SessionCommand::List {
+            kind,
+            include_terminal,
+            endpoint,
+        } => call_service(
+            endpoint,
+            "session.list",
+            json!({"kind":kind,"include_terminal":include_terminal}),
+        )?,
+    };
+    print_rpc_response(response, as_json)
 }
 
 #[derive(Subcommand)]
@@ -351,6 +390,7 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Session { command } => run_session(command, cli.json),
         Commands::Workspace { command } => run_workspace(command, cli.json),
         Commands::Service { command } => run_service(command, cli.json),
         Commands::Rpc { command } => run_rpc(command),

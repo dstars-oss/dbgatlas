@@ -63,7 +63,7 @@ analysis-workspace/
 - 会话绑定调试上下文及目标，不能等同于 worker PID 或客户端连接。同一目标的历史可共享，但不同会话的线程、栈帧和回放位置独立。
 - 区分平台创建的后端、接入的既有后端及目标进程所有权；关闭、失联和服务退出按明确策略处置，不默认终止非平台所有的进程。
 - 迭代 2 调整环境/会话模型和进程架构，不能仅抽取 WorkerSupervisor 接口；最小必要的 API/schema 调整应同步调用方、测试和文档。原生 exec/长操作交互在迭代 3 深化，远端传输在迭代 5 实现。
-- 当前 DbgEng worker、service 内 ETW controller 和 TTD recorder 是不同执行路径；不得假定所有能力已有独立 worker。详细规格见 `docs/environment-session-model.md` 和 `docs/worker-model.md`。
+- DbgEng、ETW 和 TTD 录制均由会话专用主 worker 承载；TTD recorder 和清理 helper 是辅助进程。活动期间不得替换或复用主 worker。详细规格见 `docs/environment-session-model.md` 和 `docs/worker-model.md`。
 
 ## 开发语言
 

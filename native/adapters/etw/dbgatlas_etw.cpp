@@ -2459,7 +2459,11 @@ void restore_profile_interval(
     }
     uint32_t current_interval_us = 0;
     ULONG status = query_profile_interval_us(current_interval_us);
-    if (status != ERROR_SUCCESS || current_interval_us != cpu_status.applied_interval_us) {
+    if (status != ERROR_SUCCESS) {
+        cpu_status.warning_count += 1;
+        return; // Unconfirmed restoration must not be reported as an intentional skip.
+    }
+    if (current_interval_us != cpu_status.applied_interval_us) {
         cpu_status.warning_count += 1;
         if (out != nullptr && result_has_field(
                                   caller_size,
@@ -2577,10 +2581,6 @@ int32_t da_etw_write_minimal_file_trace(
         auto trace = make_trace_properties(session_name_utf8, trace_path_utf8);
         TRACEHANDLE handle = 0;
         ULONG status = StartTraceA(&handle, session_name_utf8, trace.properties);
-        if (status == ERROR_ALREADY_EXISTS) {
-            ControlTraceA(0, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
-            status = StartTraceA(&handle, session_name_utf8, trace.properties);
-        }
         if (status != ERROR_SUCCESS) {
             return fail_win32("StartTraceA", status);
         }
@@ -2682,10 +2682,6 @@ int32_t da_etw_session_start_file_trace_ex(
 
         TRACEHANDLE handle = 0;
         ULONG status = StartTraceA(&handle, session_name_utf8, trace.properties);
-        if (status == ERROR_ALREADY_EXISTS) {
-            ControlTraceA(0, session_name_utf8, trace.properties, EVENT_TRACE_CONTROL_STOP);
-            status = StartTraceA(&handle, session_name_utf8, trace.properties);
-        }
         if (status != ERROR_SUCCESS) {
             return fail_win32("StartTraceA", status);
         }
@@ -3068,6 +3064,54 @@ int32_t da_etw_filter_trace_file(
             return fail_hresult("ITraceRelogger::ProcessTrace", hr);
         }
         return DA_ETW_OK;
+#endif
+    });
+}
+
+DA_ETW_EXPORT int32_t da_etw_profile_interval(uint32_t* interval_us) {
+    return guard([&]() -> int32_t {
+        if (!interval_us) return fail(DA_ETW_ERR_INVALID_ARGUMENT, "interval output is null");
+#ifdef _WIN32
+        const ULONG status = query_profile_interval_us(*interval_us);
+        return status == ERROR_SUCCESS ? DA_ETW_OK : fail_win32("query profile interval", status);
+#else
+        return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW requires Windows");
+#endif
+    });
+}
+
+DA_ETW_EXPORT int32_t da_etw_recover_session(const char* name, const char* expected_path, uint32_t previous, uint32_t applied) {
+    return guard([&]() -> int32_t {
+        if (!name || !expected_path || !*name || !*expected_path)
+            return fail(DA_ETW_ERR_INVALID_ARGUMENT, "recovery requires an owned session name and trace path");
+#ifdef _WIN32
+        auto trace = make_trace_properties(name, expected_path);
+        const auto capacity = trace.properties->Wnode.BufferSize;
+        ULONG status = ControlTraceA(0, name, trace.properties, EVENT_TRACE_CONTROL_QUERY);
+        if (status != ERROR_WMI_INSTANCE_NOT_FOUND) {
+            if (status != ERROR_SUCCESS) return fail_win32("query recovery session", status);
+            const auto offset = trace.properties->LogFileNameOffset;
+            if (offset >= capacity) return fail(DA_ETW_ERR_INVALID_ARGUMENT, "invalid ETW trace path offset");
+            const char* actual = reinterpret_cast<const char*>(trace.storage.get() + offset);
+            const size_t remaining = capacity - offset;
+            if (!std::memchr(actual, 0, remaining) || _stricmp(actual, expected_path) != 0)
+                return fail(DA_ETW_ERR_INVALID_ARGUMENT, "ETW recovery ownership mismatch");
+            status = ControlTraceA(trace.properties->Wnode.HistoricalContext, name, trace.properties, EVENT_TRACE_CONTROL_STOP);
+            if (status != ERROR_SUCCESS && status != ERROR_WMI_INSTANCE_NOT_FOUND)
+                return fail_win32("stop owned recovery session", status);
+        }
+        if (previous && applied) {
+            uint32_t current = 0;
+            status = query_profile_interval_us(current);
+            if (status != ERROR_SUCCESS) return fail_win32("query recovery interval", status);
+            if (current == applied) {
+                status = set_profile_interval_us(previous);
+                if (status != ERROR_SUCCESS) return fail_win32("restore recovery interval", status);
+            }
+        }
+        return DA_ETW_OK;
+#else
+        return fail(DA_ETW_ERR_NOT_IMPLEMENTED, "ETW requires Windows");
 #endif
     });
 }

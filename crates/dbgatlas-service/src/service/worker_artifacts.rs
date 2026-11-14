@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Default)]
 pub(super) struct RegisteredWorkerWrites {
     pub(super) artifacts: Vec<ArtifactRef>,
     pub(super) raw_output: Option<ArtifactRef>,

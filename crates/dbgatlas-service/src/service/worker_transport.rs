@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) struct WorkerTransport {
+    pub(super) snapshot: Arc<Mutex<Option<dbgatlas_worker_protocol::WorkerSnapshot>>>,
     pub(super) file: std::fs::File,
 }
 
@@ -163,6 +164,13 @@ impl WorkerTransport {
             None,
             started.elapsed(),
         );
+        if let Some(snapshot) = response.snapshot {
+            *self
+                .snapshot
+                .lock()
+                .map_err(|_| ServiceError::Worker("worker snapshot lock poisoned".into()))? =
+                Some(snapshot);
+        }
         Ok(response.message)
     }
 }
@@ -446,7 +454,10 @@ pub(super) fn connect_worker_pipe_server(
     let handle = server.handle;
     std::mem::forget(server);
     let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
-    Ok(WorkerTransport { file })
+    Ok(WorkerTransport {
+        file,
+        snapshot: Arc::new(Mutex::new(None)),
+    })
 }
 
 #[cfg(not(windows))]

@@ -13,6 +13,8 @@ pub struct NativeVersion {
 pub enum DbgEngError {
     #[error("native adapter is only available on Windows")]
     UnsupportedPlatform,
+    #[error("execution succeeded; output unavailable: {0}; do not replay")]
+    OutputAfterExecution(String),
     #[error("native call failed with status {status}: {message}")]
     Native { status: i32, message: String },
     #[error("native returned a null session handle")]
@@ -61,7 +63,68 @@ pub struct DbgEngSession {
     _private: (),
 }
 
+#[derive(Clone, Debug)]
+pub struct EngineState {
+    pub target_state: u32,
+    pub process_id: u32,
+    pub thread_id: Option<u32>,
+    pub frame_index: Option<u32>,
+}
+
 impl DbgEngSession {
+    /// Commit a launch only after the execution owner has durably registered its target.
+    pub fn commit_launch(&self) -> Result<(), DbgEngError> {
+        #[cfg(windows)]
+        {
+            status_to_result(unsafe {
+                dbgatlas_dbgeng_sys::da_dbgeng_session_commit_launch(self.handle)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(DbgEngError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn state(&self) -> Result<(u32, u32), DbgEngError> {
+        let s = self.engine_state()?;
+        Ok((s.target_state, s.process_id))
+    }
+    #[cfg(windows)]
+    pub fn engine_state(&self) -> Result<EngineState, DbgEngError> {
+        let mut state = dbgatlas_dbgeng_sys::DA_DbgEngState {
+            struct_size: size_of::<dbgatlas_dbgeng_sys::DA_DbgEngState>() as u32,
+            ..Default::default()
+        };
+        status_to_result(unsafe {
+            dbgatlas_dbgeng_sys::da_dbgeng_session_state(self.handle, &mut state)
+        })?;
+        Ok(EngineState {
+            target_state: state.target_state,
+            process_id: state.process_id,
+            thread_id: (state.thread_id != u32::MAX).then_some(state.thread_id),
+            frame_index: (state.frame_index != u32::MAX).then_some(state.frame_index),
+        })
+    }
+    #[cfg(not(windows))]
+    pub fn engine_state(&self) -> Result<EngineState, DbgEngError> {
+        Err(DbgEngError::UnsupportedPlatform)
+    }
+
+    #[cfg(windows)]
+    pub fn close(&mut self) -> Result<(), DbgEngError> {
+        if self.handle.is_null() {
+            return Ok(());
+        }
+        status_to_result(unsafe { dbgatlas_dbgeng_sys::da_dbgeng_session_detach(self.handle) })?;
+        status_to_result(unsafe { dbgatlas_dbgeng_sys::da_dbgeng_session_close(self.handle) })?;
+        self.handle = std::ptr::null_mut();
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    pub fn close(&mut self) -> Result<(), DbgEngError> {
+        Err(DbgEngError::UnsupportedPlatform)
+    }
     #[cfg(windows)]
     pub fn open_file(
         path: impl AsRef<Path>,
@@ -335,24 +398,28 @@ impl DbgEngSession {
             Ok(preview) => preview,
             Err(error) => {
                 let _ = std::fs::remove_file(&part_path);
-                return Err(error);
+                return Err(DbgEngError::OutputAfterExecution(error.to_string()));
             }
         };
-        let actual_len = std::fs::metadata(&part_path)?.len();
+        let actual_len = std::fs::metadata(&part_path)
+            .map_err(|e| DbgEngError::OutputAfterExecution(e.to_string()))?
+            .len();
         if actual_len != result.full_byte_len {
             let _ = std::fs::remove_file(&part_path);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "native artifact length mismatch: reported {}, actual {actual_len}",
-                    result.full_byte_len
-                ),
-            )
-            .into());
+            return Err(DbgEngError::OutputAfterExecution(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "native artifact length mismatch: reported {}, actual {actual_len}",
+                        result.full_byte_len
+                    ),
+                )
+                .to_string(),
+            ));
         }
         if let Err(error) = std::fs::rename(&part_path, output_path) {
             let _ = std::fs::remove_file(&part_path);
-            return Err(error.into());
+            return Err(DbgEngError::OutputAfterExecution(error.to_string()));
         }
         Ok(ArtifactCommandOutput {
             preview,
@@ -434,24 +501,28 @@ impl DbgEngSession {
             Ok(preview) => preview,
             Err(error) => {
                 let _ = std::fs::remove_file(&part_path);
-                return Err(error);
+                return Err(DbgEngError::OutputAfterExecution(error.to_string()));
             }
         };
-        let actual_len = std::fs::metadata(&part_path)?.len();
+        let actual_len = std::fs::metadata(&part_path)
+            .map_err(|e| DbgEngError::OutputAfterExecution(e.to_string()))?
+            .len();
         if actual_len != result.full_byte_len {
             let _ = std::fs::remove_file(&part_path);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "native artifact length mismatch: reported {}, actual {actual_len}",
-                    result.full_byte_len
-                ),
-            )
-            .into());
+            return Err(DbgEngError::OutputAfterExecution(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "native artifact length mismatch: reported {}, actual {actual_len}",
+                        result.full_byte_len
+                    ),
+                )
+                .to_string(),
+            ));
         }
         if let Err(error) = std::fs::rename(&part_path, output_path) {
             let _ = std::fs::remove_file(&part_path);
-            return Err(error.into());
+            return Err(DbgEngError::OutputAfterExecution(error.to_string()));
         }
         Ok(ArtifactCommandOutput {
             preview,

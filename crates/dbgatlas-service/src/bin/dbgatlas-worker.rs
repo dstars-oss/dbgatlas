@@ -26,11 +26,21 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut special = std::env::args_os().skip(1);
+    if special.next().as_deref() == Some(std::ffi::OsStr::new("--cleanup-recording")) {
+        let directory = special
+            .next()
+            .ok_or("missing recording cleanup directory")?;
+        dbgatlas_service::recover_recording_resources(Path::new(&directory))?;
+        return Ok(());
+    }
     let args = WorkerArgs::parse()?;
     let mut pipe = open_pipe(&args.pipe)?;
     let lifetime_pipe = open_pipe(&args.lifetime_pipe)?;
-    let _watchdog = start_lifetime_watchdog(lifetime_pipe);
+    let ownership_file = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let _watchdog = start_lifetime_watchdog(lifetime_pipe, ownership_file.clone());
     let mut state = WorkerState::new(args.session_id.clone(), args.dbgeng_dirs);
+    state.ownership_file = ownership_file;
     loop {
         // worker 与 service 之间只走一行一个 JSON envelope 的 pipe 协议。
         // 运行诊断由 service 侧记录；worker 只负责执行 native capability 并回传 artifact 写入声明。
@@ -41,8 +51,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WorkerRequest::CloseSession { .. } | WorkerRequest::KillSession { .. }
         );
         let response = state.handle_request(request.message);
-        let should_exit = is_terminal_request;
-        let response = WorkerEnvelope::new(request.request_id, response);
+        let should_exit = is_terminal_request && matches!(response, WorkerResponse::Ok { .. });
+        let mut response = WorkerEnvelope::new(request.request_id, response);
+        response.snapshot = state.snapshot();
         let line = encode_jsonl(&response)?;
         pipe.write_all(line.as_bytes())?;
         pipe.flush()?;
@@ -99,14 +110,24 @@ impl WorkerArgs {
     }
 }
 
-fn start_lifetime_watchdog(mut lifetime_pipe: std::fs::File) -> thread::JoinHandle<()> {
+fn start_lifetime_watchdog(
+    mut lifetime_pipe: std::fs::File,
+    ownership_file: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         loop {
             match read_lifetime_line_with_timeout(&mut lifetime_pipe, LIFETIME_WATCHDOG_TIMEOUT) {
                 Ok(line) if line.trim_end() == "tick" => {}
                 Ok(_) => {}
                 Err(_) => {
-                    terminate_descendant_processes(std::process::id());
+                    if let Ok(path) = ownership_file.lock() {
+                        if let Some(path) = path.as_ref() {
+                            let _ = dbgatlas_service::process_identity::cleanup(path);
+                            if let Some(directory) = path.parent() {
+                                let _ = dbgatlas_service::recover_recording_resources(directory);
+                            }
+                        }
+                    }
                     std::process::exit(0);
                 }
             }
@@ -179,68 +200,36 @@ fn read_lifetime_line_with_timeout(
     read_jsonl_line(reader)
 }
 
-#[cfg(windows)]
-fn terminate_descendant_processes(root_pid: u32) {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-
-    for _ in 0..3 {
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return;
-        }
-        let mut processes = Vec::new();
-        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
-        while ok != 0 {
-            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
-            ok = unsafe { Process32NextW(snapshot, &mut entry) };
-        }
-        unsafe {
-            CloseHandle(snapshot);
-        }
-
-        let mut descendants = Vec::new();
-        let mut frontier = vec![root_pid];
-        while let Some(parent_pid) = frontier.pop() {
-            for (pid, ppid) in &processes {
-                if *ppid == parent_pid && *pid != root_pid && !descendants.contains(pid) {
-                    descendants.push(*pid);
-                    frontier.push(*pid);
-                }
-            }
-        }
-
-        if descendants.is_empty() {
-            return;
-        }
-
-        for pid in descendants.into_iter().rev() {
-            let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-            if handle.is_null() {
-                continue;
-            }
-            unsafe {
-                TerminateProcess(handle, 1);
-                CloseHandle(handle);
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(not(windows))]
-fn terminate_descendant_processes(_root_pid: u32) {}
-
 struct WorkerState {
+    recording: Option<dbgatlas_service::RecordingExecutor>,
+    ownership_file: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    file_target: bool,
+    normal_exit: bool,
     expected_session_id: String,
     dbgeng_dirs: Vec<PathBuf>,
     session: Option<DbgEngSession>,
+}
+
+impl Drop for WorkerState {
+    fn drop(&mut self) {
+        if self.normal_exit {
+            return;
+        }
+        // Detach before waiting for owned targets to exit: a pending debug event can otherwise hold termination.
+        self.session.take();
+        if let Ok(path) = self.ownership_file.lock() {
+            if let Some(path) = path.as_ref() {
+                if let Err(error) = dbgatlas_service::process_identity::cleanup(path) {
+                    eprintln!("abnormal worker cleanup: {error}");
+                }
+                if let Some(directory) = path.parent() {
+                    if let Err(error) = dbgatlas_service::recover_recording_resources(directory) {
+                        eprintln!("abnormal recording cleanup: {error}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl WorkerState {
@@ -254,6 +243,10 @@ impl WorkerState {
                 .collect();
         }
         Self {
+            recording: None,
+            ownership_file: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            file_target: false,
+            normal_exit: false,
             expected_session_id,
             dbgeng_dirs,
             session: None,
@@ -273,6 +266,35 @@ impl WorkerState {
         }
 
         match request {
+            WorkerRequest::Recording {
+                session_id,
+                operation_id,
+                action,
+                params,
+                ttd_dir,
+            } => {
+                if self.session.is_some() {
+                    return WorkerResponse::failed(
+                        "backend_mismatch",
+                        "worker already bound to debug",
+                    );
+                }
+                if let Some(root) = params
+                    .get("project_root")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    *self.ownership_file.lock().unwrap() = Some(
+                        PathBuf::from(root)
+                            .join("dbgatlas/artifacts/recordings")
+                            .join(session_id.id.as_str())
+                            .join("owned-processes.json"),
+                    );
+                }
+                let executor = self.recording.get_or_insert_with(|| {
+                    dbgatlas_service::RecordingExecutor::new(session_id, ttd_dir)
+                });
+                executor.execute(operation_id, &action, params)
+            }
             WorkerRequest::StartDebugSession {
                 target,
                 artifact_dir,
@@ -289,7 +311,7 @@ impl WorkerState {
                     .join(format!("{}.txt", operation_id.id.as_str()));
                 let captured = session
                     .execute_to_artifact(&command, &raw_path, DEFAULT_INLINE_RESULT_BYTE_LIMIT)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    .map_err(std::io::Error::other)?;
                 write_captured_command_response(
                     session_id,
                     operation_id,
@@ -298,6 +320,11 @@ impl WorkerState {
                     &artifact_dir,
                     "debug raw command output",
                 )
+                .map_err(|e| {
+                    std::io::Error::other(dbgatlas_dbgeng::DbgEngError::OutputAfterExecution(
+                        e.to_string(),
+                    ))
+                })
             }),
             WorkerRequest::AddSymbols {
                 session_id,
@@ -316,7 +343,7 @@ impl WorkerState {
                         &raw_path,
                         DEFAULT_INLINE_RESULT_BYTE_LIMIT,
                     )
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    .map_err(std::io::Error::other)?;
                 let command = if reload {
                     format!("add_symbols {symbol_path} --reload")
                 } else {
@@ -330,6 +357,11 @@ impl WorkerState {
                     &artifact_dir,
                     "debug add_symbols output",
                 )
+                .map_err(|e| {
+                    std::io::Error::other(dbgatlas_dbgeng::DbgEngError::OutputAfterExecution(
+                        e.to_string(),
+                    ))
+                })
             }),
             WorkerRequest::ReadMemory {
                 session_id,
@@ -346,7 +378,7 @@ impl WorkerState {
                 })?;
                 let bytes = session
                     .read_memory(address, length)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    .map_err(std::io::Error::other)?;
                 write_memory_response(
                     session_id,
                     operation_id,
@@ -357,7 +389,25 @@ impl WorkerState {
                 )
             }),
             WorkerRequest::CloseSession { .. } => {
+                if let Ok(path) = self.ownership_file.lock() {
+                    if let Some(path) = path.as_ref() {
+                        if let Err(error) =
+                            dbgatlas_service::process_identity::release_targets(path)
+                        {
+                            return WorkerResponse::failed(
+                                "target_release_failed",
+                                error.to_string(),
+                            );
+                        }
+                    }
+                }
+                if let Some(session) = self.session.as_mut() {
+                    if let Err(error) = session.close() {
+                        return WorkerResponse::failed("detach_failed", error.to_string());
+                    }
+                }
                 self.session = None;
+                self.normal_exit = true;
                 WorkerResponse::ok("debug session closed")
             }
             WorkerRequest::KillSession { .. } => {
@@ -372,7 +422,54 @@ impl WorkerState {
         }
     }
 
+    fn snapshot(&self) -> Option<dbgatlas_worker_protocol::WorkerSnapshot> {
+        let session = self.session.as_ref()?;
+        let engine = session.engine_state().ok()?;
+        let (status, pid) = (engine.target_state, engine.process_id);
+        if status == 3 {
+            if let Ok(path) = self.ownership_file.lock() {
+                if let Some(path) = path.as_ref() {
+                    let _ = dbgatlas_service::process_identity::release_targets(path);
+                }
+            }
+        }
+        use dbgatlas_model::TargetState;
+        Some(dbgatlas_worker_protocol::WorkerSnapshot {
+            target_process: if self.file_target || pid == 0 {
+                None
+            } else {
+                dbgatlas_service::process_identity::inspect(pid).ok()
+            },
+            target_state: if self.file_target {
+                TargetState::Offline
+            } else {
+                match status {
+                    1 => TargetState::Running,
+                    2 => TargetState::Stopped,
+                    _ => TargetState::Unknown,
+                }
+            },
+            observed_at: Timestamp::now(),
+            context: serde_json::json!({"thread_id":engine.thread_id,"frame_index":engine.frame_index}),
+        })
+    }
+
     fn start_session(&mut self, target: DebugTarget, artifact_dir: &Path) -> WorkerResponse {
+        if self.session.is_some() || self.recording.is_some() {
+            return WorkerResponse::failed("already_open", "worker is already bound");
+        }
+        self.file_target = matches!(target, DebugTarget::File { .. });
+        let created = matches!(target, DebugTarget::Launch { .. });
+        let ownership_path = artifact_dir.join("owned-processes.json");
+        *self.ownership_file.lock().unwrap() = Some(ownership_path.clone());
+        if created {
+            if let Err(error) = dbgatlas_worker_protocol::write_atomic_bytes(
+                &artifact_dir.join("unconfirmed-launch.json"),
+                b"{\"ownership\":\"unconfirmed\"}",
+            ) {
+                return WorkerResponse::failed("launch_intent_failed", error.to_string());
+            }
+        }
         let opened = match target {
             DebugTarget::File { path } => {
                 DbgEngSession::open_file_with_runtimes(path, &self.dbgeng_dirs)
@@ -387,6 +484,33 @@ impl WorkerState {
 
         match opened {
             Ok(session) => {
+                if created {
+                    let result = session
+                        .state()
+                        .map_err(|e| e.to_string())
+                        .and_then(|(_, pid)| {
+                            dbgatlas_service::process_identity::register(
+                                &ownership_path,
+                                pid,
+                                "target",
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                    if let Err(error) = result {
+                        return WorkerResponse::failed("ownership_registration_failed", error);
+                    }
+                    if let Err(error) =
+                        std::fs::remove_file(artifact_dir.join("unconfirmed-launch.json"))
+                    {
+                        return WorkerResponse::failed(
+                            "ownership_commit_failed",
+                            error.to_string(),
+                        );
+                    }
+                    if let Err(error) = session.commit_launch() {
+                        return WorkerResponse::failed("launch_commit_failed", error.to_string());
+                    }
+                }
                 self.session = Some(session);
                 let writes = write_session_event(artifact_dir, &self.expected_session_id, "ready")
                     .map(|write| vec![write])
@@ -406,7 +530,22 @@ impl WorkerState {
         };
         match f(session) {
             Ok(response) => response,
-            Err(error) => WorkerResponse::failed("operation_failed", error.to_string()),
+            Err(error) => {
+                let code = match error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<dbgatlas_dbgeng::DbgEngError>())
+                {
+                    Some(dbgatlas_dbgeng::DbgEngError::OutputAfterExecution(_))
+                    | Some(dbgatlas_dbgeng::DbgEngError::Native { status: 501, .. }) => {
+                        "execution_succeeded_output_failed"
+                    }
+                    Some(dbgatlas_dbgeng::DbgEngError::Native { status: 502, .. }) => {
+                        "execution_failed_output_failed"
+                    }
+                    _ => "operation_failed",
+                };
+                WorkerResponse::failed(code, error.to_string())
+            }
         }
     }
 }

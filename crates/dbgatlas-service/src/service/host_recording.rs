@@ -1,675 +1,638 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct RemoteRecording {
+    pub worker: WorkerHandle,
+    pub session_id: SessionRef,
+    pub workspace_root: PathBuf,
+    pub artifact_dir: PathBuf,
+    pub request_lock: Arc<Mutex<()>>,
+    pub result: Value,
+    pub terminal: bool,
+    pub cpu: bool,
+    pub ttd: bool,
+}
+
 impl ServiceHost {
     pub(super) fn recording_start(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        let params: RecordingStartParams = parse_params(params)?;
-        let request = StartRecording {
-            target: params.target,
-            presets: params.presets,
-            cpu_sampling: params.cpu_sampling,
-        }
-        .validate()?;
+        self.open_recording(params, false)
+    }
+    pub(super) fn recording_ttd(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        self.open_recording(params, true)
+    }
+    fn open_recording(&self, params: Option<Value>, ttd: bool) -> Result<Value, ServiceError> {
+        let params = params.unwrap_or_else(|| json!({}));
+        // Validate before accepting or starting a worker.
+        let (project_root, target, cpu) = if ttd {
+            let p: RecordingTtdParams = serde_json::from_value(params.clone())?;
+            RecordTtd {
+                target: p.target.clone(),
+                timeout_ms: p.timeout_ms,
+                options: p.options,
+            }
+            .validate()?;
+            (p.project_root, serde_json::to_value(p.target)?, false)
+        } else {
+            let p: RecordingStartParams = serde_json::from_value(params.clone())?;
+            let r = StartRecording {
+                target: p.target,
+                presets: p.presets,
+                cpu_sampling: p.cpu_sampling,
+            }
+            .validate()?;
+            (
+                p.project_root,
+                serde_json::to_value(r.target)?,
+                r.cpu_sampling.is_some(),
+            )
+        };
         let recording_id = next_recording_ref();
-        let mut cpu_active_guard = if request.cpu_sampling.is_some() {
+        let session_id = SessionRef::new(recording_id.id.clone());
+        let operation_id = next_operation_ref();
+        let mut cpu_guard = if cpu {
             Some(self.start_cpu_recording(recording_id.clone())?)
         } else {
             None
         };
-        let operation_id = next_operation_ref();
-        let workspace = ensure_project_workspace(&params.project_root)?;
+        let ttd_guard = if ttd {
+            Some(self.start_ttd_recording(recording_id.clone())?)
+        } else {
+            None
+        };
+        let workspace = ensure_project_workspace(&project_root)?;
         let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
-        let now = Timestamp::now();
-        let trace_path = artifact_dir.join("trace.etl");
-        let trace_session_name = etw_session_name(&recording_id);
-        let trace_preset_flags = etw_preset_flags(&request.presets);
-        let trace_start = self.etw_controller.start(
-            &trace_session_name,
-            &trace_path,
-            trace_preset_flags,
-            request.cpu_sampling,
-        );
-        let (mut trace_session, trace_start_error) = match trace_start {
-            Ok(session) => (Some(session), None),
-            Err(error) if request.cpu_sampling.is_some() => {
-                return Err(ServiceError::Rpc(format!(
-                    "CPU sampling ETW session failed to start: {error}"
-                )));
-            }
-            Err(error) => (None, Some(error.to_string())),
+        let method = if ttd {
+            "recording.ttd"
+        } else {
+            "recording.start"
         };
-        let (trace_stack_status, trace_stack_status_error) = match trace_session.as_ref() {
-            Some(session) => match session.stack_trace_status() {
-                Ok(status) => (Some(status), None),
-                Err(error) => (None, Some(error.to_string())),
-            },
-            None => (None, None),
-        };
-        let (cpu_sampling_status, cpu_sampling_status_error) = match trace_session.as_ref() {
-            Some(session) if request.cpu_sampling.is_some() => {
-                match session.cpu_sampling_status() {
-                    Ok(status) if status.enabled && status.stack_enabled => (Some(status), None),
-                    Ok(status) => {
-                        if let Some(session) = trace_session.take() {
-                            let _ = session.stop();
-                        }
-                        return Err(ServiceError::Rpc(format!(
-                            "CPU sampling ETW session did not enable SampledProfile StackWalk: {status:?}"
-                        )));
-                    }
-                    Err(error) => {
-                        if let Some(session) = trace_session.take() {
-                            let _ = session.stop();
-                        }
-                        return Err(ServiceError::Rpc(format!(
-                            "CPU sampling status query failed: {error}"
-                        )));
-                    }
-                }
-            }
-            _ => (None, None),
-        };
-        let prepared_target = match prepare_recording_target(&request.target) {
-            Ok(prepared) => prepared,
+        self.open_session_record(
+            &session_id,
+            &workspace,
+            dbgatlas_model::SessionKind::Recording,
+            target,
+            &operation_id,
+            method,
+            params.clone(),
+        )?;
+        let worker = match self.supervisor.create_worker(WorkerCreateRequest {
+            session_id: session_id.clone(),
+            project_root,
+            internal_workspace_root: workspace.root().to_path_buf(),
+            artifact_dir: artifact_dir.clone(),
+            startup_timeout_ms: DEFAULT_DEBUG_SESSION_STARTUP_TIMEOUT_MS,
+            dbgeng_dirs: self.capabilities.dbgeng_dirs.clone(),
+            identity: None,
+        }) {
+            Ok(worker) => worker,
             Err(error) => {
-                if let Some(session) = trace_session {
-                    let _ = session.stop();
-                }
+                self.set_session_terminal(&session_id, true, true, Some(error.to_string()))?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".into(),
+                        capability: method.into(),
+                        status: OperationStatus::Failed,
+                        created_at: Timestamp::now(),
+                        summary: error.to_string(),
+                        artifacts: vec![],
+                        raw_output: None,
+                    },
+                )?;
                 return Err(error);
             }
         };
-        let root_pid = Some(prepared_target.root_pid());
-        let trace_consumer_error = match trace_session.as_mut() {
-            Some(session) => match session.start_realtime_consumer(
-                artifact_dir.join("events"),
-                trace_preset_flags,
-                root_pid,
-            ) {
-                Ok(()) => None,
-                Err(error) => Some(error.to_string()),
-            },
-            None => None,
+        let remote = RemoteRecording {
+            worker,
+            session_id: session_id.clone(),
+            workspace_root: workspace.root().into(),
+            artifact_dir,
+            request_lock: Arc::new(Mutex::new(())),
+            result: json!({"session_id":session_id,"recording_id":session_id,"state":"opening","operation_id":operation_id,"artifact_refs":[]}),
+            terminal: false,
+            cpu,
+            ttd,
         };
-        if request.cpu_sampling.is_some() {
-            if let Some(error) = trace_consumer_error.as_deref() {
-                if let Some(session) = trace_session.take() {
-                    let _ = session.stop();
-                }
-                return Err(ServiceError::Rpc(format!(
-                    "CPU sampling realtime consumer failed to start: {error}"
-                )));
-            }
+        let _request_guard = remote
+            .request_lock
+            .lock()
+            .map_err(|_| ServiceError::SessionBusy(session_id.to_string()))?;
+        self.lock_state()?
+            .remote_recordings
+            .insert(session_id.to_string(), remote.clone());
+        // Keep global reservations until cleanup is confirmed, including failed starts.
+        if let Some(guard) = cpu_guard.as_mut() {
+            guard.commit();
         }
-        if let Err(error) = prepared_target.resume() {
-            if let Some(session) = trace_session {
-                let _ = session.stop();
+        if let Some(mut guard) = ttd_guard {
+            guard.committed = true;
+        }
+        if let Err(error) =
+            self.bind_session_worker(&session_id, &remote.worker, if ttd { "ttd" } else { "etw" })
+        {
+            let cleanup = self.supervisor.kill_worker(&remote.worker);
+            let _ = self.set_session_terminal(
+                &session_id,
+                true,
+                cleanup.is_ok(),
+                Some(error.to_string()),
+            );
+            if cleanup.is_ok() {
+                self.release_recording_slot(&remote)?;
             }
             return Err(error);
         }
-        let trace_session = Arc::new(Mutex::new(trace_session));
-        let writes = write_recording_start_artifacts(
-            &artifact_dir,
-            &recording_id,
+        if let Err(error) = self.start_open_operation(
+            &workspace,
             &operation_id,
-            &request,
-            root_pid,
-            now,
-            trace_start_error.as_deref(),
-            trace_consumer_error.as_deref(),
-            trace_stack_status,
-            trace_stack_status_error.as_deref(),
-            request.cpu_sampling,
-            cpu_sampling_status,
-            cpu_sampling_status_error.as_deref(),
-        )?;
-        let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
-
-        workspace.append_operation(&OperationRecord {
-            operation_id: operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: "recording.start".to_string(),
-            status: OperationStatus::Success,
-            created_at: now,
-            summary: "recording started".to_string(),
-            artifacts: registered.artifacts.clone(),
-            raw_output: registered.raw_output.clone(),
-        })?;
-
-        let recording = ManagedRecording {
-            recording_id: recording_id.clone(),
-            project_root: params.project_root,
-            internal_workspace_root: workspace.root().to_path_buf(),
-            artifact_dir,
-            target: request.target,
-            presets: request.presets,
-            cpu_sampling: request.cpu_sampling,
-            root_pid,
-            state: RecordingState::Running,
-            created_at: now,
-            updated_at: now,
-            last_operation: Some(operation_id.clone()),
-            artifacts: registered.artifacts.clone(),
-            trace_session,
-            trace_start_error,
-            trace_consumer_error,
-            trace_stack_status,
-            trace_stack_status_error,
-            cpu_sampling_status,
-            cpu_sampling_status_error,
-            trace_stop_result: None,
-            cpu_summary: None,
-        };
-
-        let mut operation = ServiceOperation::success(
-            operation_id.clone(),
-            "recording.start",
-            None,
-            "recording started",
-        );
-        operation.artifacts = registered.artifacts.clone();
-        operation.raw_output = registered.raw_output.clone();
-
-        let mut state = self.lock_state()?;
-        state
-            .operations
-            .insert(operation_id.id.as_str().to_string(), operation);
-        state
-            .recordings
-            .insert(recording_id.id.as_str().to_string(), recording.clone());
-        if let Some(guard) = cpu_active_guard.as_mut() {
-            guard.commit();
+            &session_id,
+            &remote.worker,
+            if ttd { "ttd" } else { "etw" },
+        ) {
+            let cleanup = self.supervisor.kill_worker(&remote.worker);
+            self.set_session_terminal(&session_id, true, cleanup.is_ok(), Some(error.to_string()))?;
+            if cleanup.is_ok() {
+                self.release_recording_slot(&remote)?;
+            }
+            return Err(error);
         }
-
-        recording_response(
-            &recording,
-            &operation_id,
-            OperationStatus::Success,
-            &registered,
+        let response = self.request_recording(&remote, &operation_id, method, params);
+        self.finish_recording_response(&remote, &operation_id, method, response, ttd)
+    }
+    fn request_recording(
+        &self,
+        recording: &RemoteRecording,
+        operation_id: &OperationRef,
+        method: &str,
+        params: Value,
+    ) -> Result<WorkerResponse, ServiceError> {
+        #[cfg(test)]
+        {
+            if self.supervisor.is_mock() {
+                let mut executor = self
+                    .lock_state()?
+                    .recording_executors
+                    .remove(recording.session_id.id.as_str())
+                    .unwrap_or_else(|| {
+                        RecordingExecutor::new(
+                            recording.session_id.clone(),
+                            self.capabilities.ttd_dir.clone(),
+                        )
+                        .with_adapters(self.etw_controller.clone(), self.ttd_runner.clone())
+                    });
+                let response = executor.execute(operation_id.clone(), method, params);
+                self.lock_state()?
+                    .recording_executors
+                    .insert(recording.session_id.to_string(), executor);
+                return Ok(response);
+            }
+        }
+        self.supervisor.request_worker(
+            &recording.worker,
+            WorkerRequest::Recording {
+                session_id: recording.session_id.clone(),
+                operation_id: operation_id.clone(),
+                action: method.into(),
+                params,
+                ttd_dir: self.capabilities.ttd_dir.clone(),
+            },
         )
     }
-
-    pub(super) fn recording_ttd(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        let params: RecordingTtdParams = parse_params(params)?;
-        let worker_identity = params.worker_identity;
-        let request = RecordTtd {
-            target: params.target,
-            timeout_ms: params.timeout_ms,
-            options: params.options,
-        }
-        .validate()?;
-        let current_dir = ttd_launch_start_directory(&request.target)?;
-        let recording_id = next_recording_ref();
-        let operation_id = next_operation_ref();
-        let _active_guard = self.start_ttd_recording(recording_id.clone())?;
-        let workspace = ensure_project_workspace(&params.project_root)?;
-        let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
-        let traces_dir = artifact_dir.join("traces");
-        fs::create_dir_all(&traces_dir)?;
-
-        let ttd_exe = self.resolve_ttd_exe()?;
-        let started = Instant::now();
-        let started_at = Timestamp::now();
-        let stdout_path = artifact_dir.join("recorder.stdout.txt");
-        let stderr_path = artifact_dir.join("recorder.stderr.txt");
-        let stop_stdout_path = artifact_dir.join("recorder-stop.stdout.txt");
-        let stop_stderr_path = artifact_dir.join("recorder-stop.stderr.txt");
-        let events_path = artifact_dir.join("events.jsonl");
-        append_ttd_recording_event(
-            &events_path,
-            &recording_id,
-            &operation_id,
-            "ttd_recording_started",
-            started_at,
-            json!({
-                "target": request.target,
-                "timeout_ms": request.timeout_ms,
-                "worker_identity": worker_identity,
-                "ttd_exe": ttd_exe,
-            }),
-            None,
-        )?;
-
-        let args = build_ttd_args(&request.target, &request.options, &traces_dir);
-        append_ttd_recording_event(
-            &events_path,
-            &recording_id,
-            &operation_id,
-            "recorder_starting",
-            Timestamp::now(),
-            json!({
-                "args": args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-                "current_dir": current_dir.as_ref(),
-            }),
-            None,
-        )?;
-
-        let timeout_stop_target = ttd_stop_target(&request.target, None);
-        let recorder_exit = self.ttd_runner.run(TtdRecorderInvocation {
-            ttd_exe: ttd_exe.clone(),
-            args,
-            current_dir,
-            timeout: Duration::from_millis(request.timeout_ms),
-            stdout_path: stdout_path.clone(),
-            stderr_path: stderr_path.clone(),
-            worker_identity,
-            timeout_stop: timeout_stop_target
-                .clone()
-                .map(|stop_target| TtdTimeoutStop {
-                    stop_target,
-                    prefer_recorded_pid: matches!(&request.target, TtdTarget::Launch { .. }),
-                    stdout_path: stop_stdout_path.clone(),
-                    stderr_path: stop_stderr_path.clone(),
-                    timeout: Duration::from_secs(15),
-                    recorder_exit_timeout: Duration::from_secs(15),
-                }),
-        });
-        ensure_file_exists(&stdout_path)?;
-        ensure_file_exists(&stderr_path)?;
-
-        let mut warnings = Vec::new();
-        let mut error = None;
-        let mut recorder_exit_code = None;
-        let mut timed_out = false;
-        let mut recorder_stop = None;
-        let mut recorder_killed_after_timeout = false;
-        match recorder_exit {
-            Ok(exit) => {
-                recorder_exit_code = exit.exit_code;
-                timed_out = exit.timed_out;
-                recorder_stop = exit.stop;
-                recorder_killed_after_timeout = exit.killed_after_timeout;
-                append_ttd_recording_event(
-                    &events_path,
-                    &recording_id,
-                    &operation_id,
-                    "recorder_finished",
-                    Timestamp::now(),
-                    json!({
-                        "exit_code": exit.exit_code,
-                        "timed_out": exit.timed_out,
-                    }),
+    fn finish_recording_response(
+        &self,
+        recording: &RemoteRecording,
+        operation_id: &OperationRef,
+        method: &str,
+        response: Result<WorkerResponse, ServiceError>,
+        terminal: bool,
+    ) -> Result<Value, ServiceError> {
+        let workspace = Workspace::open(&recording.workspace_root)?;
+        let (mut result, writes) = match response {
+            Ok(WorkerResponse::Recording { result, writes }) => (result, writes),
+            other => {
+                let status = if matches!(other, Ok(WorkerResponse::Failed { .. })) {
+                    OperationStatus::Failed
+                } else {
+                    OperationStatus::Unknown
+                };
+                let message = format!("recording execution unavailable: {other:?}");
+                let cleanup = self.supervisor.kill_worker(&recording.worker);
+                self.set_session_terminal(
+                    &recording.session_id,
+                    true,
+                    cleanup.is_ok(),
+                    Some(message.clone()),
+                )?;
+                if let Some(remote) = self
+                    .lock_state()?
+                    .remote_recordings
+                    .get_mut(recording.session_id.id.as_str())
+                {
+                    remote.terminal = true;
+                }
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id: operation_id.clone(),
+                        adapter_id: "service".into(),
+                        capability: method.into(),
+                        status: status.clone(),
+                        created_at: Timestamp::now(),
+                        summary: message.clone(),
+                        artifacts: vec![],
+                        raw_output: None,
+                    },
+                )?;
+                self.finish_operation_in_memory(
+                    operation_id,
+                    status,
+                    message.clone(),
+                    vec![],
                     None,
                 )?;
-            }
-            Err(run_error) => {
-                error = Some(format!("start TTD recorder failed: {run_error}"));
-                append_ttd_recording_event(
-                    &events_path,
-                    &recording_id,
-                    &operation_id,
-                    "recorder_failed",
-                    Timestamp::now(),
-                    json!({}),
-                    error.clone(),
-                )?;
-            }
-        }
-
-        let target_pid = parse_first_recorded_pid(
-            &(read_text_lossy(&stdout_path) + "\n" + read_text_lossy(&stderr_path).as_str()),
-        );
-        let mut stop_stdout_registered = false;
-        let mut stop_stderr_registered = false;
-        if timed_out {
-            if recorder_killed_after_timeout {
-                warnings
-                    .push("TTD recorder did not exit after stop and was terminated".to_string());
-            }
-            append_ttd_recording_event(
-                &events_path,
-                &recording_id,
-                &operation_id,
-                "timeout_reached",
-                Timestamp::now(),
-                json!({}),
-                None,
-            )?;
-            if let Some(stop) = recorder_stop {
-                ensure_file_exists(&stop_stdout_path)?;
-                ensure_file_exists(&stop_stderr_path)?;
-                stop_stdout_registered = true;
-                stop_stderr_registered = true;
-                if let Some(stop_error) = stop.error {
-                    let warning = format!("TTD stop failed after timeout: {stop_error}");
-                    warnings.push(warning.clone());
-                    append_ttd_recording_event(
-                        &events_path,
-                        &recording_id,
-                        &operation_id,
-                        "recorder_stop_failed",
-                        Timestamp::now(),
-                        json!({ "stop_target": stop.stop_target.to_string_lossy() }),
-                        Some(warning),
-                    )?;
-                } else {
-                    if stop.timed_out {
-                        warnings.push("TTD stop command timed out".to_string());
-                    }
-                    append_ttd_recording_event(
-                        &events_path,
-                        &recording_id,
-                        &operation_id,
-                        "recorder_stop_finished",
-                        Timestamp::now(),
-                        json!({
-                            "stop_target": stop.stop_target.to_string_lossy(),
-                            "exit_code": stop.exit_code,
-                            "timed_out": stop.timed_out,
-                        }),
-                        None,
-                    )?;
+                if cleanup.is_ok() {
+                    self.release_recording_slot(recording)?;
                 }
-            } else {
-                let message = match timeout_stop_target {
-                    Some(stop_target) => format!(
-                        "TTD recorder timed out, but stop was not attempted for {}",
-                        stop_target.to_string_lossy()
-                    ),
-                    None => {
-                        "TTD recorder timed out, but DbgAtlas could not determine a stop target"
-                            .to_string()
-                    }
-                };
-                warnings.push(message);
+                return Err(ServiceError::Worker(message));
             }
-        }
-
-        let discovered = discover_ttd_artifacts(&traces_dir)?;
-        let status = if error.is_some() {
-            "failed"
-        } else if recorder_exit_code.is_some_and(|code| code != 0) {
-            error = Some(recorder_error_summary(
-                &stdout_path,
-                &stderr_path,
-                recorder_exit_code,
-            ));
-            "failed"
-        } else if discovered.traces.is_empty() {
-            error = Some("TTD recorder completed but no .run trace was created".to_string());
-            "failed"
-        } else if timed_out {
-            "timed_out"
-        } else {
-            "completed"
         };
-        let operation_status = if status == "failed" {
-            OperationStatus::Failed
-        } else {
-            OperationStatus::Success
-        };
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let stopped_at = Timestamp::now();
-        let metadata = ttd_recording_metadata_json(TtdRecordingMetadata {
-            recording_id: &recording_id,
-            operation_id: &operation_id,
-            request: &request,
-            status,
-            operation_status: &operation_status,
-            target_pid,
-            recorder_exit_code,
-            timed_out,
-            started_at,
-            stopped_at,
-            duration_ms,
-            ttd_exe: &ttd_exe,
-            worker_identity,
-            discovered: &discovered,
-            warnings: &warnings,
-            error: error.as_deref(),
-        });
-        let metadata_len = write_json_file(&artifact_dir.join("recording.json"), &metadata)?;
-        append_ttd_recording_event(
-            &events_path,
-            &recording_id,
-            &operation_id,
-            "recording_completed",
-            stopped_at,
-            json!({
-                "status": status,
-                "operation_status": operation_status,
-                "trace_count": discovered.traces.len(),
-                "duration_ms": duration_ms,
-            }),
-            error.clone(),
-        )?;
-
-        let writes = ttd_recording_writes(
-            &recording_id,
-            &artifact_dir,
-            metadata_len,
-            stop_stdout_registered,
-            stop_stderr_registered,
-            &discovered,
-        )?;
-        let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
-        let trace_artifacts = ttd_trace_artifact_results(&workspace, &writes, &registered);
-        workspace.append_operation(&OperationRecord {
-            operation_id: operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: "recording.ttd".to_string(),
-            status: operation_status.clone(),
-            created_at: started_at,
-            summary: format!("TTD recording {status}"),
-            artifacts: registered.artifacts.clone(),
-            raw_output: registered.raw_output.clone(),
-        })?;
-
-        let mut operation = ServiceOperation::success(
-            operation_id.clone(),
-            "recording.ttd",
+        let status: OperationStatus = serde_json::from_value(result["operation_status"].clone())?;
+        // Execution facts survive a separate output registration failure.
+        self.finish_operation_in_memory(
+            operation_id,
+            status.clone(),
+            format!("{method} executed"),
+            vec![],
             None,
-            format!("TTD recording {status}"),
-        );
-        if operation_status == OperationStatus::Failed {
-            operation.status = ServiceOperationStatus::Failed;
+        )?;
+        let (registered, output_error) =
+            match register_worker_writes(&workspace, operation_id, &writes) {
+                Ok(registered) => (registered, None),
+                Err(error) => (RegisteredWorkerWrites::default(), Some(error.to_string())),
+            };
+        replace_worker_output_refs(&mut result, &registered.artifacts);
+        if output_error.is_some() {
+            result["artifact_refs"] = json!([]);
+            result["output_error"] = json!(output_error);
         }
-        operation.artifacts = registered.artifacts.clone();
-        operation.raw_output = registered.raw_output.clone();
-        let mut state = self.lock_state()?;
-        state
+        result["session_id"] = serde_json::to_value(&recording.session_id)?;
+        result["recording_id"] = serde_json::to_value(&recording.session_id)?;
+        self.finish_operation_in_memory(
+            operation_id,
+            status.clone(),
+            format!("{method} completed"),
+            registered.artifacts.clone(),
+            registered.raw_output.clone(),
+        )?;
+        if let Some(op) = self
+            .lock_state()?
             .operations
-            .insert(operation_id.id.as_str().to_string(), operation);
-
-        Ok(json!({
-            "recording_id": recording_id,
-            "state": status,
-            "target": request.target,
-            "mode": request.target.mode(),
-            "worker_identity": worker_identity,
-            "operation_id": operation_id,
-            "operation_status": operation_status,
-            "target_pid": target_pid,
-            "recorder_exit_code": recorder_exit_code,
-            "duration_ms": duration_ms,
-            "primary_trace_path": discovered.traces.first(),
-            "trace_paths": discovered.traces,
-            "trace_index_paths": discovered.trace_indexes,
-            "trace_artifacts": trace_artifacts,
-            "artifact_refs": registered.artifacts,
-            "raw_output_ref": registered.raw_output,
-            "warnings": warnings,
-            "error": error,
-            "operation": {
-                "status": operation_status,
-                "artifact_refs": registered.artifacts,
-                "raw_output_ref": registered.raw_output,
+            .get_mut(operation_id.id.as_str())
+        {
+            op.details.output_error = output_error.clone();
+        }
+        let journal = self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: dbgatlas_model::OperationDetails {
+                    output_error: output_error.clone(),
+                    ..Default::default()
+                },
+                operation_id: operation_id.clone(),
+                adapter_id: "service".into(),
+                capability: method.into(),
+                status: status.clone(),
+                created_at: Timestamp::now(),
+                summary: format!("{method} completed"),
+                artifacts: registered.artifacts.clone(),
+                raw_output: registered.raw_output.clone(),
+            },
+        );
+        if let Err(error) = journal {
+            let message =
+                format!("execution completed; operation journal failed: {error}; do not replay");
+            result["output_error"] = json!(message);
+            if let Some(op) = self
+                .lock_state()?
+                .operations
+                .get_mut(operation_id.id.as_str())
+            {
+                op.details.output_error = Some(message);
             }
-        }))
+        }
+        let already_terminated = self
+            .lock_state()?
+            .remote_recordings
+            .get(recording.session_id.id.as_str())
+            .is_some_and(|r| r.terminal);
+        if already_terminated {
+            return Err(ServiceError::Worker("recording was concurrently terminated; late response retained without reactivating session".into()));
+        }
+        if terminal {
+            let cleanup = if status == OperationStatus::Failed {
+                self.supervisor.kill_worker(&recording.worker)
+            } else {
+                match self.supervisor.request_worker(
+                    &recording.worker,
+                    WorkerRequest::CloseSession {
+                        session_id: recording.session_id.clone(),
+                    },
+                ) {
+                    Ok(WorkerResponse::Ok { .. }) => {
+                        self.supervisor.close_worker(&recording.worker)
+                    }
+                    other => Err(ServiceError::Worker(format!(
+                        "recording close failed: {other:?}"
+                    ))),
+                }
+            };
+            self.set_session_terminal(
+                &recording.session_id,
+                cleanup.is_err() || status == OperationStatus::Failed,
+                cleanup.is_ok(),
+                cleanup.as_ref().err().map(ToString::to_string),
+            )?;
+            if cleanup.is_ok() {
+                self.release_recording_slot(recording)?;
+            } else {
+                result["cleanup_error"] = json!(cleanup.unwrap_err().to_string());
+            }
+        }
+        let mut state = self.lock_state()?;
+        if let Some(remote) = state
+            .remote_recordings
+            .get_mut(recording.session_id.id.as_str())
+        {
+            if remote.terminal {
+                return Err(ServiceError::Worker(
+                    "recording was concurrently terminated".into(),
+                ));
+            }
+            remote.result = result.clone();
+            remote.terminal = terminal;
+        }
+        if let Some(session) = state.summaries.get_mut(recording.session_id.id.as_str()) {
+            if !terminal {
+                session.lifecycle = dbgatlas_model::SessionLifecycle::Active;
+            }
+            session.artifacts = registered.artifacts;
+            session.last_operation_id = Some(operation_id.clone());
+            session.context = json!({"recording_state":result["state"]});
+            if let Some(value) = result.get("target_process").filter(|v| !v.is_null()) {
+                let mut process: dbgatlas_model::ProcessInstance =
+                    serde_json::from_value(value.clone())?;
+                process.environment_id = session.control_environment.id.clone();
+                session.target.process = Some(process);
+            }
+            self.persist_session(session)?;
+        }
+        Ok(result)
     }
-
+    pub(super) fn release_recording_slot(
+        &self,
+        recording: &RemoteRecording,
+    ) -> Result<(), ServiceError> {
+        let mut state = self.lock_state()?;
+        if recording.cpu
+            && state
+                .active_cpu_recording
+                .as_ref()
+                .is_some_and(|id| id.id == recording.session_id.id)
+        {
+            state.active_cpu_recording = None;
+        }
+        if recording.ttd
+            && state
+                .active_ttd_recording
+                .as_ref()
+                .is_some_and(|id| id.id == recording.session_id.id)
+        {
+            state.active_ttd_recording = None;
+        }
+        Ok(())
+    }
     pub(super) fn recording_status(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         let params: RecordingParams = parse_params(params)?;
         let state = self.lock_state()?;
         let recording = state
-            .recordings
+            .remote_recordings
             .get(params.recording_id.id.as_str())
-            .cloned()
             .ok_or_else(|| ServiceError::RecordingNotFound(params.recording_id.to_string()))?;
-        Ok(recording_status_response(&recording))
+        let mut result = recording.result.clone();
+        if let Some(session) = state.summaries.get(params.recording_id.id.as_str()) {
+            result["last_operation"] = serde_json::to_value(&session.last_operation_id)?;
+            result["created_at"] = serde_json::to_value(session.created_at)?;
+            result["updated_at"] = serde_json::to_value(session.updated_at)?;
+        }
+        Ok(result)
     }
-
     pub(super) fn recording_stop(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         self.finish_recording(params, RecordingFinishMode::Stop)
     }
-
     pub(super) fn recording_cancel(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         self.finish_recording(params, RecordingFinishMode::Cancel)
     }
-
     pub(super) fn recording_kill(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         self.finish_recording(params, RecordingFinishMode::Kill)
     }
-
     pub(super) fn finish_recording(
         &self,
         params: Option<Value>,
         mode: RecordingFinishMode,
     ) -> Result<Value, ServiceError> {
         let params: RecordingParams = parse_params(params)?;
-        let mut recording = {
-            let mut state = self.lock_state()?;
-            let recording = state
-                .recordings
-                .get_mut(params.recording_id.id.as_str())
-                .ok_or_else(|| ServiceError::RecordingNotFound(params.recording_id.to_string()))?;
-            if recording.state != RecordingState::Running {
-                return Err(ServiceError::RecordingAlreadyTerminal(
-                    recording.recording_id.to_string(),
-                ));
-            }
-            recording.state = RecordingState::Stopping;
-            recording.updated_at = Timestamp::now();
-            recording.clone()
+        let recording = self
+            .lock_state()?
+            .remote_recordings
+            .get(params.recording_id.id.as_str())
+            .cloned()
+            .ok_or_else(|| ServiceError::RecordingNotFound(params.recording_id.to_string()))?;
+        let force = matches!(mode, RecordingFinishMode::Kill);
+        let cleanup_complete = self
+            .lock_state()?
+            .summaries
+            .get(recording.session_id.id.as_str())
+            .is_some_and(|s| s.cleanup.complete);
+        if recording.terminal && (!force || cleanup_complete) {
+            return Err(ServiceError::RecordingAlreadyTerminal(
+                params.recording_id.to_string(),
+            ));
+        }
+        let _guard = if force {
+            None
+        } else {
+            Some(
+                recording
+                    .request_lock
+                    .try_lock()
+                    .map_err(|_| ServiceError::SessionBusy(recording.session_id.to_string()))?,
+            )
         };
-
+        if !force
+            && self
+                .lock_state()?
+                .remote_recordings
+                .get(recording.session_id.id.as_str())
+                .is_some_and(|r| r.terminal)
+        {
+            return Err(ServiceError::RecordingAlreadyTerminal(
+                params.recording_id.to_string(),
+            ));
+        }
+        let method = match mode {
+            RecordingFinishMode::Stop => "recording.stop",
+            RecordingFinishMode::Cancel => "recording.cancel",
+            RecordingFinishMode::Kill => "recording.kill",
+        };
         let operation_id = next_operation_ref();
-        let workspace = Workspace::open(&recording.internal_workspace_root)?;
-        let artifact_dir = recording.artifact_dir.clone();
-        let now = Timestamp::now();
-        let (state, status, capability, summary, writes) = match mode {
-            RecordingFinishMode::Stop => {
-                let writes = write_recording_stop_artifacts(
-                    &artifact_dir,
-                    &mut recording,
-                    &operation_id,
-                    now,
-                )?;
-                (
-                    RecordingState::Stopped,
-                    OperationStatus::Success,
-                    "recording.stop",
-                    "recording stopped",
-                    writes,
-                )
+        let workspace = Workspace::open(&recording.workspace_root)?;
+        self.begin_operation_record(
+            &workspace,
+            &operation_id,
+            &recording.session_id,
+            method,
+            json!({"recording_id":params.recording_id}),
+        )?;
+        if force {
+            if let Some(remote) = self
+                .lock_state()?
+                .remote_recordings
+                .get_mut(recording.session_id.id.as_str())
+            {
+                remote.terminal = true;
             }
-            RecordingFinishMode::Cancel => (
-                RecordingState::Canceled,
-                OperationStatus::Canceled,
-                "recording.cancel",
-                "recording canceled",
-                write_recording_terminal_trace_artifacts(
-                    &artifact_dir,
-                    &mut recording,
+            if let Err(error) = self.supervisor.kill_worker(&recording.worker) {
+                self.set_session_terminal(
+                    &recording.session_id,
+                    true,
+                    false,
+                    Some(error.to_string()),
+                )?;
+                self.finish_operation_in_memory(
                     &operation_id,
-                    now,
-                    "canceled",
-                )?,
-            ),
-            RecordingFinishMode::Kill => (
-                RecordingState::Killed,
-                OperationStatus::Failed,
-                "recording.kill",
-                "recording killed",
-                write_recording_terminal_trace_artifacts(
-                    &artifact_dir,
-                    &mut recording,
-                    &operation_id,
-                    now,
-                    "killed",
-                )?,
-            ),
-        };
-        let registered = register_worker_writes(&workspace, &operation_id, &writes)?;
-        workspace.append_operation(&OperationRecord {
-            operation_id: operation_id.clone(),
-            adapter_id: "service".to_string(),
-            capability: capability.to_string(),
-            status: status.clone(),
-            created_at: now,
-            summary: summary.to_string(),
-            artifacts: registered.artifacts.clone(),
-            raw_output: registered.raw_output.clone(),
-        })?;
-
-        recording.state = state;
-        recording.updated_at = now;
-        recording.last_operation = Some(operation_id.clone());
-        recording.artifacts = registered.artifacts.clone();
-
-        let mut operation =
-            ServiceOperation::success(operation_id.clone(), capability, None, summary);
-        if status == OperationStatus::Canceled {
-            operation.status = ServiceOperationStatus::Canceled;
+                    OperationStatus::Failed,
+                    error.to_string(),
+                    vec![],
+                    None,
+                )?;
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: Default::default(),
+                        operation_id,
+                        adapter_id: "service".into(),
+                        capability: method.into(),
+                        status: OperationStatus::Failed,
+                        created_at: Timestamp::now(),
+                        summary: error.to_string(),
+                        artifacts: vec![],
+                        raw_output: None,
+                    },
+                )?;
+                return Err(error);
+            }
+            self.set_session_terminal(
+                &recording.session_id,
+                true,
+                true,
+                Some("recording worker forcefully terminated; outputs may be incomplete".into()),
+            )?;
+            self.release_recording_slot(&recording)?;
+            let metadata_path = recording.artifact_dir.join("recording.json");
+            let mut metadata: Value = fs::read(&metadata_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_else(|| json!({}));
+            metadata["state"] = json!("killed");
+            metadata["output_complete"] = json!(false);
+            metadata["operation_id"] = serde_json::to_value(&operation_id)?;
+            let length = write_json_file(&metadata_path, &metadata)?;
+            let registered = register_worker_writes(
+                &workspace,
+                &operation_id,
+                &[WorkerArtifactWrite {
+                    relative_path: PathBuf::from("artifacts/recordings")
+                        .join(recording.session_id.id.as_str())
+                        .join("recording.json"),
+                    kind: "recording.metadata".into(),
+                    role: None,
+                    byte_len: length,
+                    description: Some("forced recording termination; outputs incomplete".into()),
+                }],
+            )?;
+            let mut result = recording.result.clone();
+            result["artifact_refs"] = serde_json::to_value(&registered.artifacts)?;
+            result["state"] = json!("killed");
+            result["operation_status"] = json!("failed");
+            result["operation_id"] = serde_json::to_value(&operation_id)?;
+            result["warnings"] = json!(["forced termination; output completeness is unknown"]);
+            let mut state = self.lock_state()?;
+            if let Some(r) = state
+                .remote_recordings
+                .get_mut(recording.session_id.id.as_str())
+            {
+                r.terminal = true;
+                r.result = result.clone();
+            }
+            drop(state);
+            self.append_operation_result(
+                &workspace,
+                &OperationRecord {
+                    details: Default::default(),
+                    operation_id: operation_id.clone(),
+                    adapter_id: "service".into(),
+                    capability: method.into(),
+                    status: OperationStatus::Failed,
+                    created_at: Timestamp::now(),
+                    summary: "recording forced closed".into(),
+                    artifacts: registered.artifacts.clone(),
+                    raw_output: None,
+                },
+            )?;
+            self.finish_operation_in_memory(
+                &operation_id,
+                ServiceOperationStatus::Failed,
+                "recording forced closed".into(),
+                registered.artifacts,
+                None,
+            )?;
+            return Ok(result);
         }
-        if status == OperationStatus::Failed {
-            operation.status = ServiceOperationStatus::Failed;
-        }
-        operation.artifacts = registered.artifacts.clone();
-        operation.raw_output = registered.raw_output.clone();
-
-        let mut state = self.lock_state()?;
-        if state.active_cpu_recording.as_ref() == Some(&recording.recording_id) {
-            state.active_cpu_recording = None;
-        }
-        state.recordings.insert(
-            recording.recording_id.id.as_str().to_string(),
-            recording.clone(),
+        let response = self.request_recording(
+            &recording,
+            &operation_id,
+            method,
+            json!({"recording_id":params.recording_id}),
         );
-        state
-            .operations
-            .insert(operation_id.id.as_str().to_string(), operation);
-
-        recording_response(&recording, &operation_id, status, &registered)
+        self.finish_recording_response(&recording, &operation_id, method, response, true)
     }
 }
 
-pub(super) fn recording_response(
-    recording: &ManagedRecording,
-    operation_id: &OperationRef,
-    status: OperationStatus,
-    writes: &RegisteredWorkerWrites,
-) -> Result<Value, ServiceError> {
-    Ok(json!({
-        "recording_id": recording.recording_id,
-        "state": recording.state,
-        "target": recording.target,
-        "root_pid": recording.root_pid,
-        "presets": recording.presets,
-        "cpu_sampling": recording.cpu_sampling,
-        "cpu_summary": recording.cpu_summary,
-        "operation_id": operation_id,
-        "operation_status": status,
-        "artifact_refs": writes.artifacts,
-        "raw_output_ref": writes.raw_output,
-        "operation": {
-            "status": status,
-            "artifact_refs": writes.artifacts,
-            "raw_output_ref": writes.raw_output,
+fn replace_worker_output_refs(value: &mut Value, refs: &[ArtifactRef]) {
+    match value {
+        Value::String(text) => {
+            if let Some(index) = text
+                .strip_prefix("worker-output-")
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                if let Some(reference) = refs.get(index) {
+                    *text = reference.id.to_string();
+                }
+            }
         }
-    }))
-}
-
-pub(super) fn recording_status_response(recording: &ManagedRecording) -> Value {
-    json!({
-        "recording_id": recording.recording_id,
-        "state": recording.state,
-        "target": recording.target,
-        "root_pid": recording.root_pid,
-        "presets": recording.presets,
-        "cpu_sampling": recording.cpu_sampling,
-        "cpu_summary": recording.cpu_summary,
-        "created_at": recording.created_at,
-        "updated_at": recording.updated_at,
-        "last_operation": recording.last_operation,
-        "artifact_refs": recording.artifacts,
-    })
+        Value::Array(items) => {
+            for item in items {
+                replace_worker_output_refs(item, refs);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                replace_worker_output_refs(item, refs);
+            }
+        }
+        _ => {}
+    }
 }

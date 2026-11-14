@@ -110,6 +110,17 @@ fn cpu_recording_cancel_kill_and_zero_samples_finalize_cleanly() {
             params: Some(json!({ "recording_id": recording_id })),
         });
         assert!(finished.error.is_none(), "{method}: {:?}", finished.error);
+        if method == "recording.kill" {
+            let result = finished.result.unwrap();
+            assert_eq!(result["state"], "killed");
+            assert!(result["cpu_summary"].is_null());
+            assert_eq!(
+                stop_count.load(Ordering::SeqCst),
+                0,
+                "force close must not invent cooperative finalization"
+            );
+            continue;
+        }
         assert_eq!(
             finished.result.unwrap()["cpu_summary"]["quality"]["total_samples"],
             0
@@ -876,12 +887,12 @@ fn recording_kill_records_failed_operation_and_keeps_artifacts_in_facts() {
                 && artifact.operation_id.as_ref() == Some(&kill_operation_id))
     );
     assert!(
-        facts
+        !facts
             .artifacts
             .iter()
             .any(|artifact| artifact.relative_path == trace
-                && artifact.kind == "recording.trace"
-                && artifact.operation_id.as_ref() == Some(&kill_operation_id))
+                && artifact.operation_id.as_ref() == Some(&kill_operation_id)),
+        "force close must not fabricate a finalized trace"
     );
     let recording_metadata: Value =
         serde_json::from_str(&fs::read_to_string(workspace.root().join(recording_json)).unwrap())
@@ -984,10 +995,42 @@ fn concurrent_recording_finish_allows_one_terminal_operation() {
             response
                 .error
                 .as_ref()
-                .is_some_and(|error| error.code == -32016)
+                .is_some_and(|error| matches!(error.code, -32016 | -32017))
         })
         .count();
 
-    assert_eq!(success_count, 1);
-    assert_eq!(terminal_reject_count, 1);
+    assert_eq!(success_count, 1, "{responses:?}");
+    assert_eq!(terminal_reject_count, 1, "{responses:?}");
+}
+
+#[test]
+fn cpu_restore_failure_does_not_mark_recovery_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let (host, _) = cpu_test_host(MockEtwMode::RestoreFailure);
+    let started = start_cpu_recording(&host, temp.path()).result.unwrap();
+    let response = host.recording_stop(Some(json!({"recording_id":started["recording_id"]})));
+    assert!(
+        response
+            .unwrap_err()
+            .to_string()
+            .contains("restoration is unconfirmed")
+    );
+    let path = temp
+        .path()
+        .join(INTERNAL_WORKSPACE_DIR)
+        .join("artifacts/recordings")
+        .join(started["recording_id"]["id"].as_str().unwrap())
+        .join("recovery.json");
+    let recovery: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(recovery["completed"], false);
+}
+
+#[test]
+fn independent_cleanup_errors_are_retained_together() {
+    let first = Err(ServiceError::Worker("target cleanup denied".into()));
+    let second = Err(ServiceError::Worker("ETW recovery failed".into()));
+    let error = combine_cleanup_results(first, second)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("target cleanup denied") && error.contains("ETW recovery failed"));
 }

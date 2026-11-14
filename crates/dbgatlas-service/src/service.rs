@@ -138,9 +138,25 @@ fn run_ttd_command_helper_inner(
     if let Some(parent) = options.stderr_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let registry = options
+        .stdout_path
+        .parent()
+        .ok_or_else(|| ServiceError::Worker("missing helper registry".into()))?
+        .join("owned-processes.json");
+    let instance = crate::process_identity::inspect(std::process::id())?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::process_identity::is_registered(&registry, &instance)? {
+        if Instant::now() >= deadline {
+            return Err(ServiceError::Worker(
+                "helper ownership handshake timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    #[cfg(windows)]
+    let job = platform::helper_job::HelperJob::create()?;
     let stdout = fs::File::create(&options.stdout_path)?;
     let stderr = fs::File::create(&options.stderr_path)?;
-    let job = job::ManagedJob::create_result("DbgAtlasTtdCommandHelper")?;
     let mut command = Command::new(&options.executable);
     command
         .args(&options.args)
@@ -150,13 +166,37 @@ fn run_ttd_command_helper_inner(
     if let Some(current_dir) = &options.current_dir {
         command.current_dir(current_dir);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+    }
     let mut child = command.spawn()?;
-    if let Err(error) = job.assign_child_process(&child) {
+    if let Some(directory) = options.stdout_path.parent() {
+        if let Err(error) = crate::process_identity::register(
+            &directory.join(format!("owned-helper-{}.json", std::process::id())),
+            child.id(),
+            "tool",
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+    }
+    #[cfg(windows)]
+    if let Err(error) = crate::process_identity::resume_created_process(child.id()) {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(ServiceError::Io(error));
+        return Err(error.into());
     }
-    Ok(child.wait()?.code())
+    let exit_code = child.wait()?.code();
+    #[cfg(windows)]
+    if exit_code == Some(0) {
+        job.preserve_targets()?;
+    } else {
+        job.failure_exit_code(exit_code);
+    }
+    Ok(exit_code)
 }
 
 fn append_ttd_helper_error(path: &Path, error: &ServiceError) -> Result<(), std::io::Error> {
@@ -223,6 +263,8 @@ pub enum ServiceError {
     SessionNotFound(String),
     #[error("session is not reusable: {0}")]
     SessionNotReusable(String),
+    #[error("session busy: {0}")]
+    SessionBusy(String),
     #[error("session is already terminal: {0}")]
     SessionAlreadyTerminal(String),
     #[error("recording not found: {0}")]
@@ -263,10 +305,13 @@ pub enum ServiceError {
 
 #[derive(Clone)]
 pub struct ServiceHost {
+    service_instance: String,
     state: Arc<Mutex<ServiceState>>,
     supervisor: Arc<dyn WorkerSupervisor>,
     capabilities: ServiceCapabilities,
+    #[cfg(test)]
     ttd_runner: Arc<dyn TtdRecorderRunner>,
+    #[cfg(test)]
     etw_controller: Arc<dyn EtwController>,
 }
 
@@ -278,8 +323,15 @@ pub struct ServiceCapabilities {
 
 mod host_debug;
 mod host_recording;
+use host_recording::RemoteRecording;
 mod host_service;
 mod host_worker_ops;
+mod recording_executor;
+mod session_model;
+pub use recording_executor::RecordingExecutor;
+mod recording_recovery;
+use recording_recovery::RecordingRecovery;
+pub use recording_recovery::recover_recording_resources;
 
 impl ServiceCapabilities {
     pub fn from_runtime_config(runtime: &RuntimeConfig) -> Self {
@@ -310,14 +362,18 @@ impl ServiceCapabilities {
 
 #[derive(Default)]
 struct ServiceState {
+    remote_recordings: HashMap<String, RemoteRecording>,
+    #[cfg(test)]
+    recording_executors: HashMap<String, RecordingExecutor>,
+    summaries: HashMap<String, dbgatlas_model::Session>,
     sessions: HashMap<String, ManagedSession>,
-    recordings: HashMap<String, ManagedRecording>,
     operations: HashMap<String, ServiceOperation>,
     active_ttd_recording: Option<RecordingRef>,
     active_cpu_recording: Option<RecordingRef>,
 }
 
 struct TtdActiveGuard {
+    committed: bool,
     state: Arc<Mutex<ServiceState>>,
     recording_id: RecordingRef,
 }
@@ -350,6 +406,9 @@ impl Drop for CpuActiveGuard {
 
 impl Drop for TtdActiveGuard {
     fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -369,6 +428,7 @@ struct ManagedRecording {
     presets: Vec<RecordingPreset>,
     cpu_sampling: Option<CpuSamplingOptions>,
     root_pid: Option<u32>,
+    target_process: Option<dbgatlas_model::ProcessInstance>,
     state: RecordingState,
     created_at: Timestamp,
     updated_at: Timestamp,
@@ -469,6 +529,18 @@ pub struct WorkerCreateRequest {
 }
 
 pub trait WorkerSupervisor: Send + Sync {
+    fn is_mock(&self) -> bool {
+        false
+    }
+    fn snapshot(&self, _worker: &WorkerHandle) -> Option<dbgatlas_worker_protocol::WorkerSnapshot> {
+        None
+    }
+    fn process_instance(&self, _worker: &WorkerHandle) -> Option<dbgatlas_model::ProcessInstance> {
+        None
+    }
+    fn is_alive(&self, _worker: &WorkerHandle) -> Result<Option<bool>, ServiceError> {
+        Ok(None)
+    }
     fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError>;
     fn request_worker(
         &self,
@@ -657,9 +729,16 @@ impl Default for MockWorkerSupervisor {
 }
 
 impl WorkerSupervisor for MockWorkerSupervisor {
+    fn is_mock(&self) -> bool {
+        true
+    }
     fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
-        let worker_id = Id::new(format!("worker-{}", request.session_id.id.as_str()))
-            .expect("generated worker ids are valid");
+        let worker_id = Id::new(format!(
+            "worker-{}-{}",
+            request.session_id.id.as_str(),
+            next_operation_ref().id
+        ))
+        .expect("generated worker ids are valid");
         Ok(WorkerHandle {
             worker_id,
             pipe_name: format!(r"\\.\pipe\dbgatlas-{}", request.session_id.id.as_str()),
@@ -708,6 +787,8 @@ pub struct ProcessWorkerSupervisor {
 }
 
 struct ProcessWorkerState {
+    ownership_file: PathBuf,
+    snapshot: Arc<Mutex<Option<dbgatlas_worker_protocol::WorkerSnapshot>>>,
     child: Mutex<WorkerProcess>,
     transport: Mutex<WorkerTransport>,
     lifetime: Mutex<WorkerLifetime>,
@@ -822,84 +903,6 @@ impl Drop for WorkerLifetime {
     }
 }
 
-#[cfg(windows)]
-fn terminate_descendant_processes(root_pid: u32) {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-
-    for _ in 0..3 {
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            append_service_diagnostic_log(&format!(
-                "worker_descendant_cleanup_snapshot_failed root_pid={} error={}",
-                root_pid,
-                sanitize_log_value(&std::io::Error::last_os_error().to_string())
-            ));
-            return;
-        }
-
-        let mut processes = Vec::new();
-        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
-        while ok != 0 {
-            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
-            ok = unsafe { Process32NextW(snapshot, &mut entry) };
-        }
-        unsafe {
-            CloseHandle(snapshot);
-        }
-
-        let mut descendants = Vec::new();
-        let mut frontier = vec![root_pid];
-        while let Some(parent_pid) = frontier.pop() {
-            for (pid, ppid) in &processes {
-                if *ppid == parent_pid && *pid != root_pid && !descendants.contains(pid) {
-                    descendants.push(*pid);
-                    frontier.push(*pid);
-                }
-            }
-        }
-
-        if descendants.is_empty() {
-            return;
-        }
-
-        for pid in descendants.into_iter().rev() {
-            let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-            if handle.is_null() {
-                append_service_diagnostic_log(&format!(
-                    "worker_descendant_open_failed root_pid={} pid={} error={}",
-                    root_pid,
-                    pid,
-                    sanitize_log_value(&std::io::Error::last_os_error().to_string())
-                ));
-                continue;
-            }
-            let ok = unsafe { TerminateProcess(handle, 1) };
-            if ok == 0 {
-                append_service_diagnostic_log(&format!(
-                    "worker_descendant_terminate_failed root_pid={} pid={} error={}",
-                    root_pid,
-                    pid,
-                    sanitize_log_value(&std::io::Error::last_os_error().to_string())
-                ));
-            }
-            unsafe {
-                CloseHandle(handle);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(not(windows))]
-fn terminate_descendant_processes(_root_pid: u32) {}
-
 impl ProcessWorkerSupervisor {
     pub fn new() -> Result<Self, ServiceError> {
         Ok(Self {
@@ -938,10 +941,32 @@ impl ProcessWorkerSupervisor {
 }
 
 impl WorkerSupervisor for ProcessWorkerSupervisor {
+    fn process_instance(&self, worker: &WorkerHandle) -> Option<dbgatlas_model::ProcessInstance> {
+        let state = self.get_worker(worker).ok()?;
+        let child = state.child.lock().ok()?;
+        crate::process_identity::inspect(child.pid()).ok()
+    }
+    fn is_alive(&self, worker: &WorkerHandle) -> Result<Option<bool>, ServiceError> {
+        let state = self.get_worker(worker)?;
+        let mut child = state
+            .child
+            .lock()
+            .map_err(|_| ServiceError::Worker("process lock poisoned".into()))?;
+        Ok(Some(child.try_wait()?.is_none()))
+    }
+    fn snapshot(&self, worker: &WorkerHandle) -> Option<dbgatlas_worker_protocol::WorkerSnapshot> {
+        let state = self.get_worker(worker).ok()?;
+        state.snapshot.lock().ok()?.clone()
+    }
+
     fn create_worker(&self, request: WorkerCreateRequest) -> Result<WorkerHandle, ServiceError> {
         let started = Instant::now();
-        let worker_id = Id::new(format!("worker-{}", request.session_id.id.as_str()))
-            .expect("generated worker ids are valid");
+        let worker_id = Id::new(format!(
+            "worker-{}-{}",
+            request.session_id.id.as_str(),
+            next_operation_ref().id
+        ))
+        .expect("generated worker ids are valid");
         let pipe_name = unique_pipe_name(&request.session_id);
         let lifetime_pipe_name = unique_lifetime_pipe_name(&request.session_id);
         let identity = request.identity.unwrap_or_else(|| self.identity.clone());
@@ -1048,6 +1073,8 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         };
         let lifetime = WorkerLifetime::start(&worker_id, &request.session_id, lifetime_connected);
         let state = Arc::new(ProcessWorkerState {
+            ownership_file: request.artifact_dir.join("owned-processes.json"),
+            snapshot: connected.snapshot.clone(),
             child: Mutex::new(child),
             transport: Mutex::new(connected),
             lifetime: Mutex::new(lifetime),
@@ -1152,74 +1179,81 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
     }
 
     fn close_worker(&self, worker: &WorkerHandle) -> Result<(), ServiceError> {
-        let started = Instant::now();
-        let worker_state = self
-            .workers
+        let state = self.get_worker(worker)?;
+        let mut child = state
+            .child
             .lock()
-            .map_err(|_| ServiceError::Worker("worker registry lock poisoned".to_string()))?
-            .remove(worker.worker_id.as_str());
-        let found = worker_state.is_some();
-        if let Some(worker_state) = worker_state {
-            if let Ok(mut lifetime) = worker_state.lifetime.lock() {
-                lifetime.stop();
-            }
-            let mut child = worker_state
-                .child
-                .lock()
-                .map_err(|_| ServiceError::Worker("worker process lock poisoned".to_string()))?;
-            if !child.wait_timeout(WORKER_SHUTDOWN_TIMEOUT)? {
-                append_service_diagnostic_log(&format!(
-                    "worker_close_timeout worker_id={} session_id={} identity={} timeout_ms={}",
-                    sanitize_log_value(worker.worker_id.as_str()),
-                    sanitize_log_value(worker.session_id.id.as_str()),
-                    sanitize_log_value(&format!("{:?}", worker.identity)),
-                    WORKER_SHUTDOWN_TIMEOUT.as_millis(),
-                ));
-                terminate_descendant_processes(child.pid());
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            .map_err(|_| ServiceError::Worker("process lock poisoned".into()))?;
+        if !child.wait_timeout(WORKER_SHUTDOWN_TIMEOUT)? {
+            return Err(ServiceError::Worker(
+                "worker did not exit cooperatively; explicit force close required".into(),
+            ));
         }
-        append_service_diagnostic_log(&format!(
-            "worker_close worker_id={} session_id={} identity={} found={} duration_ms={}",
-            sanitize_log_value(worker.worker_id.as_str()),
-            sanitize_log_value(worker.session_id.id.as_str()),
-            sanitize_log_value(&format!("{:?}", worker.identity)),
-            found,
-            started.elapsed().as_millis(),
-        ));
+        state
+            .lifetime
+            .lock()
+            .map_err(|_| ServiceError::Worker("lifetime lock poisoned".into()))?
+            .stop();
+        drop(child);
+        self.workers
+            .lock()
+            .map_err(|_| ServiceError::Worker("worker registry lock poisoned".into()))?
+            .remove(worker.worker_id.as_str());
         Ok(())
     }
-
     fn kill_worker(&self, worker: &WorkerHandle) -> Result<(), ServiceError> {
-        let started = Instant::now();
-        let worker_state = self
-            .workers
-            .lock()
-            .map_err(|_| ServiceError::Worker("worker registry lock poisoned".to_string()))?
-            .remove(worker.worker_id.as_str());
-        let found = worker_state.is_some();
-        if let Some(worker_state) = worker_state {
-            if let Ok(mut lifetime) = worker_state.lifetime.lock() {
-                lifetime.stop();
+        let state = match self.get_worker(worker) {
+            Ok(state) => state,
+            Err(_)
+                if !self
+                    .workers
+                    .lock()
+                    .map_err(|_| ServiceError::Worker("worker registry lock poisoned".into()))?
+                    .contains_key(worker.worker_id.as_str()) =>
+            {
+                return Ok(());
             }
-            let mut child = worker_state
-                .child
-                .lock()
-                .map_err(|_| ServiceError::Worker("worker process lock poisoned".to_string()))?;
-            terminate_descendant_processes(child.pid());
-            let _ = child.kill();
-            let _ = child.wait();
+            Err(error) => return Err(error),
+        };
+        let mut child = state
+            .child
+            .lock()
+            .map_err(|_| ServiceError::Worker("process lock poisoned".into()))?;
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+            child.wait()?;
         }
-        append_service_diagnostic_log(&format!(
-            "worker_kill worker_id={} session_id={} identity={} found={} duration_ms={}",
-            sanitize_log_value(worker.worker_id.as_str()),
-            sanitize_log_value(worker.session_id.id.as_str()),
-            sanitize_log_value(&format!("{:?}", worker.identity)),
-            found,
-            started.elapsed().as_millis(),
-        ));
+        state
+            .lifetime
+            .lock()
+            .map_err(|_| ServiceError::Worker("lifetime lock poisoned".into()))?
+            .stop();
+        let processes =
+            crate::process_identity::cleanup(&state.ownership_file).map_err(ServiceError::from);
+        let recording = self.recover_worker_recording(&state.ownership_file);
+        combine_cleanup_results(processes, recording)?;
+        drop(child);
+        self.workers
+            .lock()
+            .map_err(|_| ServiceError::Worker("worker registry lock poisoned".into()))?
+            .remove(worker.worker_id.as_str());
         Ok(())
+    }
+}
+
+fn combine_cleanup_results(
+    processes: Result<(), ServiceError>,
+    recording: Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let errors: Vec<_> = [processes, recording]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|e| e.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ServiceError::Worker(errors.join("; ")))
     }
 }
 
@@ -1231,9 +1265,18 @@ impl Drop for ProcessWorkerSupervisor {
                     lifetime.stop();
                 }
                 if let Ok(mut child) = worker.child.lock() {
-                    terminate_descendant_processes(child.pid());
                     let _ = child.kill();
                     let _ = child.wait();
+                    if let Err(error) = crate::process_identity::cleanup(&worker.ownership_file) {
+                        append_service_diagnostic_log(&format!(
+                            "worker_drop_cleanup_failed error={error}"
+                        ));
+                    }
+                    if let Err(error) = self.recover_worker_recording(&worker.ownership_file) {
+                        append_service_diagnostic_log(&format!(
+                            "worker_drop_recording_cleanup_failed error={error}"
+                        ));
+                    }
                 }
             }
         }

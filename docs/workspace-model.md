@@ -147,3 +147,13 @@ inline 上限和完整 artifact 引用。完整结果在 worker 回复前原子�
 recording workflow 返回同一类引用字段，并增加 `recording_id`。报告或 agent 不应猜测 `events/` 内部文件名来确认一次 recording 是否完成，而应优先通过 operation/artifact refs 找到 `recording.json`、`trace.etl` 和 category event artifacts。
 
 报告或分析笔记应在 `analysis/` 下用 Markdown 引用这些 id，例如 `operation_id=op-...`、`artifact_id=artifact-...`、`session_id=session-...`。解释、假设和结论只写入 Markdown，不写入 facts JSONL。
+
+## 迭代 2 会话与操作记录
+
+既有 artifacts/sessions/<session_id>/ 和 artifacts/recordings/<recording_id>/ 内增加 schema_version=1 的 session.json。录制的两个 ID 字段同值。布局、旧文件和既有编号不迁移。
+
+operations.jsonl 追加 session_id、input、execution_context、update_seq、output_error、related_operation_id。已接受操作先落盘再执行，同 ID 的原始更新均保留，list/get 按序归并为最新状态，已记录输入和执行快照不可被后续会话变化覆盖。旧行缺失字段按未知读取。执行已完成而归档失败时分别表达结果和输出可用性，不重放动作。
+
+worker 退出等异步事实写入会话目录 session-events.jsonl，不虚构客户端业务动作。owned-processes.json、owned-helper-*.json、recovery.json 和未确认 launch 标记是本机执行侧清理证据；不把它们当作跨主机协议或稳定目标内容身份。
+
+本服务运行期保留终态摘要；服务重启不从 session.json 恢复可执行会话。完整跨重启查询和 SQLite 仍属于迭代 4。

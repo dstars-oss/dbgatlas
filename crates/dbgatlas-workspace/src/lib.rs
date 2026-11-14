@@ -1,3 +1,4 @@
+static OPERATION_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use dbgatlas_model::{ArtifactRef, Id, InvalidId, OperationRef, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,8 @@ pub struct ArtifactMetadata {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OperationRecord {
+    #[serde(default, flatten)]
+    pub details: dbgatlas_model::OperationDetails,
     pub operation_id: OperationRef,
     pub adapter_id: String,
     pub capability: String,
@@ -117,18 +120,7 @@ pub struct WorkspaceFacts {
     pub command_audit: Vec<CommandAuditRecord>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationStatus {
-    #[serde(alias = "Running")]
-    Running,
-    #[serde(alias = "Success")]
-    Success,
-    #[serde(alias = "Failed")]
-    Failed,
-    #[serde(alias = "Canceled")]
-    Canceled,
-}
+pub use dbgatlas_model::OperationState as OperationStatus;
 
 #[derive(Clone, Debug)]
 pub struct Workspace {
@@ -271,11 +263,54 @@ impl Workspace {
     }
 
     pub fn append_operation(&self, record: &OperationRecord) -> Result<(), WorkspaceError> {
-        append_json_line(self.root.join(OPERATIONS_LOG), record)
+        let _guard = OPERATION_LOG_LOCK.lock().map_err(|_| WorkspaceError::Io {
+            path: self.root.join(OPERATIONS_LOG),
+            source: std::io::Error::other("operation log lock poisoned"),
+        })?;
+        let mut record = record.clone();
+        if let Some(previous) = self
+            .list_operations_unlocked()?
+            .into_iter()
+            .find(|p| p.operation_id == record.operation_id)
+        {
+            record.created_at = previous.created_at;
+            record.details.session_id = previous.details.session_id.or(record.details.session_id);
+            record.details.input = previous.details.input.or(record.details.input);
+            record.details.execution_context = previous
+                .details
+                .execution_context
+                .or(record.details.execution_context);
+            if record.details.related_operation_id.is_none() {
+                record.details.related_operation_id = previous.details.related_operation_id;
+            }
+            if record.details.output_error.is_none() {
+                record.details.output_error = previous.details.output_error;
+            }
+            record.details.update_seq = previous.details.update_seq + 1;
+        }
+        append_json_line(self.root.join(OPERATIONS_LOG), &record)
     }
 
     pub fn list_operations(&self) -> Result<Vec<OperationRecord>, WorkspaceError> {
-        read_json_lines(self.root.join(OPERATIONS_LOG))
+        let _guard = OPERATION_LOG_LOCK.lock().map_err(|_| WorkspaceError::Io {
+            path: self.root.join(OPERATIONS_LOG),
+            source: std::io::Error::other("operation log lock poisoned"),
+        })?;
+        self.list_operations_unlocked()
+    }
+
+    fn list_operations_unlocked(&self) -> Result<Vec<OperationRecord>, WorkspaceError> {
+        let records: Vec<OperationRecord> = read_json_lines(self.root.join(OPERATIONS_LOG))?;
+        let mut latest = std::collections::BTreeMap::new();
+        for record in records {
+            let key = record.operation_id.to_string();
+            if latest.get(&key).is_none_or(|old: &OperationRecord| {
+                old.details.update_seq <= record.details.update_seq
+            }) {
+                latest.insert(key, record);
+            }
+        }
+        Ok(latest.into_values().collect())
     }
 
     pub fn get_operation(
@@ -508,6 +543,39 @@ fn read_json_lines<T: DeserializeOwned>(path: PathBuf) -> Result<Vec<T>, Workspa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_journal_merges_updates_without_inventing_identity_or_changing_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path().join("legacy"), Default::default()).unwrap();
+        let legacy = serde_json::json!({"operation_id":{"id":"old-op"},"adapter_id":"service","capability":"debug.eval",
+            "status":"Running","created_at":{"unix_millis":1},"summary":"old","artifacts":[],"raw_output":null});
+        std::fs::write(workspace.root().join(OPERATIONS_LOG), format!("{legacy}\n")).unwrap();
+        let id = OperationRef::new(Id::new("old-op").unwrap());
+        let mut record = workspace.get_operation(&id).unwrap().unwrap();
+        assert!(record.details.session_id.is_none());
+        assert!(record.details.execution_context.is_none());
+        record.status = OperationStatus::Unknown;
+        record.details.input = Some(serde_json::json!({"command":"original"}));
+        workspace.append_operation(&record).unwrap();
+        record.details.input = Some(serde_json::json!({"command":"replacement"}));
+        workspace.append_operation(&record).unwrap();
+        let merged = workspace.list_operations().unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].details.update_seq, 2);
+        assert_eq!(
+            merged[0].details.input.as_ref().unwrap()["command"],
+            "original"
+        );
+        assert_eq!(merged[0].status, OperationStatus::Unknown);
+        assert_eq!(
+            std::fs::read_to_string(workspace.root().join(OPERATIONS_LOG))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+    }
 
     #[test]
     fn init_creates_visible_workspace_layout() {

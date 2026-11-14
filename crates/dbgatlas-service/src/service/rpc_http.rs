@@ -2,8 +2,11 @@ use super::*;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceOperation {
+    #[serde(flatten)]
+    pub details: dbgatlas_model::OperationDetails,
     pub operation_id: OperationRef,
     pub capability: String,
+    #[serde(skip)]
     pub session_id: Option<SessionRef>,
     pub status: ServiceOperationStatus,
     pub summary: String,
@@ -24,6 +27,10 @@ impl ServiceOperation {
     ) -> Self {
         let now = Timestamp::now();
         Self {
+            details: dbgatlas_model::OperationDetails {
+                session_id: session_id.clone(),
+                ..Default::default()
+            },
             operation_id,
             capability: capability.into(),
             session_id,
@@ -45,6 +52,10 @@ impl ServiceOperation {
     ) -> Self {
         let now = Timestamp::now();
         Self {
+            details: dbgatlas_model::OperationDetails {
+                session_id: session_id.clone(),
+                ..Default::default()
+            },
             operation_id,
             capability: capability.into(),
             session_id,
@@ -66,6 +77,10 @@ impl ServiceOperation {
     ) -> Self {
         let now = Timestamp::now();
         Self {
+            details: dbgatlas_model::OperationDetails {
+                session_id: session_id.clone(),
+                ..Default::default()
+            },
             operation_id,
             capability: capability.into(),
             session_id,
@@ -80,14 +95,7 @@ impl ServiceOperation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceOperationStatus {
-    Running,
-    Success,
-    Failed,
-    Canceled,
-}
+pub use dbgatlas_model::OperationState as ServiceOperationStatus;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceEvent {
@@ -322,6 +330,7 @@ pub(super) fn append_worker_transport_log(
 
 pub(super) fn worker_response_kind(response: &WorkerResponse) -> &'static str {
     match response {
+        WorkerResponse::Recording { .. } => "recording",
         WorkerResponse::Ok { .. } => "ok",
         WorkerResponse::DebugCommand { .. } => "debug_command",
         WorkerResponse::DebugMemory { .. } => "debug_memory",

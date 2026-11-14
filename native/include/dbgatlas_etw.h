@@ -140,6 +140,9 @@ typedef struct DA_EtwSessionStopResult {
 typedef struct DA_EtwSessionHandle DA_EtwSessionHandle;
 
 DA_ETW_EXPORT int32_t da_etw_abi_version(DA_EtwVersion* out);
+DA_ETW_EXPORT int32_t da_etw_profile_interval(uint32_t* interval_us);
+DA_ETW_EXPORT int32_t da_etw_recover_session(const char* session_name_utf8, const char* expected_trace_path_utf8,
+    uint32_t previous_interval_us, uint32_t applied_interval_us);
 DA_ETW_EXPORT int32_t da_etw_adapter_info(DA_EtwAdapterInfo* out);
 DA_ETW_EXPORT int32_t da_etw_last_error(
     char* buffer,

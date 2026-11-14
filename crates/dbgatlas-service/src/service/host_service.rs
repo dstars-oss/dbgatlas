@@ -1,12 +1,20 @@
 use super::*;
+use std::thread;
 
 impl ServiceHost {
     pub fn new(supervisor: Arc<dyn WorkerSupervisor>) -> Self {
         Self {
+            service_instance: format!(
+                "service-{}-{}",
+                std::process::id(),
+                Timestamp::now().unix_millis
+            ),
             state: Arc::new(Mutex::new(ServiceState::default())),
             supervisor,
             capabilities: ServiceCapabilities::from_runtime_config(&RuntimeConfig::default()),
+            #[cfg(test)]
             ttd_runner: Arc::new(ProcessTtdRecorderRunner),
+            #[cfg(test)]
             etw_controller: Arc::new(NativeEtwController),
         }
     }
@@ -49,122 +57,78 @@ impl ServiceHost {
     }
 
     pub(super) fn shutdown_workers_gracefully(&self, timeout: Duration) {
-        let sessions = match self.lock_state() {
-            Ok(state) => state
-                .sessions
-                .values()
-                .filter(|session| !session.state.is_terminal())
-                .cloned()
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                append_service_diagnostic_log(&format!(
-                    "worker_shutdown_snapshot_failed error={}",
-                    sanitize_log_value(&error.to_string())
-                ));
-                return;
-            }
+        let (debug, recordings) = match self.lock_state() {
+            Ok(state) => (
+                state.sessions.values().cloned().collect::<Vec<_>>(),
+                state
+                    .remote_recordings
+                    .values()
+                    .filter(|r| {
+                        !state
+                            .summaries
+                            .get(r.session_id.id.as_str())
+                            .is_some_and(|s| s.cleanup.complete)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            Err(_) => return,
         };
-        append_service_diagnostic_log(&format!(
-            "worker_shutdown_start session_count={} timeout_ms={}",
-            sessions.len(),
-            timeout.as_millis()
-        ));
-        for session in sessions {
+        for session in debug {
             self.shutdown_session_worker(session, timeout);
         }
-        append_service_diagnostic_log("worker_shutdown_complete");
+        for recording in recordings {
+            let host = self.clone();
+            let id = recording.session_id.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(host.recording_stop(Some(json!({"recording_id":id}))));
+            });
+            if !matches!(rx.recv_timeout(timeout), Ok(Ok(_))) {
+                let cleanup = self.supervisor.kill_worker(&recording.worker);
+                let _ = self.set_session_terminal(
+                    &recording.session_id,
+                    true,
+                    cleanup.is_ok(),
+                    Some("service shutdown forced recording cleanup".into()),
+                );
+                if cleanup.is_ok() {
+                    let _ = self.release_recording_slot(&recording);
+                }
+            }
+        }
     }
 
     pub(super) fn shutdown_session_worker(&self, session: ManagedSession, timeout: Duration) {
-        let started = Instant::now();
-        loop {
-            match session.request_lock.try_lock() {
-                Ok(_guard) => {
-                    let request = match session.capability.as_str() {
-                        "debug" => WorkerRequest::CloseSession {
-                            session_id: session.session_id.clone(),
-                        },
-                        _ => {
-                            let _ = self.supervisor.kill_worker(&session.worker);
-                            return;
-                        }
-                    };
-                    match self.supervisor.request_worker_with_timeout(
-                        &session.worker,
-                        request,
-                        timeout,
-                    ) {
-                        Ok(WorkerResponse::Ok { .. }) => {
-                            if let Err(error) = self.supervisor.close_worker(&session.worker) {
-                                append_service_diagnostic_log(&format!(
-                                    "worker_shutdown_close_failed worker_id={} session_id={} capability={} error={}",
-                                    sanitize_log_value(session.worker.worker_id.as_str()),
-                                    sanitize_log_value(session.session_id.id.as_str()),
-                                    sanitize_log_value(&session.capability),
-                                    sanitize_log_value(&error.to_string())
-                                ));
-                                let _ = self.supervisor.kill_worker(&session.worker);
-                            }
-                        }
-                        Ok(other) => {
-                            append_service_diagnostic_log(&format!(
-                                "worker_shutdown_unexpected_response worker_id={} session_id={} capability={} response={}",
-                                sanitize_log_value(session.worker.worker_id.as_str()),
-                                sanitize_log_value(session.session_id.id.as_str()),
-                                sanitize_log_value(&session.capability),
-                                sanitize_log_value(&format!("{other:?}"))
-                            ));
-                            let _ = self.supervisor.kill_worker(&session.worker);
-                        }
-                        Err(error) => {
-                            append_service_diagnostic_log(&format!(
-                                "worker_shutdown_request_failed worker_id={} session_id={} capability={} error={}",
-                                sanitize_log_value(session.worker.worker_id.as_str()),
-                                sanitize_log_value(session.session_id.id.as_str()),
-                                sanitize_log_value(&session.capability),
-                                sanitize_log_value(&error.to_string())
-                            ));
-                            let _ = self.supervisor.kill_worker(&session.worker);
-                        }
-                    }
-                    self.mark_session_closed_for_shutdown(&session);
-                    return;
+        let host = self.clone();
+        let id = session.session_id.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let result = host.debug_session_close(Some(json!({"session_id":id})));
+                if matches!(result, Err(ServiceError::SessionBusy(_))) && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
                 }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    append_service_diagnostic_log(&format!(
-                        "worker_shutdown_lock_poisoned worker_id={} session_id={}",
-                        sanitize_log_value(session.worker.worker_id.as_str()),
-                        sanitize_log_value(session.session_id.id.as_str())
-                    ));
-                    let _ = self.supervisor.kill_worker(&session.worker);
-                    self.mark_session_closed_for_shutdown(&session);
-                    return;
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if started.elapsed() >= timeout {
-                        append_service_diagnostic_log(&format!(
-                            "worker_shutdown_lock_timeout worker_id={} session_id={} timeout_ms={}",
-                            sanitize_log_value(session.worker.worker_id.as_str()),
-                            sanitize_log_value(session.session_id.id.as_str()),
-                            timeout.as_millis()
-                        ));
-                        let _ = self.supervisor.kill_worker(&session.worker);
-                        self.mark_session_closed_for_shutdown(&session);
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
+                let _ = tx.send(result);
+                break;
+            }
+        });
+        if !matches!(rx.recv_timeout(timeout), Ok(Ok(_))) {
+            let cleanup = self.supervisor.kill_worker(&session.worker);
+            let _ = self.set_session_terminal(
+                &session.session_id,
+                true,
+                cleanup.is_ok(),
+                Some("service shutdown forced worker cleanup".into()),
+            );
+            if cleanup.is_ok() {
+                if let Ok(mut state) = self.lock_state() {
+                    state.sessions.remove(session.session_id.id.as_str());
                 }
             }
-        }
-    }
-
-    pub(super) fn mark_session_closed_for_shutdown(&self, session: &ManagedSession) {
-        let Ok(mut state) = self.lock_state() else {
-            return;
-        };
-        if let Some(current) = state.sessions.get_mut(session.session_id.id.as_str()) {
-            current.state = DebugSessionState::Closed;
-            current.updated_at = Timestamp::now();
         }
     }
 
@@ -189,6 +153,56 @@ impl ServiceHost {
         spec: MethodSpec,
         params: Option<Value>,
     ) -> Result<Value, ServiceError> {
+        let incoming_id = params.as_ref().and_then(|p| {
+            extract_ref_id_field(p, "session_id")
+                .or_else(|| extract_ref_id_field(p, "recording_id"))
+        });
+        let observe = matches!(
+            spec.route,
+            MethodRoute::Debug | MethodRoute::Recording | MethodRoute::Operation
+        );
+        let mut result = self.dispatch_method_inner(spec, params);
+        if observe {
+            let session_id = result
+                .as_ref()
+                .ok()
+                .and_then(|r| {
+                    extract_ref_id_field(r, "session_id")
+                        .or_else(|| extract_ref_id_field(r, "recording_id"))
+                })
+                .or(incoming_id);
+            if let Some(id) = session_id {
+                let summary = self.session_get(Some(json!({"session_id":id})))?;
+                let session: dbgatlas_model::Session = serde_json::from_value(summary.clone())?;
+                if let Some(operation_id) = &session.last_operation_id {
+                    if let Some(record) =
+                        Workspace::open(&session.workspace.root)?.get_operation(operation_id)?
+                    {
+                        let mut state = self.lock_state()?;
+                        if let Some(operation) = state.operations.get_mut(operation_id.id.as_str())
+                        {
+                            if operation.details.output_error.is_none()
+                                || record.status == operation.status
+                            {
+                                operation.details = record.details;
+                                operation.status = record.status;
+                            }
+                        }
+                    }
+                }
+                if let Ok(value) = &mut result {
+                    value["session"] = summary;
+                }
+            }
+        }
+        result
+    }
+
+    fn dispatch_method_inner(
+        &self,
+        spec: MethodSpec,
+        params: Option<Value>,
+    ) -> Result<Value, ServiceError> {
         let name = spec.name.as_str();
         match spec.route {
             MethodRoute::Service => match name {
@@ -198,6 +212,7 @@ impl ServiceHost {
                 _ => unhandled_registered_method(name),
             },
             MethodRoute::Session => match name {
+                "session.get" => self.session_get(params),
                 "session.list" => self.session_list(params),
                 _ => unhandled_registered_method(name),
             },
@@ -348,31 +363,53 @@ impl ServiceHost {
     }
 
     pub(super) fn session_list(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        if let Some(params) = params {
-            if !params.is_object() {
-                return Err(ServiceError::Rpc(
-                    "session.list arguments must be a JSON object".to_string(),
-                ));
-            }
+        let params = params.unwrap_or_else(|| json!({}));
+        if !params.is_object() {
+            return Err(ServiceError::Rpc(
+                "session.list arguments must be an object".into(),
+            ));
         }
-        let mut sessions = {
+        let kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("debug");
+        if !["debug", "recording", "all"].contains(&kind) {
+            return Err(ServiceError::Rpc("invalid session kind".into()));
+        }
+        let include_terminal = params
+            .get("include_terminal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ids: Vec<_> = self
+            .lock_state()?
+            .summaries
+            .values()
+            .filter(|s| {
+                (kind == "all"
+                    || (kind == "debug") == (s.kind == dbgatlas_model::SessionKind::Debug))
+                    && (include_terminal || !s.lifecycle.is_terminal())
+            })
+            .map(|s| s.session_id.clone())
+            .collect();
+        let mut sessions = Vec::new();
+        for id in ids {
+            let summary = self.session_get(Some(json!({"session_id":id})))?;
+            if !include_terminal
+                && matches!(summary["lifecycle"].as_str(), Some("closed" | "failed"))
+            {
+                continue;
+            }
             let state = self.lock_state()?;
-            state
-                .sessions
-                .values()
-                .map(SessionListItem::from)
-                .collect::<Vec<_>>()
-        };
-        sessions.sort_by(|left, right| {
-            left.session_id
-                .id
-                .as_str()
-                .cmp(right.session_id.id.as_str())
-        });
-        Ok(json!({
-            "count": sessions.len(),
-            "sessions": sessions,
-        }))
+            let mut item = if let Some(session) = state.sessions.get(id.id.as_str()) {
+                serde_json::to_value(SessionListItem::from(session))?
+            } else {
+                summary.clone()
+            };
+            item["session"] = summary;
+            sessions.push(item);
+        }
+        sessions.sort_by_key(|s| s["session_id"].to_string());
+        Ok(json!({"count":sessions.len(), "sessions":sessions}))
     }
 
     pub(super) fn service_info(&self) -> Result<Value, ServiceError> {
@@ -408,60 +445,119 @@ impl ServiceHost {
 
     pub(super) fn operation_cancel(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         let params: OperationGetParams = parse_params(params)?;
-        let (operation, session) = {
-            let mut state = self.lock_state()?;
+        let (original, session) = {
+            let state = self.lock_state()?;
             let operation = state
                 .operations
-                .get_mut(params.operation_id.id.as_str())
+                .get(params.operation_id.id.as_str())
+                .cloned()
                 .ok_or_else(|| ServiceError::OperationNotFound(params.operation_id.to_string()))?;
             if operation.status != ServiceOperationStatus::Running {
                 return Err(ServiceError::OperationNotCancelable(
                     params.operation_id.to_string(),
                 ));
             }
-            operation.status = ServiceOperationStatus::Canceled;
-            operation.summary = "operation canceled".to_string();
-            operation.updated_at = Timestamp::now();
-            operation.events.push(ServiceEvent {
-                timestamp: Timestamp::now(),
-                kind: "canceled".to_string(),
-                message: "operation canceled by request".to_string(),
-            });
-            let operation = operation.clone();
             let session = operation
                 .session_id
                 .as_ref()
-                .and_then(|session_id| state.sessions.get(session_id.id.as_str()).cloned());
+                .and_then(|id| state.sessions.get(id.id.as_str()))
+                .cloned();
             (operation, session)
         };
-
-        if let Some(session) = session {
-            let cancel_outcome = self.supervisor.cancel_worker_operation(
-                &session.worker,
-                &session.session_id,
-                &params.operation_id,
-            )?;
-            if cancel_outcome == WorkerCancelOutcome::WorkerKilled {
-                let mut state = self.lock_state()?;
-                if let Some(session) = state.sessions.get_mut(session.session_id.id.as_str()) {
-                    session.state = DebugSessionState::Error;
-                    session.updated_at = Timestamp::now();
-                }
+        let session = session.ok_or_else(|| {
+            ServiceError::Rpc(
+                "operation cancellation is unsupported; use the recording stop/kill action".into(),
+            )
+        })?;
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let cancellation_id = next_operation_ref();
+        self.begin_operation_record(
+            &workspace,
+            &cancellation_id,
+            &session.session_id,
+            "operation.cancel",
+            json!({"operation_id":params.operation_id}),
+        )?;
+        let outcome = match self.supervisor.cancel_worker_operation(
+            &session.worker,
+            &session.session_id,
+            &params.operation_id,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.append_operation_result(
+                    &workspace,
+                    &OperationRecord {
+                        details: dbgatlas_model::OperationDetails {
+                            related_operation_id: Some(params.operation_id),
+                            ..Default::default()
+                        },
+                        operation_id: cancellation_id,
+                        adapter_id: "service".into(),
+                        capability: "operation.cancel".into(),
+                        status: OperationStatus::Failed,
+                        created_at: Timestamp::now(),
+                        summary: error.to_string(),
+                        artifacts: vec![],
+                        raw_output: None,
+                    },
+                )?;
+                return Err(error);
             }
-            let workspace = Workspace::open(&session.internal_workspace_root)?;
-            workspace.append_operation(&OperationRecord {
-                operation_id: params.operation_id,
-                adapter_id: "service".to_string(),
-                capability: operation.capability.clone(),
-                status: OperationStatus::Canceled,
-                created_at: Timestamp::now(),
-                summary: "operation canceled".to_string(),
-                artifacts: operation.artifacts.clone(),
-                raw_output: operation.raw_output.clone(),
-            })?;
+        };
+        if outcome == WorkerCancelOutcome::WorkerKilled {
+            self.mark_debug_session_error(&session.session_id)?;
+            self.finish_operation_in_memory(
+                &params.operation_id,
+                ServiceOperationStatus::Unknown,
+                "worker terminated; original operation outcome unknown".into(),
+                original.artifacts.clone(),
+                original.raw_output.clone(),
+            )?;
+            self.append_operation_result(
+                &workspace,
+                &OperationRecord {
+                    details: Default::default(),
+                    operation_id: params.operation_id.clone(),
+                    adapter_id: "service".into(),
+                    capability: original.capability,
+                    status: OperationStatus::Unknown,
+                    created_at: Timestamp::now(),
+                    summary: "worker terminated; outcome unknown".into(),
+                    artifacts: original.artifacts,
+                    raw_output: original.raw_output,
+                },
+            )?;
         }
-
-        Ok(serde_json::to_value(operation)?)
+        self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: dbgatlas_model::OperationDetails {
+                    related_operation_id: Some(params.operation_id.clone()),
+                    ..Default::default()
+                },
+                operation_id: cancellation_id.clone(),
+                adapter_id: "service".into(),
+                capability: "operation.cancel".into(),
+                status: OperationStatus::Success,
+                created_at: Timestamp::now(),
+                summary: "cancellation request delivered; original result reported separately"
+                    .into(),
+                artifacts: vec![],
+                raw_output: None,
+            },
+        )?;
+        self.finish_operation_in_memory(
+            &cancellation_id,
+            ServiceOperationStatus::Success,
+            "cancellation request delivered".into(),
+            vec![],
+            None,
+        )?;
+        let mut result = self.operation_get(Some(json!({"operation_id":params.operation_id})))?;
+        result["cancellation_operation_id"] = serde_json::to_value(cancellation_id)?;
+        result["cancellation_requested"] = json!(true);
+        Ok(result)
     }
 
     pub(super) fn operation_stream(&self, params: Option<Value>) -> Result<Value, ServiceError> {

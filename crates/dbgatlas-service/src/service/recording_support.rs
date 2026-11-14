@@ -864,7 +864,24 @@ pub(super) enum TtdRecorderProcess {
     RawWindows(windows_active_user_process::RawProcess),
 }
 
+impl Drop for TtdRecorderProcess {
+    fn drop(&mut self) {
+        if matches!(self.try_wait(), Ok(None)) {
+            let _ = self.kill();
+            let _ = self.wait();
+        }
+    }
+}
+
 impl TtdRecorderProcess {
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Std(child) => child.id(),
+            #[cfg(windows)]
+            Self::RawWindows(child) => child.pid(),
+        }
+    }
+
     pub(super) fn try_wait(&mut self) -> Result<Option<Option<i32>>, std::io::Error> {
         match self {
             Self::Std(child) => child
@@ -908,17 +925,17 @@ pub(super) fn spawn_ttd_process(
     }
     match worker_identity {
         TtdRecorderIdentity::Default => {
-            let stdout = fs::File::create(stdout_path)?;
-            let stderr = fs::File::create(stderr_path)?;
-            let mut command = Command::new(ttd_exe);
-            command
-                .args(args)
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr));
-            if let Some(current_dir) = current_dir {
-                command.current_dir(current_dir);
-            }
-            Ok(TtdRecorderProcess::Std(command.spawn()?))
+            let helper_exe = std::env::current_exe()?.with_file_name("dbgatlas.exe");
+            let helper_args =
+                ttd_command_helper_args(ttd_exe, args, current_dir, stdout_path, stderr_path);
+            Ok(TtdRecorderProcess::Std(
+                Command::new(helper_exe)
+                    .args(helper_args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            ))
         }
         TtdRecorderIdentity::ActiveInteractiveUser => spawn_active_interactive_ttd_process(
             ttd_exe,
@@ -938,7 +955,7 @@ pub(super) fn spawn_active_interactive_ttd_process(
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<TtdRecorderProcess, ServiceError> {
-    let helper_exe = std::env::current_exe()?;
+    let helper_exe = std::env::current_exe()?.with_file_name("dbgatlas.exe");
     let helper_args = ttd_command_helper_args(ttd_exe, args, current_dir, stdout_path, stderr_path);
     windows_active_user_process::spawn_os(&helper_exe, &helper_args)
         .map(TtdRecorderProcess::RawWindows)
@@ -984,6 +1001,16 @@ pub(super) fn spawn_active_interactive_ttd_process(
 pub(super) fn run_ttd_process(
     invocation: TtdRecorderInvocation,
 ) -> Result<TtdProcessExit, ServiceError> {
+    let launched = invocation
+        .timeout_stop
+        .as_ref()
+        .is_some_and(|stop| stop.prefer_recorded_pid);
+    let mut target_instance = invocation
+        .timeout_stop
+        .as_ref()
+        .filter(|stop| !stop.prefer_recorded_pid)
+        .and_then(|stop| stop.stop_target.to_str()?.parse::<u32>().ok())
+        .and_then(|pid| crate::process_identity::inspect(pid).ok());
     let mut child = spawn_ttd_process(
         &invocation.ttd_exe,
         &invocation.args,
@@ -992,9 +1019,47 @@ pub(super) fn run_ttd_process(
         &invocation.stdout_path,
         &invocation.stderr_path,
     )?;
+    let ownership_file = invocation
+        .stdout_path
+        .parent()
+        .ok_or_else(|| ServiceError::Worker("missing recorder output directory".into()))?
+        .join("owned-processes.json");
+    let _recorder_instance =
+        match crate::process_identity::register(&ownership_file, child.pid(), "tool") {
+            Ok(instance) => instance,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        };
     let deadline = Instant::now() + invocation.timeout;
     loop {
+        if launched && target_instance.is_none() {
+            let output = read_text_lossy(&invocation.stdout_path)
+                + &read_text_lossy(&invocation.stderr_path);
+            if let Some(pid) = parse_first_recorded_pid(&output) {
+                if let Ok(instance) = crate::process_identity::inspect(pid) {
+                    if crate::process_identity::confirmed_tool_child(&ownership_file, &instance)? {
+                        target_instance = Some(crate::process_identity::register_instance(
+                            &ownership_file,
+                            instance,
+                            "target",
+                        )?);
+                    }
+                }
+            }
+        }
+        if let Some(instance) = &target_instance {
+            write_atomic_bytes(
+                &ownership_file.with_file_name("target-instance.json"),
+                &serde_json::to_vec(instance)?,
+            )?;
+        }
         if let Some(exit_code) = child.try_wait()? {
+            if exit_code == Some(0) {
+                crate::process_identity::release_targets(&ownership_file)?;
+            }
             return Ok(TtdProcessExit {
                 exit_code,
                 timed_out: false,
@@ -1008,11 +1073,24 @@ pub(super) fn run_ttd_process(
                 let recorder_exit_deadline = Instant::now() + timeout_stop.recorder_exit_timeout;
                 let mut timeout_stop = timeout_stop.clone();
                 if timeout_stop.prefer_recorded_pid {
-                    let recorder_output = read_text_lossy(&invocation.stdout_path)
-                        + "\n"
-                        + read_text_lossy(&invocation.stderr_path).as_str();
-                    if let Some(pid) = parse_first_recorded_pid(&recorder_output) {
-                        timeout_stop.stop_target = OsString::from(pid.to_string());
+                    let instance = target_instance.as_ref().ok_or_else(|| {
+                        ServiceError::Worker(
+                            "TTD launch target identity is unknown; refusing PID stop".into(),
+                        )
+                    })?;
+                    let current = crate::process_identity::inspect(instance.pid)?;
+                    if !instance.same_instance(&current) {
+                        return Err(ServiceError::Worker(
+                            "TTD target instance changed; refusing stop".into(),
+                        ));
+                    }
+                    timeout_stop.stop_target = OsString::from(instance.pid.to_string());
+                } else if let Some(instance) = &target_instance {
+                    let current = crate::process_identity::inspect(instance.pid)?;
+                    if !instance.same_instance(&current) {
+                        return Err(ServiceError::Worker(
+                            "TTD attach target instance changed; refusing stop".into(),
+                        ));
                     }
                 }
                 stop = Some(run_ttd_stop_process(
@@ -1108,6 +1186,11 @@ pub(super) fn run_ttd_command(
         stdout_path,
         stderr_path,
     )?;
+    let registry = stdout_path
+        .parent()
+        .ok_or_else(|| ServiceError::Worker("missing stop output directory".into()))?
+        .join("owned-processes.json");
+    crate::process_identity::register(&registry, child.pid(), "tool")?;
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(exit_code) = child.try_wait()? {

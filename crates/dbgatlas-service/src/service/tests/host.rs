@@ -1,5 +1,34 @@
 use super::*;
 
+#[cfg(windows)]
+#[test]
+fn target_instance_exit_is_observed_without_a_backend_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::with_mock_workers();
+    let result = host
+        .recording_start(Some(json!({
+            "project_root": temp.path(), "target": {"type":"attach", "pid":42}
+        })))
+        .unwrap();
+    let id: SessionRef = serde_json::from_value(result["session_id"].clone()).unwrap();
+    let mut old_instance = crate::process_identity::inspect(std::process::id()).unwrap();
+    // A different instance now occupies this PID: the recorded instance has ended.
+    old_instance.creation_time_100ns = old_instance.creation_time_100ns.map(|time| time - 1);
+    host.lock_state()
+        .unwrap()
+        .summaries
+        .get_mut(id.id.as_str())
+        .unwrap()
+        .target
+        .process = Some(old_instance);
+    let summary = host.session_get(Some(json!({"session_id":id}))).unwrap();
+    assert_eq!(summary["lifecycle"], "active");
+    assert_eq!(summary["target_state"]["state"], "exited");
+    assert_eq!(summary["target_state"]["source"], "process_monitor");
+    host.recording_stop(Some(json!({"recording_id":id})))
+        .unwrap();
+}
+
 #[test]
 fn unknown_methods_do_not_create_worker_or_operation() {
     let host = ServiceHost::new(Arc::new(FailingCreateWorkerSupervisor));
@@ -394,7 +423,7 @@ fn debug_eval_steps_propagates_internal_step_errors() {
 
     assert!(response.error.is_none(), "{:?}", response.error);
     let result = response.result.unwrap();
-    assert_eq!(result["operation_status"], "failed");
+    assert_eq!(result["operation_status"], "success");
     assert!(
         result["steps"][0]["error"]
             .as_str()
@@ -404,11 +433,13 @@ fn debug_eval_steps_propagates_internal_step_errors() {
     let state = host.lock_state().unwrap();
     assert!(state.operations.values().any(|operation| {
         operation.capability == "debug.eval_steps.step"
-            && operation.status == ServiceOperationStatus::Failed
+            && operation.status == ServiceOperationStatus::Success
+            && operation.details.output_error.is_some()
     }));
     assert!(state.operations.values().any(|operation| {
         operation.capability == "debug.eval_steps"
-            && operation.status == ServiceOperationStatus::Failed
+            && operation.status == ServiceOperationStatus::Success
+            && operation.details.output_error.is_some()
     }));
 }
 
@@ -423,7 +454,9 @@ fn debug_eval_artifact_registration_failure_finalizes_operation() {
 
     let state = host.lock_state().unwrap();
     assert!(state.operations.values().any(|operation| {
-        operation.capability == "debug.eval" && operation.status == ServiceOperationStatus::Failed
+        operation.capability == "debug.eval"
+            && operation.status == ServiceOperationStatus::Success
+            && operation.details.output_error.is_some()
     }));
     drop(state);
     let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
@@ -434,11 +467,11 @@ fn debug_eval_artifact_registration_failure_finalizes_operation() {
             .iter()
             .any(|operation| {
                 operation.capability == "debug.eval"
-                    && matches!(operation.status, OperationStatus::Failed)
+                    && matches!(operation.status, OperationStatus::Success)
             })
     );
     assert!(workspace.list_command_audit().unwrap().iter().any(|audit| {
-        audit.capability == "debug.eval" && matches!(audit.status, OperationStatus::Failed)
+        audit.capability == "debug.eval" && matches!(audit.status, OperationStatus::Success)
     }));
 }
 
@@ -911,7 +944,7 @@ fn debug_eval_timeout_kills_worker_and_marks_session_error() {
             .values()
             .find(|operation| operation.capability == "debug.eval")
             .unwrap();
-        assert_eq!(operation.status, ServiceOperationStatus::Failed);
+        assert_eq!(operation.status, ServiceOperationStatus::Unknown);
     }
 
     let cleanup = host.handle_rpc(JsonRpcRequest {
@@ -985,7 +1018,7 @@ fn cancel_rejects_completed_operation_without_changing_status() {
 }
 
 #[test]
-fn cancel_marks_running_operation_as_canceled() {
+fn cancel_acceptance_does_not_override_successful_execution() {
     let temp = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(InstrumentedWorkerSupervisor::wait_for_cancel());
     let host = ServiceHost::new(supervisor.clone());
@@ -1022,11 +1055,12 @@ fn cancel_marks_running_operation_as_canceled() {
         method: "operation.get".to_string(),
         params: Some(json!({ "operation_id": operation_id })),
     });
-    assert_eq!(get.result.unwrap()["status"], "canceled");
+    assert_eq!(get.result.unwrap()["status"], "success");
+    assert_eq!(cancel.result.unwrap()["cancellation_requested"], true);
 }
 
 #[test]
-fn eval_requests_for_one_session_are_serialized() {
+fn busy_session_rejects_a_second_operation_without_queueing() {
     let temp = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(InstrumentedWorkerSupervisor::with_delay(100));
     let host = ServiceHost::new(supervisor.clone());
@@ -1038,8 +1072,15 @@ fn eval_requests_for_one_session_are_serialized() {
 
     let first = std::thread::spawn(move || eval_request(&first_host, first_session, ".echo 1"));
     let second = std::thread::spawn(move || eval_request(&second_host, second_session, ".echo 2"));
-    assert!(first.join().unwrap().error.is_none());
-    assert!(second.join().unwrap().error.is_none());
+    let responses = [first.join().unwrap(), second.join().unwrap()];
+    assert_eq!(responses.iter().filter(|r| r.error.is_none()).count(), 1);
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|r| r.error.as_ref().is_some_and(|e| e.code == -32017))
+            .count(),
+        1
+    );
 
     assert_eq!(supervisor.max_active.load(Ordering::SeqCst), 1);
 }
@@ -1114,7 +1155,7 @@ fn concurrent_close_rechecks_latest_session_state() {
             response
                 .error
                 .as_ref()
-                .is_some_and(|error| error.code == -32010)
+                .is_some_and(|error| matches!(error.code, -32010 | -32017))
         })
         .count();
 
@@ -1137,7 +1178,10 @@ fn eval_after_concurrent_close_rechecks_latest_session_state() {
     std::thread::sleep(Duration::from_millis(10));
     let eval = std::thread::spawn(move || eval_request(&eval_host, eval_session, ".echo late"));
     assert!(close.join().unwrap().error.is_none());
-    assert_eq!(eval.join().unwrap().error.unwrap().code, -32010);
+    assert!(matches!(
+        eval.join().unwrap().error.unwrap().code,
+        -32010 | -32017 | -32011
+    ));
 }
 
 #[test]
@@ -1174,5 +1218,100 @@ fn read_memory_registers_memory_artifact() {
         operations
             .iter()
             .any(|operation| operation.capability == "debug.read_memory")
+    );
+}
+
+#[test]
+fn session_summary_binding_terminal_history_and_operation_context_are_stable() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::with_mock_workers();
+    let first = create_debug_session(&host, temp.path()).result.unwrap();
+    let second = create_debug_session(&host, temp.path()).result.unwrap();
+    let a: SessionRef = serde_json::from_value(first["session_id"].clone()).unwrap();
+    let b: SessionRef = serde_json::from_value(second["session_id"].clone()).unwrap();
+    let old = host.session_get(Some(json!({"session_id":a}))).unwrap();
+    let other_worker = host.lock_state().unwrap().sessions[b.id.as_str()]
+        .worker
+        .clone();
+    assert!(
+        host.bind_session_worker(&a, &other_worker, "dbgeng")
+            .is_err()
+    );
+    assert_ne!(
+        old["worker"]["worker_id"],
+        second["session"]["worker"]["worker_id"]
+    );
+    let eval = eval_request(&host, serde_json::to_value(&a).unwrap(), ".echo snapshot")
+        .result
+        .unwrap();
+    let op: OperationRef = serde_json::from_value(eval["operation_id"].clone()).unwrap();
+    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let before = workspace.get_operation(&op).unwrap().unwrap();
+    assert!(before.details.input.is_some());
+    assert!(
+        before
+            .details
+            .execution_context
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_some()
+    );
+    close_request(&host, serde_json::to_value(&a).unwrap())
+        .result
+        .unwrap();
+    let closed = host.session_get(Some(json!({"session_id":a}))).unwrap();
+    assert_eq!(closed["lifecycle"], "closed");
+    assert_eq!(closed["cleanup"]["complete"], true);
+    assert_eq!(closed["worker"], old["worker"]);
+    assert_eq!(
+        workspace
+            .get_operation(&op)
+            .unwrap()
+            .unwrap()
+            .details
+            .execution_context,
+        before.details.execution_context
+    );
+    assert_eq!(host.session_list(None).unwrap()["count"], 1);
+    assert_eq!(
+        host.session_list(Some(json!({"include_terminal":true})))
+            .unwrap()["count"],
+        2
+    );
+    let history = workspace.list_operations().unwrap();
+    assert_eq!(history.iter().filter(|r| r.operation_id == op).count(), 1);
+    assert!(history.iter().any(|r| r.capability == "debug.session.close"
+        && r.details.input.is_some()
+        && r.details.update_seq >= 1));
+}
+
+#[test]
+fn recording_alias_and_default_session_scope_are_compatible() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ServiceHost::with_mock_workers();
+    let result = host
+        .recording_start(Some(
+            json!({"project_root":temp.path(),"target":{"type":"attach","pid":42}}),
+        ))
+        .unwrap();
+    assert_eq!(result["session_id"], result["recording_id"]);
+    assert_eq!(host.session_list(None).unwrap()["count"], 0);
+    assert_eq!(
+        host.session_list(Some(json!({"kind":"recording"})))
+            .unwrap()["count"],
+        1
+    );
+    host.recording_kill(Some(json!({"recording_id":result["recording_id"]})))
+        .unwrap();
+    assert_eq!(
+        host.session_list(Some(json!({"kind":"recording"})))
+            .unwrap()["count"],
+        0
+    );
+    assert_eq!(
+        host.session_list(Some(json!({"kind":"recording","include_terminal":true})))
+            .unwrap()["count"],
+        1
     );
 }

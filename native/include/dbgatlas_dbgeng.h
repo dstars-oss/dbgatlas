@@ -23,7 +23,9 @@ typedef enum DA_DbgEngStatus {
     DA_DBGENG_OK = 0,
     DA_DBGENG_ERR_INVALID_ARGUMENT = 1,
     DA_DBGENG_ERR_BUFFER_TOO_SMALL = 2,
-    DA_DBGENG_ERR_INTERNAL = 500
+    DA_DBGENG_ERR_INTERNAL = 500,
+    DA_DBGENG_ERR_OUTPUT_AFTER_SUCCESS = 501,
+    DA_DBGENG_ERR_OUTPUT_AFTER_FAILURE = 502
 } DA_DbgEngStatus;
 
 typedef struct DA_DbgEngVersion {
@@ -52,6 +54,18 @@ typedef struct DA_DbgEngArtifactResult {
 } DA_DbgEngArtifactResult;
 
 typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
+
+typedef struct DA_DbgEngState {
+    uint32_t struct_size;
+    uint32_t target_state; /* 0 unknown, 1 running, 2 stopped, 3 no debuggee */
+    uint32_t process_id;
+    uint32_t thread_id; /* debugger thread index; UINT32_MAX when unknown */
+    uint32_t frame_index; /* UINT32_MAX when unknown */
+} DA_DbgEngState;
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_state(DA_DbgEngSessionHandle* handle, DA_DbgEngState* out);
+/* On failure the handle remains valid and may be retried or explicitly disposed. */
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_commit_launch(DA_DbgEngSessionHandle* handle);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_detach(DA_DbgEngSessionHandle* handle);
 
 DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out);
 DA_DBGENG_EXPORT int32_t da_dbgeng_load_runtime(const char* dbgeng_dir_utf8);

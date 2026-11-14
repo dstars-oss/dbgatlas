@@ -65,6 +65,7 @@ pub(super) struct DebugStartFailure {
 }
 
 pub(super) struct DebugSessionStartAttempt {
+    pub(super) uncleaned_worker: Option<WorkerHandle>,
     pub(super) worker: Option<WorkerHandle>,
     pub(super) writes: Option<Vec<WorkerArtifactWrite>>,
     pub(super) failures: Vec<String>,
@@ -202,6 +203,7 @@ pub(super) fn rpc_error_for(error: ServiceError) -> JsonRpcError {
         ServiceError::SessionNotFound(_) => -32010,
         ServiceError::OperationNotFound(_) => -32011,
         ServiceError::SessionNotReusable(_) => -32012,
+        ServiceError::SessionBusy(_) => -32017,
         ServiceError::SessionAlreadyTerminal(_) => -32013,
         ServiceError::OperationNotCancelable(_) => -32014,
         ServiceError::RecordingNotFound(_) => -32015,

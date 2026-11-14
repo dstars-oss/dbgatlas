@@ -7,6 +7,16 @@ pub const DA_DBGENG_ERR_INTERNAL: i32 = 500;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct DA_DbgEngState {
+    pub struct_size: u32,
+    pub target_state: u32,
+    pub process_id: u32,
+    pub thread_id: u32,
+    pub frame_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DA_DbgEngVersion {
     pub struct_size: u32,
     pub flags: u32,
@@ -56,6 +66,12 @@ pub struct DA_DbgEngSessionHandle {
 #[cfg(windows)]
 #[link(name = "dbgatlas_dbgeng")]
 unsafe extern "C" {
+    pub fn da_dbgeng_session_state(
+        handle: *mut DA_DbgEngSessionHandle,
+        out: *mut DA_DbgEngState,
+    ) -> i32;
+    pub fn da_dbgeng_session_commit_launch(handle: *mut DA_DbgEngSessionHandle) -> i32;
+    pub fn da_dbgeng_session_detach(handle: *mut DA_DbgEngSessionHandle) -> i32;
     pub fn da_dbgeng_abi_version(out: *mut DA_DbgEngVersion) -> i32;
     pub fn da_dbgeng_load_runtime(dbgeng_dir_utf8: *const c_char) -> i32;
     pub fn da_dbgeng_release_view(owner: *mut c_void);

@@ -7,7 +7,7 @@
 - Backend：提供可操作的调试/采集上下文，负责原生执行和真实状态。
 - Native adapter：封装特定本机能力，例如 DbgEng C ABI；属于后端实现细节。
 - Transport：把请求、结果和事件送到后端，不决定调试命令含义。
-- Worker：隔离和承载后端的进程方式；不要求每个后端都是 DbgAtlas 创建的 worker。
+- Worker：隔离和承载后端的进程方式；本轮所有活动会话绑定 DbgAtlas 专用 worker；后续接入既有后端仍需保持其独立所有权。
 
 同一后端可有本机或远端连接方式。后端协议、控制端 RPC/MCP 和 native C ABI 是不同边界；不能直接把指针、本机句柄或控制端的绝对路径传成通用远端参数。
 
@@ -28,7 +28,7 @@
 
 ## 实施阶段
 
-迭代 2 实现环境/会话绑定、后端进程所有权、连接与执行责任分离，并让当前本机 debug 路径通过新边界。允许最小必要的请求/响应调整，需同步 CLI、RPC/MCP、测试和文档，不强行保留本机 worker 字段作为平台概念。
+迭代 2 实现环境/会话绑定、后端进程所有权、连接与执行责任分离，并让当前本机 debug、ETW 和 TTD 录制路径通过专用 worker 边界。允许最小必要的请求/响应调整，需同步 CLI、RPC/MCP、测试和文档，不强行保留本机 worker 字段作为平台概念。
 
 迭代 3 收敛原生 exec、长操作、事件读取及中断语义。等待超时只结束本次等待，不能隐含杀 worker；执行期限、显式取消和强制终止分别表达。具体 MCP 版本、Tasks 映射及客户端兼容策略在实际验证后确定，不声称当前已支持。
 
@@ -40,7 +40,7 @@
 
 此抽象没有完整的会话连接、进程所有权和异步中断契约；不能直接升级成覆盖所有后端的大接口。现有调试链路主要由 `ServiceHost`、`WorkerSupervisor` 与 worker 消息执行，不是全部经过 `Core::invoke()`。
 
-现有 worker protocol v6 是内部本机 JSONL 协议，包含 `StartDebugSession`、`EvalDebugCommand` 等请求及本机 `artifact_dir`。它可以作为本地实现材料，但不能直接视为最终跨机器协议。
+现有 worker protocol v7 是内部本机 JSONL 协议，包含 `StartDebugSession`、`EvalDebugCommand` 等请求及本机 `artifact_dir`。它可以作为本地实现材料，但不能直接视为最终跨机器协议。
 
 旧文档“第一版不设计 session trait/streaming callback”只反映早期短调用范围，不再限制当前环境、会话和进程架构调整。仍不引入与已实现路径无关的大型事件总线、插件系统或统一命令语言。
 

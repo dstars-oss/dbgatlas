@@ -2,6 +2,29 @@ use super::*;
 
 pub(super) fn mock_worker_response(request: WorkerRequest) -> Result<WorkerResponse, ServiceError> {
     match request {
+        WorkerRequest::Recording {
+            session_id,
+            operation_id,
+            action,
+            ..
+        } => {
+            let (state, status) = match action.as_str() {
+                "recording.start" => ("running", "success"),
+                "recording.stop" => ("stopped", "success"),
+                "recording.cancel" => ("canceled", "canceled"),
+                _ => {
+                    return Err(ServiceError::Worker(
+                        "mock recording action unsupported".into(),
+                    ));
+                }
+            };
+            Ok(WorkerResponse::Recording {
+                result: json!({"recording_id":session_id,"session_id":session_id,
+                "operation_id":operation_id,"state":state,"operation_status":status,"artifact_refs":[],
+                "warnings":["mock worker; no collection performed"]}),
+                writes: vec![],
+            })
+        }
         WorkerRequest::StartDebugSession { .. } => Ok(WorkerResponse::Ok {
             summary: "debug session started by mock worker".to_string(),
             writes: Vec::new(),

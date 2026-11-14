@@ -238,6 +238,7 @@ impl Core {
         artifacts: Vec<dbgatlas_model::ArtifactRef>,
     ) -> Result<(), CoreError> {
         let record = OperationRecord {
+            details: Default::default(),
             operation_id,
             adapter_id: adapter_id.as_str().to_string(),
             capability: capability.as_str().to_string(),
@@ -413,9 +414,20 @@ mod tests {
         .unwrap();
 
         let operations = core.workspace().list_operations().unwrap();
-        assert_eq!(operations.len(), 2);
+        assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].operation_id.id, operation_id.id);
-        assert!(matches!(operations[0].status, OperationStatus::Running));
-        assert!(matches!(operations[1].status, OperationStatus::Canceled));
+        assert!(matches!(operations[0].status, OperationStatus::Canceled));
+        assert_eq!(operations[0].details.update_seq, 1);
+        let raw = std::fs::read_to_string(
+            core.workspace()
+                .root()
+                .join(dbgatlas_workspace::OPERATIONS_LOG),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            2,
+            "original status updates remain available"
+        );
     }
 }
