@@ -1,6 +1,8 @@
 # DbgAtlas
 
-DbgAtlas is an AI-oriented debugging platform. AI clients use native debugger commands with session management, state, and recorded outputs. Windows debugging and recording are implemented first; remote backends, persistent searchable history, Linux, and a management UI follow the iterations in [GOALS.md](GOALS.md).
+DbgAtlas is an AI-oriented debugging platform. AI clients use native debugger commands with session management, state, and recorded outputs. Windows debugging and recording are implemented first; environment/session/process restructuring, remote backends, persistent searchable history, Linux, and a management UI follow [PLAN.md](PLAN.md).
+
+The [architecture specification](docs/architecture.md) and [environment/session model](docs/environment-session-model.md) define the target design. The next iteration restructures environments, sessions, and process ownership on the local path; remote transport and the later AI execution interface are separate iterations. See the [implementation baseline](docs/roadmap.md) for current code paths and limitations.
 
 IDA static analysis belongs to external tools. DbgAtlas provides debugger-native symbols, types, disassembly, and memory inspection.
 

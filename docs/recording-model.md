@@ -4,6 +4,8 @@ DbgAtlas 的 recording 能力负责采集、过滤和归档低层运行时事件
 
 recording 是独立产品能力，不依赖 debug session。调试和外部分析 workflow 可以引用 recording artifact，但 recording lifecycle 本身不要求已有 debug session。
 
+本文描述当前采集实现与产物。迭代 2 只调整执行依赖和环境归属，不要求所有采集器变成同一种 worker；后续目标边界见 [进程与生命周期](worker-model.md)。
+
 ## Goals
 
 - 使用 Windows ETW API 采集开发调试所需的低层事件。
@@ -25,8 +27,8 @@ recording 是独立产品能力，不依赖 debug session。调试和外部分�
 - `recording.start`：启动一次 recording，并返回 `recording_id`、`operation_id` 和初始 artifact 引用。
 - `recording.stop`：停止 recording，flush 过滤后的 ETL 和事件文件，并登记最终 artifact metadata。
 - `recording.status`：查询 recording 状态、target、开始时间、已登记 artifact 和最近 operation。
-- `recording.cancel`：协作式取消正在进行的 recording operation。
-- `recording.kill`：当 worker 卡死或无法协作停止时终止 recording worker，并把 operation 记录为 failed 或 canceled。
+- `recording.cancel`：经 finish_recording 停止并归档当前 ETW recording，将状态记为 canceled。
+- `recording.kill`：经同一终结路径停止并归档 ETW recording，将 recording 记为 killed、operation 记为 failed；当前没有可供强杀的独立 ETW worker，不保证能打断阻塞的 native stop。
 - `recording.ttd`：用 `TTD.exe` 执行一次 launch / attach / monitor 录制，返回 `recording_id`、`operation_id`、状态和 artifact refs；该入口是一次性同步操作，不复用 ETW lifecycle 的 `recording.start/status/stop`。
 
 service `0.3` 在 JSON-RPC 和 MCP 上暴露相同的 `recording.start/status/stop/cancel/kill` lifecycle；MCP input schema 与 RPC 参数一致，并继续返回相同的 recording、operation 和 artifact 引用。
@@ -54,8 +56,9 @@ dbgatlas recording ttd --project-root <path> --monitor <program> --timeout-ms <m
 Recording 采用 C++ ETW adapter + Rust safe wrapper 的边界：
 
 - C++ adapter 负责 ETW session、provider enable、实时事件消费、基础预处理、过滤和输出 flush。
-- Rust wrapper 和 domain manager 负责参数校验、worker 编排、operation 状态、artifact 登记和 service/CLI/MCP 入口。
-- service 仍是产品控制面；worker 是内部隔离边界，不作为外部 API 暴露。
+- Rust wrapper 和 service 负责参数校验、operation 状态、artifact 登记和 service/CLI/MCP 入口。
+- 当前 ServiceHost 持有 EtwController，ManagedRecording 持有 service 进程内的 EtwSessionControl；ETW 不是独立 worker。TTD 通过 TtdRecorderRunner 启动 recorder 子进程，身份切换时使用辅助进程。
+- 迭代 2 将本机执行依赖收拢到明确边界，保持现有采集行为；若后续增加独立采集进程，需单独验证生命周期、停止和产物完整性。
 
 首版 provider 配置使用内置 presets，而不是要求用户手写 provider GUID、keyword 和 level。内置 presets 至少覆盖：
 

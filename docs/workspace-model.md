@@ -1,6 +1,18 @@
 # Workspace Model
 
-DbgAtlas 的真实分析数据放在显式 analysis workspace 中。workspace 是工具事实层，不保存人或模型的高层结论为客观事实。
+DbgAtlas 的真实分析数据放在显式 analysis workspace 中。操作与产物是工具事实层，analysis 保存解释，不把人或模型的高层结论作为工具事实。本文件先定义目标存储职责，再列出当前 JSONL 实现；实施顺序见 [PLAN.md](../PLAN.md)。
+
+## 目标存储职责与阶段
+
+- 操作统一关联输入、执行上下文、状态和输出；文件通过引用关联，不再引入独立 Observation 业务对象。自发事件归入会话记录。
+- 会话绑定运行中的调试上下文，历史关联目标；重新打开同一 Dump/回放可查阅此前输出，但不共享当前线程、栈帧或回放位置。历史结果不自动当作当前现场或缓存命中。
+- 迭代 2 建立环境/目标/会话关联及逻辑输出与执行侧路径的边界，保留现有 JSONL；不在本轮创建 SQLite 或全量重建数据模型。
+- 迭代 4 在每个 workspace 引入本地 SQLite，保存操作原始记录和输出索引；小输出可入库，大文本、Dump、TTD、ETL 等保留文件。数据库位置、表结构、版本迁移和原记录导入在该轮确定，不丢弃已有历史。
+- SQLite 中的原始操作记录不是可随时重建的缓存；可重建的派生索引要单独界定。一次操作可有多个输出，同一文件可被后续会话引用，不能随一个会话关闭而删除。
+- 数据库由所属服务管理，不让远端节点直接共享写入。迭代 5 才实现远端产物取回，必须区分远端已生成、本地已归档、缺失或部分结果。
+- 迭代 6 完善稳定目标身份和跨会话检索。路径或 PID 相同不保证身份相同；符号版本、线程、回放位置等上下文影响历史输出是否可复用。
+
+## 当前 JSONL 实现
 
 ## 初始结构
 
@@ -20,7 +32,7 @@ analysis-workspace/
 
 ## 目录职责
 
-- `artifacts/`：DbgAtlas 管理的工具产物、原始输出、metadata 和可重建索引。
+- `artifacts/`：DbgAtlas 管理的工具产物、原始输出和原始操作/metadata 记录；不能整体视作可重建索引。
 - `analysis/`：人或模型写作的 Markdown 笔记、假设、结论和报告。
 - `inputs/`：人工放入的初始输入材料，可选创建。
 
@@ -101,13 +113,13 @@ service `0.3` 的 RPC 和 MCP 使用三个产品级入口，参数统一为 proj
 }
 ```
 
-| `0.1` 聚合字段 | `0.2` 方法 | `0.2` 返回 |
+| 记录类别 | 当前方法 | 返回 |
 | --- | --- | --- |
 | `artifacts` | `artifact.list` | `{ "artifacts": [...] }` |
 | `operations` | `operation.list` | `{ "operations": [...] }`，内容是持久化 operation records |
 | `command_audit` | `audit.list_commands` | `{ "commands": [...] }` |
 
-`workspace.facts` 已在 `0.2` 移除且没有兼容 alias。原先读取聚合结果的调用方应按需调用上述三个方法；service 始终在内部解析 `<project_root>/dbgatlas`，不再接受 analysis workspace 或 `artifacts/` 的内部路径。
+当前 service 在内部解析 `<project_root>/dbgatlas`，调用上述方法应传 project root，不传 analysis workspace 或 `artifacts/` 的内部路径。
 
 Codex 通过 service-hosted HTTP MCP endpoint 接入，无需配置认证凭据：
 

@@ -1,91 +1,79 @@
-# DbgAtlas 架构
+# DbgAtlas 架构规格
 
-DbgAtlas 是面向 AI 的调试平台，以原生调试命令为主要操作入口，先完善 Windows 调试与录制。远端后端、SQLite 历史、Linux 和管理页面按 `GOALS.md` 逐步实现，当前文档中的本机 service/worker 结构仍是现有实现。源码仓库产出工具本身，不承载真实分析数据；真实分析数据放在显式 analysis workspace 中。
+DbgAtlas 面向 AI 提供原生调试命令执行、会话管理、状态查询和操作历史。Windows 为首个实现平台，后端可逐步部署到其他机器和操作系统。IDA 静态分析由外部工具承担；调试需要的符号、类型、局部反汇编和地址信息仍在范围内。
 
-## 分层
+## 文档分工与实现状态
+
+- 本文定义总体职责和依赖方向；[环境与会话模型](environment-session-model.md)定义环境、目标、会话及状态语义。
+- [后端执行边界](adapter-model.md)定义原生执行与后端契约；[进程与生命周期](worker-model.md)定义进程所有权和故障处理。
+- [运行时模型](runtime-model.md)、[工作区模型](workspace-model.md)、[录制模型](recording-model.md)分别维护部署、持久化和采集规格。
+- [PLAN.md](../PLAN.md)只负责实施顺序、验收和进度；[当前实现基线](roadmap.md)描述已存在的代码路径。验证记录是对应提交的历史证据，不是后续功能的验收证明。
+
+以下目标架构尚未全部实现。迭代 2 的重点是环境、会话和进程架构，迭代 3 才收敛 AI 执行交互，迭代 5 才实现远端传输。不要把目标图中的连线当成当前可调用能力。
+
+## 目标职责分层
 
 ```mermaid
-flowchart LR
-  CLI["dbgatlas-cli"] --> SVC["dbgatlas service\nJSON-RPC HTTP"]
-  MCP["HTTP MCP clients"] --> SVC
-  UI["future UI"] --> SVC
-  SVC --> CORE["dbgatlas-core"]
-  SVC --> DEBUG["dbgatlas-debug"]
-  SVC --> REC["recording domain"]
-  SVC --> RUNTIME["dbgatlas-runtime"]
-  SVC --> WS["dbgatlas-workspace\ninternal storage"]
-  SVC --> WORKER["per-session worker"]
-  CORE --> AD["dbgatlas-adapter"]
-  DEBUG --> AD
-  DEBUG --> RUNTIME
-  DEBUG --> WS
-  REC --> AD
-  REC --> RUNTIME
-  REC --> WS
-  WORKER --> DBG
-  WORKER --> ETW["ETW adapter"]
-  AD --> DBG["dbgatlas-dbgeng"]
-  DBG --> SYS["dbgatlas-dbgeng-sys"]
-  SYS --> DLL["native dbgeng DLL"]
-  ETW --> ETWSYS["etw sys/wrapper"]
-  ETWSYS --> ETWDLL["native ETW DLL"]
+flowchart TB
+  CLIENT["AI / CLI / 管理页面"] --> SERVICE["服务入口：路由与协议适配"]
+  SERVICE --> CONTROL["控制层：环境、会话、操作与生命周期"]
+  CONTROL --> HISTORY["工作区：操作记录与输出引用"]
+  CONTROL --> CONNECTION["后端连接边界：本机 / 后续远端"]
+  CONNECTION --> BACKEND["执行侧：原生命令、真实状态与进程管理"]
+  BACKEND --> ENGINE["调试引擎 / 采集器"]
+  ENGINE --> TARGET["本机目标 / 原生远程目标 / Dump / 回放"]
 ```
 
-`dbgatlas service` 是产品运行时控制面。CLI、HTTP MCP 和后续 UI 都是 service client，不是架构核心。对外 API 使用 JSON-RPC 2.0 over loopback HTTP，不使用认证并信任本机调用者，保留 loopback bind 与浏览器 `Origin` 校验；`/rpc` 承载 DbgAtlas 自有 JSON-RPC API，`/mcp` 承载 MCP JSON-RPC HTTP endpoint。长操作可以通过 HTTP streaming/SSE 返回 progress/output，但取消必须显式请求，断线不等于取消。
+控制层负责选择执行环境、建立会话绑定、分配操作身份、管理输出和生命周期。执行侧负责本环境的引擎加载、进程身份、原生命令执行和状态回报。连接边界不决定调试命令语义，也不把传输断线解释为目标退出。
 
-对外 API 不暴露 `workspace.*`、`project.*` 或 `worker.*` 业务资源。调用方在创建 session 时传入 `project_root`；service 内部把它解析为 `<project_root>/dbgatlas` 作为 analysis workspace，并懒创建该目录。`workspace` 仍是内部持久化模型，负责 manifest、artifact metadata、operation log 和受控 artifact path。
+逻辑分层不要求每层成为独立进程或 crate。迭代 2 依据实际依赖决定代码归属，不为图中每个方框创建服务或模块。
 
-service `0.3` 使用统一方法注册表定义 canonical method、domain route、MCP 描述、输入 schema 和 capability gate。JSON-RPC dispatch 与 MCP `tools/list` / `tools/call` 共享该注册表，避免入口能力漂移。项目事实通过 `artifact.list`、`operation.list` 和 `audit.list_commands` 暴露，三者都接收 `project_root`，不向调用方暴露内部 workspace 路径。
+## 三个位置与两种远程
 
-`session` 是公开生命周期对象，`worker` 是内部运行时对象。当前默认一个 session 绑定一个 worker；创建 session 时创建 worker，关闭或 kill session 时结束对应 worker。worker 由 service 的 lifetime pipe heartbeat 和 worker 侧 watchdog 管理，service 正常退出时主动关闭 worker，异常断开时 worker 应自主退出。
+控制端位置、后端进程所在环境、目标所在环境分别表达。本机是默认执行环境，不是所有路径和 PID 的全局解释空间。
 
-`dbgatlas-debug` 代表 debug domain manager 边界：它定义 target、session、command 和状态模型。DbgEng、TTD、dump eval 等能力由 domain manager 编排 runtime、workspace 和具体 adapter/native wrapper。
+- 远端后端：控制端连接另一环境中的调试器进程。
+- 原生远程目标：调试器通过其原生调试协议连接另一个环境中的目标。
+- 两者可组合；离线 Dump/回放在后端环境中打开，产生记录的原环境只作为来源信息保存。
 
-`recording` 代表事件录制 domain 边界。Recording 以 ETW API 为主线，公开 `recording.*` lifecycle，内部通过受控 worker 和 C++ ETW adapter 采集、过滤并归档低层事件材料。recording 独立于 debug session；调试和外部分析 workflow 可以引用 recording artifact。
+环境是执行和定位上下文，不等于虚拟机，也不要求客体安装 Agent。虚拟机启停、快照和实验编排不属于迭代 2；普通客体执行通道也不是内核调试连接的前提。
 
-`dbgatlas-runtime` 代表运行时安装与进程策略边界：调试/录制工具发现、symbol path、proxy、child process policy 属于 runtime config，不写入 analysis workspace manifest。
+## 面向 AI 的操作面
 
-## 工程基础边界
+原生命令执行是主要入口，补充会话发现/建立、状态、中断、关闭和历史读取。不要把 WinDbg/GDB 的全部命令重新设计成统一 JSON 工具，也不要因采用原生命令而放弃可靠的状态与事件获取。
 
-- `dbgatlas-model` 只放最小公共模型：`Id`、`WorkspaceRef`、`TargetRef`、`SessionRef`、`ArtifactRef`、`OperationRef`、`Timestamp`。
-- `dbgatlas-workspace` 只管理磁盘事实：manifest、`artifacts/`、`analysis/`、可选 `inputs/`、artifact metadata、operation log。
-- `dbgatlas-adapter` 只定义最小 adapter contract：adapter id、capability、invocation、result、error。
-- `dbgatlas-core` 编排 workspace 与 adapter，不直接接触 unsafe FFI。
-- `dbgatlas-cli` 提供本地开发、运维和 workflow 调用入口。
-- `*-sys` crate 和 safe wrapper 负责把 native ABI 暴露为 Rust 侧能力，core 不直接接触 unsafe FFI。
+平台统一执行外层信息：操作标识、会话与目标上下文、完成情况、结果预览和完整输出引用。原生输出及平台特有字段保留；不同后端的命令、异常/信号和能力无需强行同构。具体名称与 MCP schema 在迭代 3 验证后确定。
 
-## 架构加固边界
+命令知识与调试方法按需提供。平台不把高层分析结论作为工具事实，也不建立独立的 Observation 业务资源；操作承载输入和输出，会话承载无直接请求来源的事件。
 
-- `dbgatlas-debug` 定义 debug target、session state、session skeleton、command eval 请求/结果和 manager trait；它不是 DbgEng wrapper。
-- `dbgatlas-runtime` 定义 runtime config、tool path、symbol path、proxy 和 process launch policy；它不拥有 workspace 数据。
-- `dbgatlas-workspace` 增加受控 artifact layout helper，例如 `artifacts/sessions/<session_id>/`、`artifacts/recordings/<recording_id>/`、`artifacts/profiles/<profile_id>/`、`artifacts/ttd_recordings/<recording_id>/`。Recording 使用统一的 `artifacts/recordings/<recording_id>/` namespace；旧的 profiles/ttd_recordings 预留布局仅作为兼容背景保留。
-- `dbgatlas-core` 保持短调用 `invoke()`，并预留长任务 operation 状态：`running`、`success`、`failed`、`canceled`。
-- 同一 debug session 的请求必须串行化；不同 session 后续可并发。状态不能依赖命令文本解析。
-- `dbgatlas-adapter` 不是 session/backend 总接口；session 生命周期、worker 管理和 domain 语义由 domain manager 承担。
+## 会话、历史与存储
 
-## Service 边界
+会话绑定一份可操作的调试上下文，包含后端关联和目标/目标集合引用。会话不是 worker PID，也不拥有目标全部历史。不同会话可以引用同一份离线记录，但当前线程、栈帧、回放位置和符号设置独立。
 
-- 同一个 `dbgatlas.exe` 提供 `service run` 开发模式、安装态 Windows service 入口和普通 CLI client 命令。
-- Windows service lifecycle 由 `dbgatlas service install/start/stop/status/uninstall` 管理。默认安装根是 `%ProgramFiles%\DbgAtlas`；安装器和提权脚本应复用 service 命令默认行为，只有自定义目录时才显式传入 `--install-root`。`install` 支持复制 payload 到 `<install-root>\bin`，也支持 `--payload-mode use-existing` 直接使用安装器已放置的 `bin`；配置放在 `<install-root>\etc\`，服务日志放在 `<install-root>\var\log\`，DbgAtlas 受控 WinDbg runtime 放在 `<install-root>\bin\rt\`。SCM 只指向安装目录下的 binary，避免锁住开发构建产物。
-- 安装态 service 可通过 `service.update` JSON-RPC/MCP 方法从构建好的 payload 目录异步更新自身；更新由独立 updater 进程完成 stop、rename swap、restart 和 best-effort cleanup。
-- `debug.session.create` 接收 `project_root` 和 target，返回 `session_id`；后续 `debug.eval`、`debug.modules`、`debug.threads`、`debug.stack`、`debug.session.close` 和 `debug.session.kill` 只需要 `session_id`。
-- 外部 service API 表达产品能力；内部 worker protocol 表达低层执行、状态、artifact 写入清单和进程控制。两者分层演进。
-- Worker identity 按 capability policy 选择：安装态 debug 默认 LocalSystem，可在 `debug.session.create` 请求中用 `worker_identity: "active_interactive_user"` 显式切到交互用户；ETW recording 默认 LocalSystem 或显式配置的受控 identity。权限不足时返回结构化错误，不自动提权。
+历史归入显式 analysis workspace。当前使用 JSONL 和产物文件；迭代 4 引入本地 SQLite，迭代 6 完善稳定目标身份与跨会话检索。迭代 2 只建立关联位置和运行实例边界，不提前实现内容寻址、SQLite 表结构或自动结果缓存。
 
-## 预留但不创建
+工作区逻辑输出引用与执行侧文件位置分开。本机可由边界内的实现直接写受控目录；未来远端产物需要明确取回或远端引用状态，不能把远端绝对路径当成本机可读路径。
 
-第一版不创建 `dbgatlas-dia*`、`dbgatlas-symbol`、`dbgatlas-pe`、`dbgatlas-report`。这些能力在 core/workspace/adapter API 稳定后再引入。
+## 当前代码与目标职责的关系
 
-service-hosted HTTP MCP 入口通过现有 service/domain workflow 暴露 MCP tools，不复制 debug/session/recording 业务逻辑，也不提供独立 stdio MCP 进程。
+| 当前代码 | 已有职责 | 迭代 2 调整方向 |
+| --- | --- | --- |
+| `dbgatlas-service` / `ServiceHost` | HTTP/MCP 路由、会话、worker、录制及工作区编排 | 分清入口、控制与执行依赖，不能只给现有 supervisor 换名 |
+| `dbgatlas-debug` | 目标、会话、命令及 manager 类型 | 引入环境/后端关联和生命周期边界，避免公共模型绑定本机 worker |
+| `dbgatlas-core` / `dbgatlas-adapter` | 通用短调用与产物登记 | 不是现有所有调试调用的必经路径；同步 invoke 不等于完整后端协议 |
+| `dbgatlas-worker-protocol` | 本地调试 worker 的 v6 JSONL 消息 | 是既有实现协议，含本机路径；不直接宣称可用于远端执行 |
+| `dbgatlas-runtime` | 工具发现、安装和本机身份策略 | 将执行侧配置归属到对应环境，不在控制层解释远端安装路径 |
+| `dbgatlas-workspace` | 工作区、操作与产物记录 | 保留当前落盘路径，逐步接收与执行位置解耦的输出关联 |
+| native adapter / safe wrapper | DbgEng、ETW 本地能力 | 留在执行侧，FFI 不成为跨机器协议 |
 
-IDA 静态分析由外部工具负责。调试符号、类型、局部反汇编和地址信息仍由调试后端提供。
+CLI、MCP 和管理页面必须复用平台业务实现。这里的控制层是职责，不表示当前代码已经全部搬入名为 `dbgatlas-core` 的 crate。
 
-ETW recording 路线优先走 C++ adapter + Rust safe wrapper：ETW session、provider enable、实时消费、预处理和过滤留在 native adapter 内部，Rust 侧负责安全封装、worker 编排、artifact 登记和 service/CLI/MCP 入口。WPR/WPAExport 不作为主采集链路。
+## 实施边界
 
-## 不做的事
+1. 迭代 2 建立环境/会话模型与进程执行边界，本机路径完整运行。允许为表达新模型作最小必要 API/schema 调整，不要求保留把 worker 当会话的假设。
+2. 迭代 3 明确命令等待、中断和长操作交互；不得将现有超时杀 worker 行为描述为目标规格。
+3. 迭代 4/6 依次实现历史存储和跨会话关联；历史保留不等于调试器进程可恢复。
+4. 迭代 5 实现远端连接、身份与结果核对；环境模型的存在不代表远端已可用。
+5. GDB、官方 DbgX MCP 等接入方案按实际能力验证选择，不强制所有后端使用 C++ DLL，不预先替换现有 DbgEng。
 
-- 不使用隐藏 `.dbgatlas`。
-- 不建立中心化 `protocol` crate。
-- 不提前设计完整 GUI。
-- 不提前封装完整 DbgEng。
-- 不引入复杂序列化框架。
+当前 `/rpc` 和 `/mcp` 保持无认证的 loopback 服务，并校验浏览器 `Origin`。未来远端后端通道独立设计，不能直接放宽当前 listener 来代替。安装与验证命令见[安装配置](install-configuration.md)及根目录 AGENTS.md。

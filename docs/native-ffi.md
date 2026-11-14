@@ -1,6 +1,6 @@
 # Native FFI
 
-DbgAtlas 采用 Rust 主进程 + C++ native adapter DLL。每个 native adapter 维护自己的 C header 和对应 Rust `*-sys` crate，不通过中心化 protocol 层定义边界。
+本文描述自有 Windows native adapter 的本机 FFI 边界，不是所有后端的统一架构。每个 native adapter 维护自己的 C header 和对应 Rust `*-sys` crate，不通过中心化 FFI protocol 层定义边界。后端执行和传输规格见 [后端执行边界](adapter-model.md)。
 
 DbgEng adapter 使用 `native/include/dbgatlas_dbgeng.h` 作为 adapter-specific C ABI，并由 `dbgatlas-dbgeng-sys` crate 局部绑定。早期 `native/include/dbgatlas_native.h` 只保留为 bootstrap 历史文件，不再作为 DbgEng DLL 的当前导出边界。
 
@@ -68,6 +68,6 @@ DbgEng session、callback、event polling、COM 初始化和线程归属必须�
 
 真实 DbgEng session 由 per-session worker 持有。worker 主循环串行处理同一 session 的 start/eval/add_symbols/read_memory/close 请求，避免跨线程直接操作同一 DbgEng client。
 
-DbgEng、ETW、DIA 后续必须各自维护 header、DLL adapter 和 `*-sys` crate。不要新增中心化 protocol crate，也不要把多个 native adapter 过早聚合到一个 DLL ABI。
+DbgEng、ETW 及未来确有需要的自有 native adapter 分别维护 header 和绑定，不把多个 native adapter 过早聚合到一个 DLL ABI。不提前要求新建 DIA adapter；GDB、官方工具或其他后端可通过协议或进程接入，无须统一为 C++ DLL。禁止中心化 FFI 类型不等于禁止明确的后端消息契约；既有 worker protocol 与 native ABI 是不同边界。
 
 ETW adapter ABI `0.3` 增加带 `struct_size` 的 `DA_EtwSessionOptions`、CPU sampling status 和 stop quality result；原 `da_etw_session_start_file_trace` / `da_etw_session_stop` 入口继续保留。CPU session 的全局 ProfileTime interval 必须由 native handle 持有 previous/applied 状态，并在 stop、启动回滚和 handle drop 路径按“当前值仍等于 applied”条件恢复。

@@ -1,64 +1,71 @@
-# Worker Model
+# 进程与生命周期
 
-DbgAtlas 当前使用 service-managed worker 子进程隔离 DbgEng 调试会话。后端执行边界拆分属于后续迭代。worker 是隔离边界和进程运行时细节，不是外部业务 API。
+本文定义迭代 2 的进程架构及生命周期边界，同时列出当前实现的差距。会话是调试上下文，worker 是一种承载进程；两者不等同。环境和目标语义见[环境与会话模型](environment-session-model.md)。
 
-## 目标
+## 目标进程结构
 
-- 隔离 DbgEng/COM/callback/阻塞命令对主进程的影响。
-- 外部只暴露 session 生命周期；service 创建 session 时内部创建并绑定 worker。
-- 同一 session 请求串行化，避免 debug engine 状态被并发命令破坏。
-- 不同 session 可并发运行，各自有独立 worker 生命周期。
-- 主进程可以 close、cancel 或 kill 卡死 worker，并把结果记录为 operation。
-- worker 通过 service 管理的 lifetime pipe heartbeat 和 worker 侧 watchdog 约束生命周期；service 正常退出时主动关闭 worker，异常断开时 worker 应自主退出。
-
-## 生命周期
-
-```mermaid
-stateDiagram-v2
-  [*] --> Created
-  Created --> Starting
-  Starting --> Ready
-  Ready --> Break
-  Break --> Running
-  Running --> Break
-  Break --> Closing
-  Ready --> Closing
-  Running --> Closing
-  Closing --> Closed
-  Starting --> Error
-  Ready --> Error
-  Running --> Error
+```text
+控制服务
+  └─ 后端连接
+       ├─ 本机：受管后端进程 / 接入既有后端
+       └─ 后续远端：执行节点上的后端进程
+             └─ 调试引擎或采集器 → 目标
 ```
 
-`DebugSessionState` 是结构化状态，不能从 WinDbg 命令文本或 prompt 字符串里猜。worker 应显式回报状态变化、命令结果和 artifact 写入清单。
+这表示部署选择，不要求同时实现所有分支。迭代 2 首先完成本机受管后端，建立接入既有后端的所有权表达和不可误杀约束；真实既有后端接入只有经验证后才宣告可用。远端进程启动及连接在迭代 5 实现。
 
-## 调用模型
+原生引擎的线程亲和性、回调与事件泵由执行侧处理。控制端不直接持有可跨平台使用的 native handle，也不直接解释执行节点的安装路径和进程身份。
 
-- service 为每个 session 分配一个 worker 和请求队列，当前默认 session:worker 为 1:1。
-- 同一 session 内只允许一个 command/eval/start/close 操作处于 running。
-- per-session worker 持有真实 DbgEng session；`eval`、`modules`、`threads`、`stack`、`add_symbols` 和 `read_memory` 都通过同一 worker 串行执行。
-- 创建 debug session 时调用方传入 `project_root`；service 内部懒创建 `<project_root>/dbgatlas` 并分配 `artifacts/sessions/<session_id>/`。
-- 后续 eval/close/kill 等请求只携带 `session_id`，不重复传 `project_root`，也不暴露 workspace resource。
-- worker 可在 service 授权的 session/domain artifact 路径下写 transcript、events、raw output 或 memory dump；service 负责登记全局 `artifacts.jsonl`、`operations.jsonl`。
-- `add_symbols` 是 session 级操作，只追加当前 DbgEng session 的 symbol path；它不修改 runtime config，也不写入 workspace manifest。
-- cancel 是协作式优先；超时或卡死时主进程可以 kill worker。
-- worker protocol version 6 使用内部 JSONL message；外部 service API 使用 JSON-RPC over HTTP。两者分层，不让 worker 细节泄漏到 CLI/MCP/UI。
+## 所有权与关闭
 
-## Recording Worker
+| 对象 | 所有者与责任 |
+| --- | --- |
+| 控制服务连接 | 客户端可断开；不因客户端离开自动销毁目标 |
+| 平台启动的后端进程 | 执行侧负责监控与明确的退出策略；控制端通过契约请求清理 |
+| 接入的既有调试器 | 平台只拥有连接或经授权创建的上下文，不能默认结束整个进程 |
+| 后端启动的目标 | 记录启动归属和关闭处置；不从 launch 推断永远可以杀目标 |
+| 附加的目标 | 解除调试与终止目标分别表达，按后端支持执行 |
+| 产物与历史 | 工作区所有，不随调试进程退出自动删除 |
 
-Recording 使用 recording worker，但仍不向外暴露 worker API。外部只看到 `recording.*` lifecycle 和 `recording_id`。
+close、disconnect、目标终止和后端强制结束是不同意图。后端不支持某种处置时明确报错，不能静默用 kill 代替 detach。API 的具体名称在迭代 3 收敛，但迭代 2 必须让处置责任可表达、可测试。
 
-- `recording.start` 创建受控 worker，分配 `artifacts/recordings/<recording_id>/`，并启动 ETW API 采集。
-- recording worker 持有 ETW session、provider enable 状态、process tree filter 和 category event writers。
-- launch target 由 recording worker 或其子进程策略启动，并以 root pid 建立 process tree filter。
-- attach target 从 `recording.start` 时间点开始观察，不回填历史事件。
-- stop 是协作式 flush：worker 停止 ETW session，写出过滤后 `trace.etl`、`recording.json` 和 `events/*.jsonl`。
-- cancel 优先协作式停止当前 operation；卡死或无法 flush 时 service 可以 kill worker，并登记 failed 或 canceled operation。
-- recording worker 的 artifact 写入清单由 service 登记到全局 `artifacts.jsonl` 和 `operations.jsonl`。
+## 故障与失联
 
-## 安全约束
+| 情况 | 目标要求 | 首次实现阶段 |
+| --- | --- | --- |
+| AI 客户端断开 | 保留服务内会话，不能认定目标已退出 | 迭代 2 的本机生命周期验证 |
+| 控制服务退出 | 按受管后端的明确策略处理，不将同一策略施加给既有后端 | 迭代 2；不承诺引擎跨重启恢复 |
+| 后端进程异常退出 | 标记后端失败，核对目标；无法确认时为未知 | 迭代 2 |
+| 目标退出 | 保留输出和历史，禁止继续使用旧现场引用 | 迭代 2 的关联边界，迭代 3 完善事件 |
+| 命令等待超时 | 仅结束调用等待；显式执行期限另行处理 | 迭代 3 |
+| 远端连接中断 | 连接状态与目标状态分离，重连核对原操作 | 迭代 5 |
 
-- worker 启动策略和 identity policy 来自 runtime config，不来自 analysis workspace manifest。
-- 安装态 service 默认 LocalSystem；ETW recording 默认 LocalSystem 或 runtime config 指定的受控 identity；debug worker 默认 LocalSystem，但 `debug.session.create` 可用 `worker_identity: "active_interactive_user"` 为 TTD replay、用户目录 dump 或 live launch 显式选择交互用户；开发态 `service run` 使用当前用户。
-- dump、trace、command transcript、memory output 都按敏感 artifact 处理。
-- worker 不把高层判断写成工具事实；解释层仍由人或模型在 `analysis/` 写 Markdown。
+本机受管进程可以采用父服务退出后清理的策略，但必须记录和测试；不能将 lifetime pipe 断开后退出推广为所有远端后端的规则。进程仍在也不代表操作已完成，操作结果未知时不能盲目重试。
+
+同一调试上下文的普通命令应串行化；查询和中断必须有能在长操作期间生效的通路。无需为了支持中断就允许所有引擎 API 并发调用。不同后端会话的失败应相互隔离。
+
+## 当前本机实现
+
+当前 `ManagedSession` 直接保存 `WorkerHandle`、本机 artifact 路径和请求锁；`WorkerHandle` 含管道名及 Windows 身份。`WorkerSupervisor` 负责启动、请求、关闭、取消和 kill；这仍是本机进程管理接口，不是位置无关的后端契约。
+
+- DbgEng：默认每个 debug session 一个 `dbgatlas-worker`，经本机命名管道发送 v6 JSONL 请求；native session 留在 worker。
+- 生命周期：受管 worker 使用 lifetime pipe/heartbeat/watchdog；service 清理与连接丢失会影响其进程生命周期。
+- 超时：`host_worker_ops.rs::request_worker_with_optional_timeout` 当前在显式执行超时后 kill worker 并将会话标为 Error，要求重新创建。这是待改造行为，不满足迭代 3 的等待语义。
+- 取消：当前接口可能通知 worker 或降级为结束 worker；不能描述为已实现独立、可靠的目标 interrupt。
+- Windows 身份：安装态 debug 默认 LocalSystem，请求可选择 active interactive user；开发态使用当前用户。策略属于本机执行侧，不是平台通用的远端身份模型。
+
+## 录制进程现状与边界
+
+ETW 当前不是独立 recording worker：`ServiceHost.etw_controller` 调用 `NativeEtwController`，`ManagedRecording.trace_session` 保存 service 进程内的 native 会话。`recording.stop/cancel/kill` 走 `finish_recording` 和停止/产物路径，不能据方法名宣称存在可强杀的独立采集进程。
+
+TTD 当前通过 `TtdRecorderRunner` 启动 recorder 子进程；交互用户路径使用辅助进程。它不是 debug worker 消息中的一个会话，也不是 ETW 的 start/status/stop 会话。
+
+迭代 2 必须识别并隔离这些本机执行依赖，明确 debug、ETW、TTD 的各自执行入口，不要求它们伪装成同一种 worker。默认保留 ETW 现有进程内实现；若需额外进程隔离，应有专门的实现与验收范围。录制产品行为与产物继续回归，详见[录制模型](recording-model.md)。
+
+## 迭代 2 验收
+
+- 本机完整 debug 链路经新边界运行，控制层不直接依赖 Child、本机管道或 native handle。
+- 受管与非受管后端的处置有明确测试；不支持真实接入的后端只报告契约验证，不报告运行验收。
+- 两个独立会话的普通命令与失败隔离；状态能区分后端失败和无法确认的目标状态。
+- 现有受管进程退出策略、输出归档、ETW/TTD 执行路径明确，无“假定所有录制都经 worker”的文档或接口。
+- 与窄范围测试、release 构建、安装态更新和相关 MCP 冒烟一起记录证据；异步长操作与远端恢复仍按后续迭代验收。
