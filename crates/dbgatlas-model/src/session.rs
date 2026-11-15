@@ -168,6 +168,8 @@ pub struct CleanupResult {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub input_artifacts: Vec<ArtifactRef>,
     pub schema_version: u32,
     pub session_id: SessionRef,
     pub kind: SessionKind,

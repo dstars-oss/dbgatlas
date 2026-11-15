@@ -12,6 +12,8 @@ impl ServiceHost {
             state: Arc::new(Mutex::new(ServiceState::default())),
             supervisor,
             capabilities: ServiceCapabilities::from_runtime_config(&RuntimeConfig::default()),
+            executions: Arc::new(execution::Coordinator::default()),
+            execution_scope: None,
             #[cfg(test)]
             ttd_runner: Arc::new(ProcessTtdRecorderRunner),
             #[cfg(test)]
@@ -172,24 +174,7 @@ impl ServiceHost {
                 })
                 .or(incoming_id);
             if let Some(id) = session_id {
-                let summary = self.session_get(Some(json!({"session_id":id})))?;
-                let session: dbgatlas_model::Session = serde_json::from_value(summary.clone())?;
-                if let Some(operation_id) = &session.last_operation_id {
-                    if let Some(record) =
-                        Workspace::open(&session.workspace.root)?.get_operation(operation_id)?
-                    {
-                        let mut state = self.lock_state()?;
-                        if let Some(operation) = state.operations.get_mut(operation_id.id.as_str())
-                        {
-                            if operation.details.output_error.is_none()
-                                || record.status == operation.status
-                            {
-                                operation.details = record.details;
-                                operation.status = record.status;
-                            }
-                        }
-                    }
-                }
+                let summary = self.observed_session(&serde_json::from_value(json!(id))?)?;
                 if let Ok(value) = &mut result {
                     value["session"] = summary;
                 }
@@ -212,24 +197,15 @@ impl ServiceHost {
                 _ => unhandled_registered_method(name),
             },
             MethodRoute::Session => match name {
-                "session.get" => self.session_get(params),
-                "session.interrupt" => self.session_interrupt(params),
+                "session.get" => self.session_observe(params),
+                "session.open" | "session.exec" | "session.close" | "session.kill"
+                | "session.interrupt" => self.submit_execution(name, params, false),
                 "session.list" => self.session_list(params),
+                "session.read" => self.output_read(params, true),
+                "session.help" => self.execution_help(params),
                 _ => unhandled_registered_method(name),
             },
-            MethodRoute::Debug => match name {
-                "debug.session.create" => self.debug_session_create(params),
-                "debug.session.close" => self.debug_session_close(params),
-                "debug.session.kill" => self.debug_session_kill(params),
-                "debug.eval" => self.debug_eval(params),
-                "debug.eval_steps" => self.debug_eval_steps(params),
-                "debug.modules" => self.debug_builtin_eval(params, "debug.modules", "lm"),
-                "debug.threads" => self.debug_builtin_eval(params, "debug.threads", "~"),
-                "debug.stack" => self.debug_builtin_eval(params, "debug.stack", "k"),
-                "debug.add_symbols" => self.debug_add_symbols(params),
-                "debug.read_memory" => self.debug_read_memory(params),
-                _ => unhandled_registered_method(name),
-            },
+            MethodRoute::Debug => self.submit_execution(name, params, true),
             MethodRoute::Recording => match name {
                 "recording.start" => self.recording_start(params),
                 "recording.ttd" => self.recording_ttd(params),
@@ -241,9 +217,16 @@ impl ServiceHost {
             },
             MethodRoute::Operation => match name {
                 "operation.get" => self.operation_get(params),
-                "operation.cancel" => self.operation_cancel(params),
+                "operation.cancel" => self.submit_execution(name, params, true),
                 "operation.stream" => self.operation_stream(params),
                 "operation.list" => self.operation_list(params),
+                _ => unhandled_registered_method(name),
+            },
+            MethodRoute::Execution => match name {
+                "execution.get" => self.execution_get(params),
+                "execution.list" => self.execution_list(params),
+                "execution.read" => self.output_read(params, false),
+                "execution.cancel" => self.submit_execution(name, params, false),
                 _ => unhandled_registered_method(name),
             },
             MethodRoute::Artifact => match name {
@@ -394,7 +377,7 @@ impl ServiceHost {
             .collect();
         let mut sessions = Vec::new();
         for id in ids {
-            let summary = self.session_get(Some(json!({"session_id":id})))?;
+            let summary = self.observed_session(&id)?;
             if !include_terminal
                 && matches!(summary["lifecycle"].as_str(), Some("closed" | "failed"))
             {
@@ -421,6 +404,8 @@ impl ServiceHost {
             "session_count": state.sessions.len(),
             "operation_count": state.operations.len(),
             "external_api": "json-rpc-2.0-over-http",
+            "api_version":"0.4.0",
+            "service_instance":self.service_instance,
         }))
     }
 
@@ -471,7 +456,7 @@ impl ServiceHost {
             )
         })?;
         let workspace = Workspace::open(&session.internal_workspace_root)?;
-        let cancellation_id = next_operation_ref();
+        let cancellation_id = self.action_operation_id();
         self.begin_operation_record(
             &workspace,
             &cancellation_id,
@@ -479,10 +464,49 @@ impl ServiceHost {
             "operation.cancel",
             json!({"operation_id":params.operation_id}),
         )?;
+        // A batch owns child executions. Cancel only its observed active child;
+        // the sticky request also prevents dispatching any remaining steps.
+        let mut native_id = params.operation_id.clone();
+        if original.capability == "debug.eval_steps" {
+            if let Ok(job) = self.execution_job(&params.operation_id) {
+                job.state.lock().unwrap().cancel_requested = true;
+            }
+            if let Some(active) = self.supervisor.snapshot(&session.worker).and_then(|s| {
+                serde_json::from_value::<OperationRef>(
+                    s.context["engine"]["active_operation_id"].clone(),
+                )
+                .ok()
+            }) {
+                let is_child =
+                    self.lock_state()?
+                        .operations
+                        .get(active.id.as_str())
+                        .is_some_and(|op| {
+                            op.details.input.as_ref().is_some_and(|v| {
+                                v["batch_operation_id"] == json!(params.operation_id)
+                            })
+                        });
+                if is_child {
+                    native_id = active;
+                }
+            }
+            if native_id == params.operation_id {
+                self.finish_operation_in_memory(
+                    &cancellation_id,
+                    OperationStatus::Success,
+                    "batch cancellation requested".into(),
+                    vec![],
+                    None,
+                )?;
+                return Ok(
+                    json!({"accepted":true,"cancellation_requested":true,"operation_id":params.operation_id,"control_operation_id":cancellation_id}),
+                );
+            }
+        }
         let outcome = match self.supervisor.cancel_worker_operation(
             &session.worker,
             &session.session_id,
-            &params.operation_id,
+            &native_id,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -562,16 +586,9 @@ impl ServiceHost {
     }
 
     pub(super) fn operation_stream(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        let params: OperationGetParams = parse_params(params)?;
-        let state = self.lock_state()?;
-        let operation = state
-            .operations
-            .get(params.operation_id.id.as_str())
-            .ok_or_else(|| ServiceError::OperationNotFound(params.operation_id.to_string()))?;
-        Ok(json!({
-            "operation_id": operation.operation_id,
-            "events": operation.events,
-        }))
+        let mut params = params.unwrap_or_default();
+        params["execution_id"] = params["operation_id"].take();
+        self.output_read(Some(params), false)
     }
 
     pub(super) fn artifact_list(&self, params: Option<Value>) -> Result<Value, ServiceError> {

@@ -40,7 +40,7 @@
 
 此抽象没有完整的会话连接、进程所有权和异步中断契约；不能直接升级成覆盖所有后端的大接口。现有调试链路主要由 `ServiceHost`、`WorkerSupervisor` 与 worker 消息执行，不是全部经过 `Core::invoke()`。
 
-现有 worker protocol v8 是内部本机 JSONL 协议，包含 `StartDebugSession`、`EvalDebugCommand` 等请求及本机 `artifact_dir`。它可以作为本地实现材料，但不能直接视为最终跨机器协议。
+现有 worker protocol v9 是内部本机 JSONL 协议，包含 `StartDebugSession`、`EvalDebugCommand` 等请求及本机 `artifact_dir`。它可以作为本地实现材料，但不能直接视为最终跨机器协议。
 
 旧文档“第一版不设计 session trait/streaming callback”只反映早期短调用范围，不再限制当前环境、会话和进程架构调整。仍不引入与已实现路径无关的大型事件总线、插件系统或统一命令语言。
 

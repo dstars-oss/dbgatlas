@@ -142,6 +142,11 @@ unsafe extern "C" {
         path_utf8: *const c_char,
         out_handle: *mut *mut DA_DbgEngSessionHandle,
     ) -> i32;
+    pub fn da_dbgeng_session_attach_process_mode(
+        pid: u32,
+        invasive: u32,
+        out_handle: *mut *mut DA_DbgEngSessionHandle,
+    ) -> i32;
     pub fn da_dbgeng_session_attach_process(
         pid: u32,
         out_handle: *mut *mut DA_DbgEngSessionHandle,

@@ -142,7 +142,13 @@ fn owner_snapshot(
         {
             observed.target_state = dbgatlas_model::TargetState::Exited;
         }
-        for name in ["engine", "last_event", "input_required", "output"] {
+        for name in [
+            "engine",
+            "last_event",
+            "input_required",
+            "output",
+            "execution_start",
+        ] {
             if let Some(value) = previous.context.get(name) {
                 observed.context[name] = value.clone();
             }
@@ -153,6 +159,13 @@ fn owner_snapshot(
     observed.context["engine"]["native_hresult"] = serde_json::json!(native_hr);
     observed.context["engine"]["active_operation_id"] =
         serde_json::json!(state.active.as_ref().and_then(|a| a.operation.clone()));
+    if phase == "executing" {
+        observed.context["execution_start"] = serde_json::json!({
+            "operation_id":state.active.as_ref().and_then(|a|a.operation.clone()),
+            "observed_at":observed.observed_at,"target_process":observed.target_process,
+            "context":{"thread_id":observed.context["thread_id"],"frame_index":observed.context["frame_index"],"source":"engine_owner_at_start"}
+        });
+    }
     state.snapshot = Some(observed);
     stamp(&mut state)
 }

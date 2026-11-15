@@ -716,7 +716,10 @@ fn run_debug_session(command: DebugSessionCommand, as_json: bool) -> Result<()> 
                 (Some(path), None) => serde_json::to_value(DebugTarget::File {
                     path: std::fs::canonicalize(path)?,
                 })?,
-                (None, Some(pid)) => serde_json::to_value(DebugTarget::Attach { pid })?,
+                (None, Some(pid)) => serde_json::to_value(DebugTarget::Attach {
+                    pid,
+                    mode: dbgatlas_debug::AttachMode::Noninvasive,
+                })?,
                 _ => anyhow::bail!("provide exactly one of --file or --attach"),
             };
             let response = call_service(

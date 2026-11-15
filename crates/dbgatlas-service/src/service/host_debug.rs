@@ -12,19 +12,25 @@ impl ServiceHost {
             startup_timeout_ms: params.startup_timeout_ms,
         }
         .validate()?;
-        let session_id = next_session_ref();
-        let operation_id = next_operation_ref();
+        let session_id = self
+            .execution_scope
+            .as_ref()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_else(next_session_ref);
+        let operation_id = self.action_operation_id();
         let workspace = ensure_project_workspace(&params.project_root)?;
         let session_dir = workspace.ensure_session_artifact_dir(&session_id.id)?;
-        self.open_session_record(
-            &session_id,
-            &workspace,
-            dbgatlas_model::SessionKind::Debug,
-            serde_json::to_value(&target)?,
-            &operation_id,
-            "debug.session.create",
-            serde_json::to_value(&request)?,
-        )?;
+        if self.execution_scope.is_none() {
+            self.open_session_record(
+                &session_id,
+                &workspace,
+                dbgatlas_model::SessionKind::Debug,
+                serde_json::to_value(&target)?,
+                &operation_id,
+                "debug.session.create",
+                serde_json::to_value(&request)?,
+            )?;
+        }
         let mut start = self.try_start_debug_worker(
             &params,
             &request,
@@ -210,6 +216,7 @@ impl ServiceHost {
         #[derive(Deserialize)]
         struct Params {
             session_id: SessionRef,
+            #[serde(alias = "expected_run_epoch")]
             expected_epoch: Option<u64>,
         }
         let params: Params = parse_params(params)?;
@@ -218,6 +225,18 @@ impl ServiceHost {
             .supervisor
             .snapshot(&session.worker)
             .ok_or_else(|| ServiceError::Worker("no backend observation available".into()))?;
+        if observation.context["target_control"] == false
+            && observation.target_state != dbgatlas_model::TargetState::Offline
+        {
+            return Ok(
+                json!({"accepted":false,"code":"unsupported","session_id":params.session_id}),
+            );
+        }
+        if observation.context["engine"]["state"] == "idle" && params.expected_epoch.is_none() {
+            return Ok(
+                json!({"accepted":false,"code":"already_stopped","session_id":params.session_id}),
+            );
+        }
         let epoch = params
             .expected_epoch
             .or_else(|| observation.context["engine"]["epoch"].as_u64())
@@ -227,7 +246,7 @@ impl ServiceHost {
                 )
             })?;
         let workspace = Workspace::open(&session.internal_workspace_root)?;
-        let id = next_operation_ref();
+        let id = self.action_operation_id();
         self.begin_operation_record(
             &workspace,
             &id,
@@ -309,7 +328,7 @@ impl ServiceHost {
         {
             return Err(ServiceError::SessionNotFound(params.session_id.to_string()));
         }
-        let operation_id = next_operation_ref();
+        let operation_id = self.action_operation_id();
         let capability = if matches!(mode, SessionFinishMode::Close) {
             "debug.session.close"
         } else {
@@ -531,21 +550,8 @@ impl ServiceHost {
             .map_err(|_| ServiceError::SessionBusy(params.session_id.to_string()))?;
         let session = self.reusable_debug_session(&params.session_id)?;
         let workspace = Workspace::open(&session.internal_workspace_root)?;
-        let batch_operation_id = next_operation_ref();
+        let batch_operation_id = self.action_operation_id();
         let now = Timestamp::now();
-        {
-            let mut state = self.lock_state()?;
-            state.operations.insert(
-                batch_operation_id.id.as_str().to_string(),
-                ServiceOperation::running(
-                    batch_operation_id.clone(),
-                    "debug.eval_steps",
-                    Some(session.session_id.clone()),
-                    "debug.eval_steps running",
-                ),
-            );
-        }
-
         self.begin_operation_record(&workspace, &batch_operation_id, &session.session_id,
             "debug.eval_steps", json!({"commands":params.commands,"continue_on_error":params.continue_on_error,"timeout_ms":params.timeout_ms}))?;
         let mut unknown_step = false;
@@ -555,7 +561,20 @@ impl ServiceHost {
         let mut raw_output_ref = None;
         let mut failed_step_index = None;
         let mut canceled_step_index = None;
+        let mut stop_reason: Option<&str> = None;
         for (index, command) in params.commands.iter().enumerate() {
+            if self.batch_stop_requested(&batch_operation_id, &session.session_id) {
+                stop_reason = Some("control_requested");
+                break;
+            }
+            if self
+                .supervisor
+                .snapshot(&session.worker)
+                .is_some_and(|s| s.context["engine"]["state"] == "waiting_for_event")
+            {
+                stop_reason = Some("target_running");
+                break;
+            }
             let step_operation_id = next_operation_ref();
             {
                 let mut state = self.lock_state()?;
@@ -666,7 +685,12 @@ impl ServiceHost {
                             "failed"
                         }
                     };
-                    if operation_status == "canceled" && !params.continue_on_error {
+                    if matches!(operation_status, "canceled" | "unknown") {
+                        stop_reason = Some(if operation_status == "canceled" {
+                            "canceled"
+                        } else {
+                            "unknown"
+                        });
                         steps.push(json!({
                             "step_index": index,
                             "session_id": session.session_id,
@@ -691,6 +715,14 @@ impl ServiceHost {
                 }
             }
 
+            if canceled_step_index.is_some() {
+                stop_reason = Some("canceled");
+                break;
+            }
+            if canceled_step_index.is_some() {
+                stop_reason = Some("canceled");
+                break;
+            }
             let current_session = self.reusable_debug_session(&session.session_id);
             if current_session.is_err() {
                 if failed_step_index.is_none() {
@@ -702,7 +734,10 @@ impl ServiceHost {
 
         let batch_was_canceled =
             self.operation_status(&batch_operation_id)? == Some(ServiceOperationStatus::Canceled);
-        let status = if batch_was_canceled || canceled_step_index.is_some() {
+        let status = if batch_was_canceled
+            || canceled_step_index.is_some()
+            || stop_reason == Some("control_requested")
+        {
             OperationStatus::Canceled
         } else if unknown_step {
             OperationStatus::Unknown
@@ -772,6 +807,10 @@ impl ServiceHost {
             "operation_id": batch_operation_id,
             "operation_status": status,
             "failed_step_index": failed_step_index,
+            "stop_reason": stop_reason,
+            "unexecuted_steps": (steps.len()..params.commands.len()).collect::<Vec<_>>(),
+            "stop_reason": stop_reason,
+            "unexecuted_steps": (steps.len()..params.commands.len()).collect::<Vec<_>>(),
             "output_error": output_error,
             "steps": steps,
             "artifact_refs": artifact_refs,

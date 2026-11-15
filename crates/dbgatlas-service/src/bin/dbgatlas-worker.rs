@@ -454,7 +454,13 @@ impl WorkerState {
             return WorkerResponse::failed("already_open", "worker is already bound");
         }
         self.file_target = matches!(target, DebugTarget::File { .. });
-        self.observation_only = matches!(target, DebugTarget::Attach { .. });
+        self.observation_only = matches!(
+            target,
+            DebugTarget::Attach {
+                mode: dbgatlas_debug::AttachMode::Noninvasive,
+                ..
+            }
+        );
         let created = matches!(target, DebugTarget::Launch { .. });
         let ownership_path = artifact_dir.join("owned-processes.json");
         *self.ownership_file.lock().unwrap() = Some(ownership_path.clone());
@@ -470,9 +476,11 @@ impl WorkerState {
             DebugTarget::File { path } => {
                 DbgEngSession::open_file_with_runtimes(path, &self.dbgeng_dirs)
             }
-            DebugTarget::Attach { pid } => {
-                DbgEngSession::attach_with_runtimes(pid, &self.dbgeng_dirs)
-            }
+            DebugTarget::Attach { pid, mode } => DbgEngSession::attach_mode_with_runtimes(
+                pid,
+                mode == dbgatlas_debug::AttachMode::Invasive,
+                &self.dbgeng_dirs,
+            ),
             DebugTarget::Launch { executable, args } => {
                 DbgEngSession::launch_with_runtimes(executable, &args, &self.dbgeng_dirs)
             }

@@ -77,6 +77,8 @@ pub(super) fn scan_synthetic_artifacts(
             .to_path_buf();
         let byte_len = fs::metadata(&path).ok().map(|metadata| metadata.len());
         artifacts.push(ArtifactMetadata {
+            producer_session_id: None,
+            producer_execution_id: None,
             artifact_id: ArtifactRef::new(
                 Id::new(format!("artifact-synthetic-{}", index + 1))
                     .expect("synthetic artifact ids are valid"),

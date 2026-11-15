@@ -217,16 +217,33 @@ impl DbgEngSession {
         session_from_status(handle, status)
     }
 
-    #[cfg(windows)]
     pub fn attach_with_runtimes(
         pid: u32,
+        dbgeng_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, DbgEngError> {
+        Self::attach_mode_with_runtimes(pid, false, dbgeng_dirs)
+    }
+
+    #[cfg(windows)]
+    pub fn attach_mode_with_runtimes(
+        pid: u32,
+        invasive: bool,
         dbgeng_dirs: &[std::path::PathBuf],
     ) -> Result<Self, DbgEngError> {
         if pid == 0 {
             return Err(DbgEngError::InvalidPid);
         }
         if dbgeng_dirs.is_empty() {
-            return Self::attach_with_runtime(pid, None);
+            load_runtime(None)?;
+            let mut handle = std::ptr::null_mut();
+            let status = unsafe {
+                dbgatlas_dbgeng_sys::da_dbgeng_session_attach_process_mode(
+                    pid,
+                    u32::from(invasive),
+                    &mut handle,
+                )
+            };
+            return session_from_status(handle, status);
         }
 
         let mut errors = Vec::new();
@@ -235,7 +252,11 @@ impl DbgEngSession {
                 Ok(()) => {
                     let mut handle = std::ptr::null_mut();
                     let status = unsafe {
-                        dbgatlas_dbgeng_sys::da_dbgeng_session_attach_process(pid, &mut handle)
+                        dbgatlas_dbgeng_sys::da_dbgeng_session_attach_process_mode(
+                            pid,
+                            u32::from(invasive),
+                            &mut handle,
+                        )
                     };
                     return session_from_status(handle, status).map_err(|error| {
                         DbgEngError::RuntimeCandidatesFailed(format!(
@@ -259,8 +280,9 @@ impl DbgEngSession {
     }
 
     #[cfg(not(windows))]
-    pub fn attach_with_runtimes(
+    pub fn attach_mode_with_runtimes(
         pid: u32,
+        _invasive: bool,
         _dbgeng_dirs: &[std::path::PathBuf],
     ) -> Result<Self, DbgEngError> {
         if pid == 0 {

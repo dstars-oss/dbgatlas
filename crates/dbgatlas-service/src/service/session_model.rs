@@ -33,6 +33,7 @@ impl ServiceHost {
             });
         let now = Timestamp::now();
         let session = Session {
+            input_artifacts: vec![],
             schema_version: 1,
             session_id: session_id.clone(),
             kind,
@@ -94,6 +95,17 @@ impl ServiceHost {
         capability: &str,
         input: Value,
     ) -> Result<(), ServiceError> {
+        if self
+            .execution_scope
+            .as_ref()
+            .is_some_and(|s| &s.operation_id == operation_id)
+            && self
+                .lock_state()?
+                .operations
+                .contains_key(operation_id.id.as_str())
+        {
+            return Ok(());
+        }
         // Refresh backend facts before capturing the immutable operation context.
         if self
             .lock_state()?
@@ -114,7 +126,7 @@ impl ServiceHost {
             session_id: Some(session_id.clone()),
             input: Some(input),
             execution_context: snapshot
-                .filter(|s| s.worker.is_some())
+                .filter(|s| s.worker.is_some() && !capability.starts_with("debug."))
                 .map(|s| ExecutionContext {
                     worker: s.worker,
                     target: s.target,

@@ -129,6 +129,8 @@ pub(super) fn register_worker_writes(
             memory = Some(artifact_id.clone());
         }
         workspace.register_artifact(&ArtifactMetadata {
+            producer_session_id: None,
+            producer_execution_id: None,
             artifact_id: artifact_id.clone(),
             kind: write.kind.clone(),
             relative_path: write.relative_path.clone(),

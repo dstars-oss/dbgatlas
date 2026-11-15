@@ -15,7 +15,7 @@ flowchart TB
   TTD --> RECORDER[身份 helper / recorder / stop helper]
 ```
 
-活动会话与主 worker 一对一固定绑定。辅助进程不成为新的主 worker。一个 worker 退出后不能通过替换进程延续原会话；历史仍可查询。当前三条路径复用既有 worker 二进制及 v8 本机命名管道协议，不新增独立服务。
+活动会话与主 worker 一对一固定绑定。辅助进程不成为新的主 worker。一个 worker 退出后不能通过替换进程延续原会话；历史仍可查询。当前三条路径复用既有 worker 二进制及 v9 本机命名管道协议，不新增独立服务。
 
 控制服务保存公共会话摘要和本机运行注册表，负责并发准入、操作记录与工作区最终产物登记。执行侧解析工具路径、持有 native 对象、执行后端动作并返回受控输出声明。公共模型不保存句柄、token 或管道。
 
@@ -56,8 +56,8 @@ CPU sampling 和 TTD 的并发额度由控制服务统一管理，不能因多�
 
 ## 交互与后续范围
 
-普通操作使用每会话请求锁并在忙时拒绝，不增加命令队列。状态摘要和强制结束独立于此锁。3B 已将 DbgEng Execute/WaitForEvent 固定在所有者线程；控制 pipe 投递带代次的 ACTIVE/PASSIVE/EXIT，业务 pipe 独立分发 response/event。控制请求不获取业务请求锁，也不自动升级为 kill。MCP 长操作交互与有限等待仍在 3C/3D 收敛。
+普通操作使用每会话请求锁并在忙时拒绝，不增加命令队列。状态摘要和强制结束独立于此锁。3B 已将 DbgEng Execute/WaitForEvent 固定在所有者线程；控制 pipe 投递带代次的 ACTIVE/PASSIVE/EXIT，业务 pipe 独立分发 response/event。控制请求不获取业务请求锁，也不自动升级为 kill。3C 服务层已接管任务生命周期和有限等待，MCP 协议/工具列表与 CLI 收敛留在 3D。
 
-目标运行时所有者持续 WaitForEvent(INFINITE)。关闭用 EXIT 唤醒；E_PENDING 后不查询线程/栈帧，也不将引擎 BREAK 当成目标停止，随后 detach。异步输出写 session-output.log，缓存事件有界并记录 gap，事件与 HRESULT 分别留在 engine-events.jsonl / engine-results.jsonl；公共游标读取在 3C 实现。
+目标运行时所有者持续 WaitForEvent(INFINITE)。关闭用 EXIT 唤醒；E_PENDING 后不查询线程/栈帧，也不将引擎 BREAK 当成目标停止，随后 detach。异步输出写 session-output.log，缓存事件有界并记录 gap，事件与 HRESULT 分别留在 engine-events.jsonl / engine-results.jsonl；3C 的 execution.read / session.read 已提供有界公共游标读取。
 
 当前 debug 显式执行超时仍可能杀 worker，并使会话失败、原操作结果 unknown；这不是“只停止本次等待”。远端传输在迭代 5 实现；本轮不承诺服务重启恢复现场、worker 池、迁移或真实既有调试器接入。

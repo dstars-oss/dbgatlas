@@ -216,6 +216,8 @@ impl Core {
         artifact: &ArtifactOutput,
     ) -> Result<(), CoreError> {
         let metadata = ArtifactMetadata {
+            producer_session_id: None,
+            producer_execution_id: None,
             artifact_id: artifact.artifact_id.clone(),
             kind: artifact.kind.clone(),
             relative_path: artifact.relative_path.clone(),

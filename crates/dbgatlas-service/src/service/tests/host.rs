@@ -341,6 +341,7 @@ fn debug_eval_steps_runs_commands_in_order() {
         method: "debug.eval_steps".to_string(),
         params: Some(json!({
             "session_id": session_id,
+            "wait_ms":30000,
             "commands": [
                 ".exepath D:\\Repos\\Sangfor\\EDR\\sf3\\dump",
                 ".reload /f sf3.dll",
@@ -825,7 +826,7 @@ fn mcp_tool_input_schemas_are_top_level_objects() {
 }
 
 #[test]
-fn repeated_close_reports_removed_session() {
+fn repeated_close_returns_the_same_execution() {
     let temp = tempfile::tempdir().unwrap();
     let host = ServiceHost::with_mock_workers();
     let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
@@ -844,7 +845,11 @@ fn repeated_close_reports_removed_session() {
         method: "debug.session.close".to_string(),
         params: Some(json!({ "session_id": session_id })),
     });
-    assert_eq!(second.error.unwrap().code, -32010);
+    assert!(second.error.is_none());
+    assert_eq!(
+        first.result.unwrap()["operation_id"],
+        second.result.unwrap()["operation_id"]
+    );
 }
 
 #[test]
@@ -915,46 +920,41 @@ fn failed_eval_is_recorded_in_command_audit() {
 }
 
 #[test]
-fn debug_eval_timeout_kills_worker_and_marks_session_error() {
+fn debug_eval_wait_only_ends_observation_and_keeps_session_busy() {
     let temp = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(InstrumentedWorkerSupervisor::with_delay(200));
-    let host = ServiceHost::new(supervisor);
-    let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
-
-    let eval = host.handle_rpc(JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
+    let host = ServiceHost::new(supervisor.clone());
+    let sid = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
+    let response = host.handle_rpc(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
         id: Some(json!(2)),
-        method: "debug.eval".to_string(),
-        params: Some(json!({
-            "session_id": session_id,
-            "command": "TTD.Calls(\"KERNELBASE!LoadLibraryExW\")",
-            "timeout_ms": 10
-        })),
+        method: "debug.eval".into(),
+        params: Some(json!({"session_id":sid,"command":".echo continues","wait_ms":10})),
     });
-
-    let error = eval.error.unwrap();
-    assert!(error.message.contains("timed out after 10 ms"));
-
-    {
-        let state = host.lock_state().unwrap();
-        let session = state.sessions.values().next().unwrap();
-        assert_eq!(session.state, DebugSessionState::Error);
-        let operation = state
-            .operations
-            .values()
-            .find(|operation| operation.capability == "debug.eval")
-            .unwrap();
-        assert_eq!(operation.status, ServiceOperationStatus::Unknown);
-    }
-
-    let cleanup = host.handle_rpc(JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(json!(3)),
-        method: "debug.session.kill".to_string(),
-        params: Some(json!({ "session_id": session_id })),
-    });
-    assert!(cleanup.error.is_none(), "{:?}", cleanup.error);
-    assert!(host.lock_state().unwrap().sessions.is_empty());
+    assert!(response.error.is_none());
+    let response = response.result.unwrap();
+    assert_eq!(response["wait_expired"], true);
+    assert!(
+        eval_request(&host, sid.clone(), ".echo busy")
+            .error
+            .is_some()
+    );
+    let id: OperationRef = serde_json::from_value(response["operation_id"].clone()).unwrap();
+    let job = host.execution_job(&id).unwrap();
+    let guard = job.state.lock().unwrap();
+    let (guard, _) = job
+        .changed
+        .wait_timeout_while(guard, Duration::from_secs(3), |s| !s.finished)
+        .unwrap();
+    assert!(guard.finished);
+    drop(guard);
+    assert_eq!(host.execution_value(&id).unwrap()["status"], "success");
+    assert!(
+        eval_request(&host, sid.clone(), ".echo still-usable")
+            .error
+            .is_none()
+    );
+    assert!(close_request(&host, sid).error.is_none());
 }
 
 #[test]
@@ -985,7 +985,7 @@ fn add_symbols_uses_distinct_operation_capability() {
 }
 
 #[test]
-fn cancel_rejects_completed_operation_without_changing_status() {
+fn cancel_reports_already_finished_without_changing_status() {
     let temp = tempfile::tempdir().unwrap();
     let host = ServiceHost::with_mock_workers();
     let session_id = create_debug_session(&host, temp.path()).result.unwrap()["session_id"].clone();
@@ -1006,7 +1006,8 @@ fn cancel_rejects_completed_operation_without_changing_status() {
         method: "operation.cancel".to_string(),
         params: Some(json!({ "operation_id": operation_id.clone() })),
     });
-    assert_eq!(cancel.error.unwrap().code, -32014);
+    assert!(cancel.error.is_none());
+    assert_eq!(cancel.result.unwrap()["code"], "already_finished");
 
     let get = host.handle_rpc(JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -1159,8 +1160,12 @@ fn concurrent_close_rechecks_latest_session_state() {
         })
         .count();
 
-    assert_eq!(success_count, 1);
-    assert_eq!(missing_count, 1);
+    assert_eq!(success_count, 2);
+    assert_eq!(missing_count, 0);
+    assert_eq!(
+        responses[0].result.as_ref().unwrap()["operation_id"],
+        responses[1].result.as_ref().unwrap()["operation_id"]
+    );
 }
 
 #[test]
@@ -1180,7 +1185,7 @@ fn eval_after_concurrent_close_rechecks_latest_session_state() {
     assert!(close.join().unwrap().error.is_none());
     assert!(matches!(
         eval.join().unwrap().error.unwrap().code,
-        -32010 | -32017 | -32011
+        -32010 | -32017 | -32011 | -32000
     ));
 }
 

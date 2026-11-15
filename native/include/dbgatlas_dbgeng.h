@@ -119,6 +119,10 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_last_error(
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_file(
     const char* path_utf8,
     DA_DbgEngSessionHandle** out_handle);
+/* invasive: 0 preserves non-invasive/no-suspend behavior; 1 takes debug control. */
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process_mode(
+    uint32_t pid, uint32_t invasive, DA_DbgEngSessionHandle** out_handle);
+
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
     uint32_t pid,
     DA_DbgEngSessionHandle** out_handle);

@@ -43,21 +43,8 @@ impl ServiceHost {
             ));
         }
 
-        let operation_id = next_operation_ref();
+        let operation_id = self.action_operation_id();
         let workspace = Workspace::open(&session.internal_workspace_root)?;
-        let operation = ServiceOperation::running(
-            operation_id.clone(),
-            capability,
-            Some(session.session_id.clone()),
-            format!("{capability} running"),
-        );
-        {
-            let mut state = self.lock_state()?;
-            state
-                .operations
-                .insert(operation_id.id.as_str().to_string(), operation);
-        }
-
         self.begin_operation_record(
             &workspace,
             &operation_id,
@@ -95,26 +82,13 @@ impl ServiceHost {
             .map_err(|_| ServiceError::SessionBusy(session.session_id.to_string()))?;
         let session = self.reusable_debug_session(&request.session_id)?;
 
-        let operation_id = next_operation_ref();
+        let operation_id = self.action_operation_id();
         let workspace = Workspace::open(&session.internal_workspace_root)?;
         let audit_command = if request.reload {
             format!(".sympath+ {}; .reload", request.symbol_path)
         } else {
             format!(".sympath+ {}", request.symbol_path)
         };
-        let operation = ServiceOperation::running(
-            operation_id.clone(),
-            "debug.add_symbols",
-            Some(session.session_id.clone()),
-            "debug.add_symbols running",
-        );
-        {
-            let mut state = self.lock_state()?;
-            state
-                .operations
-                .insert(operation_id.id.as_str().to_string(), operation);
-        }
-
         self.begin_operation_record(
             &workspace,
             &operation_id,
@@ -151,25 +125,12 @@ impl ServiceHost {
             .map_err(|_| ServiceError::SessionBusy(session.session_id.to_string()))?;
         let session = self.reusable_debug_session(&request.session_id)?;
 
-        let operation_id = next_operation_ref();
+        let operation_id = self.action_operation_id();
         let workspace = Workspace::open(&session.internal_workspace_root)?;
         let audit_command = format!(
             "read_memory address={} length={}",
             request.address, request.length
         );
-        let operation = ServiceOperation::running(
-            operation_id.clone(),
-            "debug.read_memory",
-            Some(session.session_id.clone()),
-            "debug.read_memory running",
-        );
-        {
-            let mut state = self.lock_state()?;
-            state
-                .operations
-                .insert(operation_id.id.as_str().to_string(), operation);
-        }
-
         self.begin_operation_record(
             &workspace,
             &operation_id,
@@ -206,6 +167,9 @@ impl ServiceHost {
         audit_command: String,
         worker_response: Result<WorkerResponse, ServiceError>,
     ) -> Result<Value, ServiceError> {
+        if let Err(error) = self.capture_execution_start(&operation_id) {
+            append_service_diagnostic_log(&format!("execution context archive failed: {error}"));
+        }
         match worker_response {
             Ok(WorkerResponse::DebugCommand { mut result, writes }) => {
                 let registered = match register_worker_writes(workspace, &operation_id, &writes) {
@@ -572,47 +536,10 @@ impl ServiceHost {
         operation_id: &OperationRef,
         timeout_ms: Option<u64>,
     ) -> Result<WorkerResponse, ServiceError> {
-        let Some(timeout_ms) = timeout_ms else {
-            return self.supervisor.request_worker(&session.worker, request);
-        };
-        let timeout = Duration::from_millis(timeout_ms);
-        let supervisor = Arc::clone(&self.supervisor);
-        let worker = session.worker.clone();
-        let session_id = session.session_id.clone();
-        let operation_id_for_thread = operation_id.clone();
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let response = supervisor.request_worker(&worker, request);
-            let _ = sender.send(response);
-        });
-
-        match receiver.recv_timeout(timeout) {
-            Ok(response) => response,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                append_service_diagnostic_log(&format!(
-                    "debug_eval_timeout session_id={} operation_id={} timeout_ms={}",
-                    sanitize_log_value(session_id.id.as_str()),
-                    sanitize_log_value(operation_id.id.as_str()),
-                    timeout_ms
-                ));
-                if let Err(error) = self.supervisor.kill_worker(&session.worker) {
-                    append_service_diagnostic_log(&format!(
-                        "debug_eval_timeout_kill_failed session_id={} operation_id={} error={}",
-                        sanitize_log_value(session_id.id.as_str()),
-                        sanitize_log_value(operation_id.id.as_str()),
-                        sanitize_log_value(&error.to_string())
-                    ));
-                }
-                self.mark_debug_session_error(&session_id)?;
-                Err(ServiceError::Worker(format!(
-                    "debug operation {} timed out after {} ms; debug worker was killed and the session must be recreated",
-                    operation_id_for_thread, timeout_ms
-                )))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ServiceError::Worker(
-                "worker request ended before returning a response".to_string(),
-            )),
-        }
+        // Observation budgets are owned by the service execution coordinator.
+        // Neither a client disconnect nor an expired wait can stop this request.
+        let _ = (operation_id, timeout_ms);
+        self.supervisor.request_worker(&session.worker, request)
     }
 
     pub(super) fn finish_memory_worker_response(
@@ -623,6 +550,9 @@ impl ServiceHost {
         audit_command: String,
         worker_response: Result<WorkerResponse, ServiceError>,
     ) -> Result<Value, ServiceError> {
+        if let Err(error) = self.capture_execution_start(&operation_id) {
+            append_service_diagnostic_log(&format!("execution context archive failed: {error}"));
+        }
         match worker_response {
             Ok(WorkerResponse::DebugMemory { mut result, writes }) => {
                 let registered = match register_worker_writes(workspace, &operation_id, &writes) {
@@ -963,6 +893,19 @@ impl ServiceHost {
     ) -> Result<(), ServiceError> {
         let mut state = self.lock_state()?;
         if let Some(operation) = state.operations.get_mut(operation_id.id.as_str()) {
+            if matches!(
+                operation.status,
+                ServiceOperationStatus::Success
+                    | ServiceOperationStatus::Failed
+                    | ServiceOperationStatus::Canceled
+            ) && matches!(
+                status,
+                ServiceOperationStatus::Pending
+                    | ServiceOperationStatus::Running
+                    | ServiceOperationStatus::Unknown
+            ) {
+                return Ok(());
+            }
             operation.status = status;
             operation.summary = summary;
             operation.artifacts = artifacts;

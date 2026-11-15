@@ -27,6 +27,14 @@ pub enum DebugError {
     MemoryReadTooLarge { max: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMode {
+    #[default]
+    Noninvasive,
+    Invasive,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DebugTarget {
@@ -35,6 +43,8 @@ pub enum DebugTarget {
     },
     Attach {
         pid: u32,
+        #[serde(default)]
+        mode: AttachMode,
     },
     Launch {
         executable: PathBuf,
@@ -47,7 +57,10 @@ impl DebugTarget {
     pub fn validate(self) -> Result<Self, DebugError> {
         match self {
             Self::File { path } => validate_path(&path).map(|path| Self::File { path }),
-            Self::Attach { pid } => validate_attach_pid(pid),
+            Self::Attach { pid, mode } => {
+                validate_attach_pid(pid)?;
+                Ok(Self::Attach { pid, mode })
+            }
             Self::Launch { executable, args } => validate_launch_target(&executable, args),
         }
     }
@@ -210,7 +223,10 @@ fn validate_attach_pid(pid: u32) -> Result<DebugTarget, DebugError> {
     if pid == std::process::id() {
         return Err(DebugError::AttachCurrentProcess);
     }
-    Ok(DebugTarget::Attach { pid })
+    Ok(DebugTarget::Attach {
+        pid,
+        mode: AttachMode::Noninvasive,
+    })
 }
 
 fn validate_launch_target(executable: &Path, args: Vec<String>) -> Result<DebugTarget, DebugError> {
@@ -223,6 +239,34 @@ fn validate_launch_target(executable: &Path, args: Vec<String>) -> Result<DebugT
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attach_defaults_to_observation_and_requires_explicit_control() {
+        let old: super::DebugTarget =
+            serde_json::from_str(r#"{"kind":"attach","pid":42}"#).unwrap();
+        assert!(matches!(
+            old,
+            super::DebugTarget::Attach {
+                mode: super::AttachMode::Noninvasive,
+                ..
+            }
+        ));
+        let invasive: super::DebugTarget =
+            serde_json::from_str(r#"{"kind":"attach","pid":42,"mode":"invasive"}"#).unwrap();
+        assert!(matches!(
+            invasive.validate().unwrap(),
+            super::DebugTarget::Attach {
+                mode: super::AttachMode::Invasive,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_str::<super::DebugTarget>(
+                r#"{"kind":"attach","pid":42,"mode":"typo"}"#
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
     use dbgatlas_model::{Id, SessionRef};
 
@@ -303,7 +347,11 @@ mod tests {
     #[test]
     fn rejects_invalid_targets() {
         assert!(matches!(
-            DebugTarget::Attach { pid: 0 }.validate(),
+            DebugTarget::Attach {
+                pid: 0,
+                mode: AttachMode::Noninvasive
+            }
+            .validate(),
             Err(DebugError::InvalidPid)
         ));
         assert!(matches!(

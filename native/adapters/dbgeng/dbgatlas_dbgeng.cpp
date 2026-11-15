@@ -564,12 +564,12 @@ int32_t wait_for_initial_event(DbgEngSession& session, const char* operation) {
     return DA_DBGENG_OK;
 }
 
-int32_t wait_for_launch_initial_event(DbgEngSession& session) {
+int32_t wait_for_process_initial_event(DbgEngSession& session) {
     BreakingEventCallbacks callbacks;
     IDebugEventCallbacks* previous = nullptr;
     HRESULT hr = session.client->GetEventCallbacks(&previous);
     if (FAILED(hr)) {
-        return fail_hr("IDebugClient::GetEventCallbacks(launch process)", hr);
+        return fail_hr("IDebugClient::GetEventCallbacks(initial process event)", hr);
     }
 
     hr = session.client->SetEventCallbacks(&callbacks);
@@ -577,7 +577,7 @@ int32_t wait_for_launch_initial_event(DbgEngSession& session) {
         if (previous != nullptr) {
             previous->Release();
         }
-        return fail_hr("IDebugClient::SetEventCallbacks(launch process)", hr);
+        return fail_hr("IDebugClient::SetEventCallbacks(initial process event)", hr);
     }
 
     hr = session.control->WaitForEvent(0, 30'000);
@@ -600,7 +600,7 @@ int32_t wait_for_launch_initial_event(DbgEngSession& session) {
         return DA_DBGENG_OK;
     }
 
-    return fail_hr("IDebugControl::WaitForEvent(launch process)", hr);
+    return fail_hr("IDebugControl::WaitForEvent(initial process event)", hr);
 }
 
 int32_t open_debug_file(DbgEngSession& session, const char* path_utf8) {
@@ -772,7 +772,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out) {
         out->struct_size = sizeof(DA_DbgEngVersion);
         out->flags = 0;
         out->abi_major = 0;
-        out->abi_minor = 6;
+        out->abi_minor = 7;
         out->abi_patch = 0;
         g_last_error.clear();
         return DA_DBGENG_OK;
@@ -858,7 +858,13 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_open_file(
 }
 
 DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
+    uint32_t pid, DA_DbgEngSessionHandle** out_handle) {
+    return da_dbgeng_session_attach_process_mode(pid, 0, out_handle);
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process_mode(
     uint32_t pid,
+    uint32_t invasive,
     DA_DbgEngSessionHandle** out_handle) {
     return guard([&]() -> int32_t {
         if (out_handle == nullptr) {
@@ -866,7 +872,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
         }
         *out_handle = nullptr;
 
-        if (pid == 0) {
+        if (pid == 0 || invasive > 1) {
             return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "attach pid must be greater than zero");
         }
 
@@ -879,18 +885,25 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_attach_process(
         if (status != DA_DBGENG_OK) {
             return status;
         }
-        // Use non-invasive/no-suspend attach: read target state without taking
-        // over the debug lifecycle. Destruction detaches passively so closing a
-        // DbgAtlas session does not terminate the target process.
+        // Taking debug control requires an explicit invasive choice.
         HRESULT hr = session->client->AttachProcess(
             0,
             pid,
-            DEBUG_ATTACH_NONINVASIVE | DEBUG_ATTACH_NONINVASIVE_NO_SUSPEND);
+            invasive ? DEBUG_ATTACH_DEFAULT : (DEBUG_ATTACH_NONINVASIVE | DEBUG_ATTACH_NONINVASIVE_NO_SUSPEND));
         if (FAILED(hr)) {
             return fail_hr("IDebugClient::AttachProcess", hr);
         }
         session->detach_processes_on_close = true;
-        (void)session->control->WaitForEvent(0, 1'000);
+        if (invasive) {
+            status = wait_for_process_initial_event(*session);
+            if (status != DA_DBGENG_OK) { return status; }
+            // Process options require an established live target. Set this before
+            // publishing the session, so forced debugger exit preserves externals.
+            const HRESULT options_hr = session->client->AddProcessOptions(DEBUG_PROCESS_DETACH_ON_EXIT);
+            if (FAILED(options_hr)) { return fail_hr("AddProcessOptions(detach on exit)", options_hr); }
+        } else {
+            (void)session->control->WaitForEvent(0, 1'000);
+        }
         *out_handle = reinterpret_cast<DA_DbgEngSessionHandle*>(session.release());
         g_last_error.clear();
         return DA_DBGENG_OK;
@@ -926,7 +939,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_launch_process(
         }
         session->detach_processes_on_close = true;
         session->unpublished_launch = true;
-        status = wait_for_launch_initial_event(*session);
+        status = wait_for_process_initial_event(*session);
         if (status != DA_DBGENG_OK) {
             return status;
         }

@@ -24,7 +24,7 @@
 | --- | --- | --- | --- |
 | 1. 剥离 IDA，明确产品边界 | 删除 IDA 实现与依赖；同步定位和文档 | 无 IDA 依赖的构建、安装与现有调试/录制冒烟通过 | 已验收（2026-11-14） |
 | 2. 调整环境、会话和进程架构 | 建立环境/目标/会话关联模型；拆分控制与执行及进程生命周期 | 默认本机环境的调试链路通过新模型运行，所有权与失败状态明确 | 已实现并完成代表性验收（2026-11-14） |
-| 3. 收敛 AI 交互接口 | 原生 exec 为主入口；明确状态、中断、关闭及长操作交互 | 短命令、长查询、继续、断点命中及中断均有明确结果 | 3A 完成；3B 本机实现/验证完成，安装验收待前置条件（2026-11-15） |
+| 3. 收敛 AI 交互接口 | 原生 exec 为主入口；明确状态、中断、关闭及长操作交互 | 短命令、长查询、继续、断点命中及中断均有明确结果 | 3A/3B/3C 本机实现与验证完成；3D 协议/CLI 和安装验收待推进（2026-11-15） |
 | 4. 建立持久化操作历史 | SQLite 管理记录与输出索引；提供检索和输出读取 | 重启后可查询历史，大输出可按需读取并追溯来源 | 待开始 |
 | 5. 接入远端调试后端 | 远端连接与会话管理；断线核对及产物取回 | 同一接口操作本机和远端，重连后可确认操作结果 | 待开始 |
 | 6. 跨会话继承调试信息 | 稳定目标身份与历史关联；重新打开同一目标后复用历史 | 同一 Dump/回放记录可跨会话检索，现场状态互不混淆 | 待开始 |
@@ -77,7 +77,7 @@
 
 ### 迭代 3：原生执行与可靠交互
 
-具体方案见[原生执行与可靠交互](docs/execution-interaction.md)，基于 `d2fb7d1` 核实当前链路。已确定采用 Session + Execution：session.* 接受动作并观察现场，execution.* 查询、取消和读取执行结果。3A 已收敛后端机制与首版 MCP 选择，3B 已实现执行侧控制和 session.interrupt；其余产品接口及默认等待预算仍在 3C 收敛。
+具体方案见[原生执行与可靠交互](docs/execution-interaction.md)，基于 `d2fb7d1` 核实当前链路。已确定采用 Session + Execution：session.* 接受动作并观察现场，execution.* 查询、取消和读取执行结果。3A 已收敛后端机制与首版 MCP 选择，3B 已实现执行侧控制和 session.interrupt；3C 已落地 Session + Execution、有限等待及输出读取，3D 收敛 MCP/CLI 和安装态验收。
 
 - 以 session.exec 为主要入口，统一 session.open/get/list/interrupt/close/kill/read 与 execution.get/list/cancel/read；命令知识通过 session.help 按需提供，避免所有平台工具描述常驻上下文。
 - Artifact 绑定来源会话和可确认的来源 Execution，由 workspace 保管；后续会话显式引用同一材料，关闭不删除。外部输入不虚构 producer，本轮不实现自动历史匹配或多会话产物汇聚。
@@ -89,7 +89,14 @@
 
 3A 已完成路线收敛，证据见[原型验证记录](docs/iteration-3a-validation.md)：两版 DbgEng、Dump、TTD 共 23 组原型检查通过；Codex 实际 stdio/HTTP 握手和官方 WinDbg MCP 对照已执行。有限 WaitForEvent 会暂停目标，正式事件泵改为持续等待，wait_ms 仅作用于服务层。首版 MCP 选择 2025-06-18 普通调用与 Execution 查询，不声明 Tasks。官方命令输出失败、Claude/真实 AI 调度未覆盖单列，不冒充通过。
 
-3B 已实现带代次的独立 native 中断句柄、事件回调/持续等待、原始 HRESULT、worker v8 与控制管道。真实 worker 验证覆盖迟到 cancel、关闭竞争、等待退出、目标/worker 退出、配合/不配合扩展、Dump/TTD 和大输出；工作区 229 项测试通过，MSVC release payload 构建完成。详细证据与边界见[3B 验证记录](docs/iteration-3b-validation.md)。本机仍无 DbgAtlas SCM 服务和已连接 DbgAtlas MCP，未执行安装态 update/health，不宣称完整安装验收通过。下一批次 3C 落地服务持有 Execution、有限等待与读输出；旧 debug.eval 显式超时语义尚未变更。
+3B 已实现带代次的独立 native 中断句柄、事件回调/持续等待、原始 HRESULT、worker v8 与控制管道。真实 worker 验证覆盖迟到 cancel、关闭竞争、等待退出、目标/worker 退出、配合/不配合扩展、Dump/TTD 和大输出；工作区 229 项测试通过，MSVC release payload 构建完成。详细证据与边界见[3B 验证记录](docs/iteration-3b-validation.md)。本机仍无 DbgAtlas SCM 服务和已连接 DbgAtlas MCP，未执行安装态 update/health，不宣称完整安装验收通过。3C 的实现与验证见下段。
+
+
+#### 3C 实现进展
+
+已落地 API 0.4.0 的 session.open/exec/get/list/interrupt/read/close/kill/help 和 execution.get/list/cancel/read；服务持有任务、每会话准入、有限等待与同实例去重，legacy debug 入口复用同一 Execution。旧 debug timeout_ms 明确拒绝，operation.stream 已改为有界读取。UTF-8 游标跨 .part 归档和关闭保持连续，Artifact 保存 producer_session_id/producer_execution_id，支持同 workspace 显式输入引用。显式 invasive attach、批次父子关联与中断后未执行步骤同步实现；worker v9 / DbgEng ABI 0.7.0。
+
+验证、release 状态及未覆盖项见 [3C 验证记录](docs/iteration-3c-validation.md)。下一阶段 3D 仍需 MCP 版本协商、结构化返回/工具列表收敛、CLI 命令收敛与真实客户端/安装态验收；本轮未宣称整个迭代 3 完成。
 
 ### 迭代 4：SQLite 操作历史
 

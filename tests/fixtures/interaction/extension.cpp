@@ -21,3 +21,12 @@ extern "C" __declspec(dllexport) HRESULT CALLBACK uncooperative(PDEBUG_CLIENT4 c
     }
     return S_OK;
 }
+extern "C" __declspec(dllexport) HRESULT CALLBACK streaming(PDEBUG_CLIENT4 client, PCSTR) {
+    IDebugControl* control = nullptr;
+    if (FAILED(client->QueryInterface(__uuidof(IDebugControl), reinterpret_cast<void**>(&control)))) return E_FAIL;
+    control->Output(DEBUG_OUTPUT_NORMAL, "stream:begin\n");
+    Sleep(1500);
+    control->Output(DEBUG_OUTPUT_NORMAL, "stream:end\n");
+    control->Release();
+    return S_OK;
+}

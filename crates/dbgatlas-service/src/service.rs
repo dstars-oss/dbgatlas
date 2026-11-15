@@ -310,6 +310,8 @@ pub struct ServiceHost {
     state: Arc<Mutex<ServiceState>>,
     supervisor: Arc<dyn WorkerSupervisor>,
     capabilities: ServiceCapabilities,
+    executions: Arc<execution::Coordinator>,
+    execution_scope: Option<execution::Scope>,
     #[cfg(test)]
     ttd_runner: Arc<dyn TtdRecorderRunner>,
     #[cfg(test)]
@@ -325,8 +327,10 @@ pub struct ServiceCapabilities {
 mod host_debug;
 mod host_recording;
 use host_recording::RemoteRecording;
+mod execution;
 mod host_service;
 mod host_worker_ops;
+mod output_read;
 mod recording_executor;
 mod session_model;
 pub use recording_executor::RecordingExecutor;

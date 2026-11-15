@@ -2,7 +2,7 @@
 
 DbgAtlas is an AI-oriented debugging platform. AI clients use native debugger commands with session management, state, and recorded outputs. Windows debugging and recording include the iteration 2 environment/session/process model; reliable execution interaction, remote backends, persistent searchable history, Linux, and a management UI follow [PLAN.md](PLAN.md).
 
-The [architecture specification](docs/architecture.md) and [environment/session model](docs/environment-session-model.md) describe the design and iteration 2 baseline. The next iteration adopts Session + Execution through session.* and execution.* interfaces, with bounded waits, reliable interruption and Artifact source/reference tracking. Its [3A prototype](docs/iteration-3a-validation.md) has fixed the execution and MCP direction; [3B](docs/iteration-3b-validation.md) now implements continuous engine observations and independent control. The remaining [product interfaces](docs/execution-interaction.md), service-owned bounded waits and Execution naming migration follow in 3C. See the [implementation baseline](docs/roadmap.md) for current code paths and limitations.
+The [architecture specification](docs/architecture.md) and [implementation baseline](docs/roadmap.md) describe the design and current code paths. Iteration 3C implements Session + Execution, service-owned bounded waits, reliable interruption, cursor-based output reads and Artifact producer/input references. See the [interaction contract](docs/execution-interaction.md) and [3C validation](docs/iteration-3c-validation.md). MCP version negotiation, CLI convergence and installed-client acceptance remain in 3D.
 
 IDA static analysis belongs to external tools. DbgAtlas provides debugger-native symbols, types, disassembly, and memory inspection.
 
@@ -10,15 +10,16 @@ This repository contains the tool implementation. Real investigation data belong
 
 Current implementation includes:
 
-- A `0.3.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
+- A `0.4.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
 - A Rust workspace split into `model`, `workspace`, `adapter`, `core`, `cli`, and a minimal `dbgeng` native wrapper.
 - Session/Operation model with terminal summaries, immutable execution context and versioned JSONL updates. Dedicated workers for DbgEng, ETW and TTD recording, using local named-pipe protocol v8.
-- Independent `session.interrupt` and cooperative command cancellation, with epoch validation, native events and raw output spooling. Explicit legacy execution timeouts still kill workers until 3C.
+- Independent `session.interrupt` and cooperative command cancellation, with epoch validation, native events and raw output spooling. Action waits default to 1000 ms (maximum 30000); expiry does not cancel or kill. Explicit legacy debug `timeout_ms` is rejected with migration guidance to `wait_ms`.
 - Runtime configuration types in `dbgatlas-runtime`, kept separate from workspace manifests.
 - A visible analysis workspace layout with `artifacts/`, `analysis/`, and optional `inputs/`.
 - Controlled artifact helpers for debug and recording sessions.
 - A C++20 DbgEng native DLL with adapter-specific C ABI for opening DbgEng files (`.dmp`, `.run`), attach process, raw command execution, session symbol path append, and virtual memory reads.
 - CLI commands for workspace initialization, workspace inspection, service dev mode, and debug session workflows.
+- `session.open/exec/get/list/interrupt/close/kill/read/help` and `execution.get/list/cancel/read`; legacy debug/operation aliases share the same execution IDs. `operation.stream` now returns bounded output items and a cursor.
 - RPC/MCP project fact queries through `artifact.list`, `operation.list`, and `audit.list_commands`, plus the complete ETW recording lifecycle.
 - Windows Service lifecycle commands that install or use an isolated runtime payload under `%ProgramFiles%\DbgAtlas\bin\`, machine config under `etc\`, and service logs under `var\log\`.
 

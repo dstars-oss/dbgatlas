@@ -6,7 +6,7 @@ DbgAtlas 面向 AI 提供原生调试命令执行、会话管理、状态查询�
 
 - 本文定义总体职责和依赖方向；[环境与会话模型](environment-session-model.md)定义环境、目标、会话及状态语义。
 - [后端执行边界](adapter-model.md)定义原生执行与后端契约；[进程与生命周期](worker-model.md)定义进程所有权和故障处理。
-- [原生执行与可靠交互](execution-interaction.md)细化迭代 3 的接口、执行侧改造和验收方案；[3A 原型验证](iteration-3a-validation.md)已收敛机制与协议，[3B 执行侧实现](iteration-3b-validation.md)已完成本机验证；其余公共接口及有限等待在 3C 实现。
+- [原生执行与可靠交互](execution-interaction.md)细化迭代 3 的接口、执行侧改造和验收方案；[3A 原型验证](iteration-3a-validation.md)已收敛机制与协议，[3B 执行侧实现](iteration-3b-validation.md)已完成本机验证；[3C 公共接口与有限等待](iteration-3c-validation.md)已落地，MCP/CLI 收敛与安装态验收留在 3D。
 - [运行时模型](runtime-model.md)、[工作区模型](workspace-model.md)、[录制模型](recording-model.md)分别维护部署、持久化和采集规格。
 - [PLAN.md](../PLAN.md)只负责实施顺序、验收和进度；[当前实现基线](roadmap.md)描述已存在的代码路径。验证记录是对应提交的历史证据，不是后续功能的验收证明。
 
@@ -43,13 +43,13 @@ flowchart TB
 
 原生命令执行是主要入口，补充会话发现/建立、状态、中断、关闭和历史读取。不要把 WinDbg/GDB 的全部命令重新设计成统一 JSON 工具，也不要因采用原生命令而放弃可靠的状态与事件获取。
 
-平台统一执行外层信息：execution_id、会话与目标上下文、完成情况、结果预览和完整输出引用。原生输出及平台特有字段保留；不同后端的命令、异常/信号和能力无需强行同构。迭代 3 采用 session.* 和 execution.* 命名，具体契约见[执行交互方案](execution-interaction.md)，3B 已提供 session.interrupt，其余接口与有限等待在 3C 收敛。
+平台统一执行外层信息：execution_id、会话与目标上下文、完成情况、结果预览和完整输出引用。原生输出及平台特有字段保留；不同后端的命令、异常/信号和能力无需强行同构。迭代 3 采用 session.* 和 execution.* 命名，具体契约见[执行交互方案](execution-interaction.md)，3C 已提供 session.* / execution.*、有限等待及有界输出读取；协议与 CLI 的最终收敛见 3D。
 
 命令知识与调试方法按需提供。平台不把高层分析结论作为工具事实，也不建立独立的 Observation 业务资源；Execution 承载一次动作的输入和输出，会话承载无直接请求来源的事件。execution.cancel 请求取消指定执行，session.interrupt 请求中断当前目标运行，两者不能互换。
 
 ## 会话、历史与存储
 
-目标模型统一采用 Session + Execution：Session 保存持续的执行现场，Execution 保存一次已接受动作从开始到结果留存的事实；动作种类用 action 表达。当前迭代 2 实现仍使用 Operation/OperationDetails 和 operation.*，迭代 3 通过兼容映射演进，不改写历史事实。
+目标模型统一采用 Session + Execution：Session 保存持续的执行现场，Execution 保存一次已接受动作从开始到结果留存的事实；动作种类用 action 表达。当前 3C 公共接口投影为 Execution；内部 Operation/OperationDetails、旧 operation.* 别名与 operations.jsonl 保留兼容，不改写历史事实。
 
 会话在工作区内固定绑定一个专用工作进程，承载调试或录制生命周期，包含环境、后端、目标、执行身份和处置策略。会话不是 worker PID，也不拥有目标全部历史。不同会话可以引用同一份离线记录，但当前线程、栈帧、回放位置和符号设置独立。Execution 的结果引用不依赖来源会话仍然活动。
 
@@ -67,7 +67,7 @@ Artifact 是 Session/Execution 引用的材料：工具产物记录 producer_ses
 | `dbgatlas-model` | 公共 Session、OperationDetails、环境/进程身份与状态 | 与本机运行对象分开 |
 | `dbgatlas-debug` | 目标、会话、命令及 manager 类型 | 引入环境/后端关联和生命周期边界，避免公共模型绑定本机 worker |
 | `dbgatlas-core` / `dbgatlas-adapter` | 通用短调用与产物登记 | 不是现有所有调试调用的必经路径；同步 invoke 不等于完整后端协议 |
-| `dbgatlas-worker-protocol` | DbgEng/ETW/TTD 专用 worker 的 v8 JSONL 消息 | 是既有实现协议，含本机路径；不直接宣称可用于远端执行 |
+| `dbgatlas-worker-protocol` | DbgEng/ETW/TTD 专用 worker 的 v9 JSONL 消息 | 是既有实现协议，含本机路径；不直接宣称可用于远端执行 |
 | `dbgatlas-runtime` | 工具发现、安装和本机身份策略 | 将执行侧配置归属到对应环境，不在控制层解释远端安装路径 |
 | `dbgatlas-workspace` | 工作区、操作与产物记录 | 保留当前落盘路径，逐步接收与执行位置解耦的输出关联 |
 | native adapter / safe wrapper | DbgEng、ETW 本地能力 | 留在执行侧，FFI 不成为跨机器协议 |

@@ -1,6 +1,6 @@
 # 原生执行与可靠交互：迭代 3 方案
 
-日期：2026-11-15。实现基线：`d2fb7d1`。状态：3A 路线收敛、3B 执行侧本机实现与验证完成；安装态验收缺少前置条件，3C/3D 尚未完成。见 [3B 验证记录](iteration-3b-validation.md)。
+日期：2026-11-15。实现基线：`d2fb7d1`。状态：3A/3B 已完成本机验证，3C 公共接口与输出读取已实现；验证范围见 [3C 记录](iteration-3c-validation.md)。3D 协议/CLI 收敛与安装态验收仍未完成。
 
 本文以 Session + Execution 细化原生执行、等待、事件、输出和中断的接口契约；实施顺序与验收状态由 [PLAN.md](../PLAN.md)维护。沿用[迭代 2 会话模型](environment-session-model.md)的生命周期与归属规则及[进程所有权规则](worker-model.md)，在本轮统一业务命名，不引入新的后端服务、命令语言或通用任务平台。[3A 验证记录](iteration-3a-validation.md)已固定首版机制和 MCP 选择；默认等待预算仍需产品端测量。
 
@@ -101,9 +101,9 @@ Session
 - 响应丢失后按同键核对，或从 session 的 active_execution_id/last_execution_id 找回；没有同键时不自动重发有副作用命令。服务运行实例变化必须显式报告，旧键不能在新实例静默重执行。
 - 正常完成、cancel、kill、worker 断线通过同一操作终结入口仲裁；已确认结果不被较晚 EOF 覆盖。关闭后迟到事件不能把会话重新置为 active。
 
-## 4. 建议的业务接口
+## 4. 业务接口
 
-以下为待实施的 API 契约；当前版本不可调用。业务方法同时服务 RPC、CLI 和 MCP。
+以下 API 已在 3C 的 RPC/普通 MCP 工具入口实现；CLI 专用命令与 MCP 版本/工具列表收敛留在 3D。
 
 | 接口 | 参数/响应重点 | 调整 |
 | --- | --- | --- |
@@ -121,13 +121,13 @@ Session
 | `session.kill` | session_id | 保留显式强制路径；修正文案，强制结束的会话按现有规则 failed，cleanup 单列 |
 | `session.help` | topic，另用 session_id/backend 二选一指定上下文 | 按需返回可用能力、exec/等待/输出用法及少量后端命令指引；不常驻全部命令知识 |
 
-首版建议 open/exec/interrupt/cancel/close 默认 wait_ms=1000，观察默认 0，上限 30000；这些值须由 3A 探针与客户端调用成本校准。wait_ms=0 表示不等待执行结果，不表示不做校验和接受记账。opening 会话只允许观察和关闭协调，普通 exec 明确拒绝；创建响应未拿到 session_id 时不自动重发 launch，先用 session.list 核对。
+3C 首版 open/exec/interrupt/cancel/close/kill 默认 wait_ms=1000，观察默认 0，上限 30000。wait_ms=0 表示不等待执行结果，不表示不做校验和接受记账。opening 会话只允许观察和关闭协调，普通 exec 明确拒绝；创建响应未拿到 session_id 时不自动重发 launch，先用 session.list 核对。
 
-`execution.read` 与 `session.read` 共用有界读取实现，均返回 items、next_cursor、has_more、complete、gap。默认 8 KiB、最大 64 KiB 文本预算，并设置事件数上限；返回后可继续读取。cursor 是服务生成、绑定读取种类及 execution_id/session_id 的不可解释令牌，不能混用；重复读取同一范围应得到相同内容。无新数据且执行仍运行或会话事件流仍开放时 complete=false，不用空结果冒充 EOF。UTF-8 不在码点中间截断，数字偏移不交由调用方猜测。Execution 已结束但输出收尾尚未完成时仍返回 complete=false；会话流只在收尾结束且无已知缺口时宣告完整。
+`execution.read` 与 `session.read` 共用有界读取实现，均返回 items、next_cursor、has_more、complete、gap。默认 8 KiB、最大 64 KiB、最小 4 字节文本预算；额外最多返回 64 个 Artifact 引用，引用不占文本预算，避免小预算永远无法前进。事件当前按来源输出 JSONL 文本片段，由调用者跨页拼接，不承诺一项就是一个完整事件。cursor 是服务生成、绑定读取种类及 execution_id/session_id 的不可解释令牌，不能混用；重复读取同一范围应得到相同内容。无新数据且执行仍运行或会话事件流仍开放时 complete=false，不用空结果冒充 EOF。UTF-8 不在码点中间截断，数字偏移不交由调用方猜测。Execution 已结束但输出收尾尚未完成时仍返回 complete=false；会话流只在收尾结束且无已知缺口时宣告完整。
 
 原生输出与结构化事件有各自来源字段。完整二进制产物继续返回 artifact 引用，不通过该接口塞入 JSON。接口不接受任意本机路径；只读取服务登记的输出，核对工作区归属、文件范围及 Windows junction/reparse 路径，避免逻辑引用绕过受控目录。
 
-输出正常情况下不因内存窗口淘汰丢失：文本先写入受控 spool，事件持久化至既有 session-events.jsonl 的版本化格式；内存仅保留有界预览与索引。流式读取使用已提交字节边界，完成时原子归档，游标引用不随 .part 重命名失效。I/O 失败显式设置 output_error/gap/complete=false；不保证服务崩溃后恢复执行或所有未提交尾部。
+输出正常情况下不因内存窗口淘汰丢失：文本先写入受控 spool，引擎事件持久化至 engine-events.jsonl，生命周期事件留在 session-events.jsonl；内存仅保留有界预览与索引。流式读取使用已提交字节边界，完成时原子归档，游标引用不随 .part 重命名失效。I/O 失败显式设置 output_error/gap/complete=false；不保证服务崩溃后恢复执行或所有未提交尾部。
 
 `session.get` 的 after_seq 按状态变化推进，输出读取有独立游标，避免每段日志唤醒状态等待。`execution.get` 的更新序号沿用现有 OperationDetails 的 update_seq 机制；等待只在相关变化、终态或预算结束时醒来。等待不能持有全局 state mutex，多个观察者互不消费对方的事件。
 
@@ -142,7 +142,7 @@ Session
   "execution":{"execution_id":"execution-1","session_id":"session-1","action":"session.exec","status":"success"},
   "wait_expired":false,
   "session":{"session_id":"session-1","sequence":12,"target_state":{"state":"running"},"engine":{"state":"waiting_for_event","run_epoch":3}},
-  "output":{"preview":"","cursor":"opaque-cursor","complete":true},
+  "output":{"preview":"","cursor":null,"complete":true},
   "output_error":null
 }
 ```
@@ -151,7 +151,7 @@ Session
 {"method":"session.get","params":{"session_id":"session-1","after_seq":12,"wait_ms":10000}}
 ```
 
-若 Execute 尚未返回，第一个响应的 execution.status 应为 running，后续用 execution.get；命令输出继续用 execution.read。上例 complete 只说明该命令输出已结束，之后的目标事件从 session.read 读取。断点命中附 reason、后端事件码、地址/线程与来源；缺少证据的字段保留 null。
+若 Execute 尚未返回，第一个响应的 execution.status 应为 running，后续用 execution.get；命令输出继续用 execution.read。动作响应的 preview 仅供展示；cursor=null 表示从头读取，包括预览已显示的内容。`execution.finalized` 区分任务收尾与后端终态，`output_complete` 还要求没有归档错误或未知结果。`execution.get(wait_ms>0)` 不带 after_seq 时等待收尾，带 after_seq 时等待更新或收尾。上例 complete 只说明该命令输出已结束，之后的目标事件从 session.read 读取。断点命中附 reason、后端事件码、地址/线程与来源；缺少证据的字段保留 null。
 
 ## 5. 执行侧与传输改造
 
@@ -227,8 +227,8 @@ flowchart LR
 | operation_id / related_operation_id | execution_id / related_execution_id | 保留标识值及历史引用；旧记录读取时投影，不批量改写原始 JSONL |
 | last_operation_id | last_execution_id | 公共摘要映射；新增 active_execution_id 与 session.engine，不复用旧 Ready/Error 作为引擎状态 |
 
-- 建议对外 API 升至 0.4.0，明确新的等待/取消契约；内部 v8 与对外 API/MCP 版本分开。版本升级在实现提交完成，不在本方案提交中改号。
-- `debug.eval` 作为过渡 RPC/CLI 别名委托新执行路径，移出默认 MCP 列表；不能继续保留另一条超时杀 worker 实现。旧 `timeout_ms` 显式拒绝并指引 wait_ms，不静默赋予相反语义。CLI 参数、错误响应和帮助同步修改。
+- 3C 对外 API/包版本已升至 0.4.0；worker v9 防止旧 worker 静默忽略 invasive attach 配置，DbgEng ABI 为 0.7.0。三者与 MCP 版本分开。
+- `debug.eval` 作为过渡 RPC/CLI 别名委托新执行路径，默认 MCP 列表裁剪在 3D；3C 已移除超时杀 worker 路径。旧 `timeout_ms` 显式拒绝并指引 wait_ms，不静默赋予相反语义。CLI 参数、错误响应和帮助同步修改。
 - `debug.eval_steps` 保留为兼容入口，批次及各步均记录为 Execution，步骤关联 parent_execution_id；复用新执行协调器，不新增另一套核心批处理命名。每步确认为结束且引擎可接受普通命令后才继续；遇到目标运行、unknown、取消或关闭停止后续步骤并返回未执行索引，不隐含等待未来断点后自动执行剩余命令。continue_on_error 只适用于已知失败且会话仍可用。
 - modules/threads/stack/add_symbols 等兼容入口委托同一准入/执行实现，不能绕过事件、输出及协作取消；二进制 read_memory 保留受控输出能力。
 - operation.stream 作为过渡读取入口委托 execution.read，更新描述；不继续无界回传整个数组。session.read 承载独立会话事件，不把旧 operation.stream 的返回误当会话完整历史。流式游标和 execution.get/read 的跨服务重启恢复仍由迭代 4 实现；execution.list 延续已有持久化列表读取能力。
@@ -239,7 +239,7 @@ flowchart LR
 | --- | --- |
 | native/include、native/adapters/dbgeng | 会话回调、引擎事件消费、中断句柄、关闭竞争 |
 | dbgatlas-dbgeng-sys / dbgatlas-dbgeng | 局部 C ABI 镜像、安全封装与线程约束 |
-| dbgatlas-worker-protocol / worker binary | v8 消息、引擎线程、控制 pipe、事件输出 |
+| dbgatlas-worker-protocol / worker binary | v9 消息、引擎线程、控制 pipe、事件输出 |
 | dbgatlas-service | 执行协调器、transport 分发、等待与终结仲裁、输出读取、MCP 适配 |
 | dbgatlas-model / dbgatlas-debug | Session/Execution 契约、session.engine、规范 ID 与旧类型/字段投影 |
 | dbgatlas-workspace | 现有 JSONL/文件的事件与输出索引、Artifact producer 和输入引用；不加入 SQLite |
@@ -261,12 +261,13 @@ flowchart LR
 - 完成最小 native ABI、worker v8、控制 pipe 与事件分发；先跑通 launch → g → interrupt/断点 → 查询 → detach。
 - 覆盖 busy、目标退出、worker 退出、控制投递/关闭竞争；通过后再调整公共等待行为，避免只把同步函数包装为“后台线程”。
 
-3B 已落地 worker v8 的 response/event 区分、snapshot 序号和独立控制 pipe。公开增加 session.interrupt；旧 operation.cancel 已接 PASSIVE，不再因业务锁忙而 kill。引擎状态暂放 session.context.engine，公共 Execution 协调和全面命名迁移留在 3C。旧 noninvasive attach 保持观察语义，明确 target_control=false/target_state=unknown；显式 invasive 参数随 3C 的 session.open 收敛，不在 3B 静默切换 attach 模式。
+3B 已落地 worker v8 的 response/event 区分、snapshot 序号和独立控制 pipe。公开增加 session.interrupt；旧 operation.cancel 已接 PASSIVE，不再因业务锁忙而 kill。引擎状态暂放 session.context.engine，公共 Execution 协调和全面命名迁移留在 3C。旧 noninvasive attach 保持观察语义，明确 target_control=false/target_state=unknown；3C 已为 session.open 增加显式 invasive 参数，默认模式保持 noninvasive。
 
 ### 3C：服务持有 Execution 与输出读取
 
 - 落地 session.open/exec、短等待、execution.get/list/cancel/read、session.get/read/close/kill、去重核对与兼容入口；产物登记来源，文件目标支持显式 Artifact 输入引用。
 - 退出条件：wait 到期后同一 worker 继续执行且结果可取回；大量输出不挡住 interrupt；客户端断开后可核对；执行成功而归档失败不误导重放。
+- 已实现的服务协调、游标语义、兼容边界及实测结果见 [3C 验证记录](iteration-3c-validation.md)。执行上下文由 owner 在线采样；打开执行只有打开时可知的请求/worker 上下文，不伪造尚不存在的线程/栈帧。
 
 ### 3D：MCP、CLI 和安装态验收
 

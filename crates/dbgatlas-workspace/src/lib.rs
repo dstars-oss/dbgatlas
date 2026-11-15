@@ -1,4 +1,5 @@
 static OPERATION_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static JSONL_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use dbgatlas_model::{ArtifactRef, Id, InvalidId, OperationRef, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,10 @@ pub struct WorkspaceInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArtifactMetadata {
+    #[serde(default)]
+    pub producer_session_id: Option<dbgatlas_model::SessionRef>,
+    #[serde(default)]
+    pub producer_execution_id: Option<OperationRef>,
     pub artifact_id: ArtifactRef,
     pub kind: String,
     pub relative_path: PathBuf,
@@ -245,7 +250,73 @@ impl Workspace {
 
     pub fn register_artifact(&self, metadata: &ArtifactMetadata) -> Result<(), WorkspaceError> {
         self.resolve_artifact_relative_path(&metadata.relative_path)?;
-        append_json_line(self.root.join(ARTIFACTS_LOG), metadata)
+        let mut metadata = metadata.clone();
+        if let Some(id) = &metadata.operation_id {
+            if let Some(operation) = self.get_operation(id)? {
+                if let Some(session) = operation.details.session_id {
+                    if metadata
+                        .producer_session_id
+                        .as_ref()
+                        .is_some_and(|producer| producer != &session)
+                    {
+                        return Err(WorkspaceError::InvalidArtifactPath(metadata.relative_path));
+                    }
+                    metadata.producer_session_id = Some(session);
+                    if metadata
+                        .producer_execution_id
+                        .as_ref()
+                        .is_some_and(|producer| producer != id)
+                    {
+                        return Err(WorkspaceError::InvalidArtifactPath(metadata.relative_path));
+                    }
+                    metadata.producer_execution_id = Some(id.clone());
+                }
+            }
+        }
+        append_json_line(self.root.join(ARTIFACTS_LOG), &metadata)
+    }
+
+    /// Resolve the registered relative path, then validate the opened object too.
+    /// A junction swapped between lookup and open cannot expose an outside file.
+    pub fn open_artifact_read(&self, relative: impl AsRef<Path>) -> Result<File, WorkspaceError> {
+        let path = self.resolve_artifact_relative_path(relative)?;
+        let file = File::open(&path).map_err(|source| WorkspaceError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+            use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+            let mut buffer = vec![0u16; 32768];
+            let size = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle() as _,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    0,
+                )
+            };
+            if size == 0 || size as usize >= buffer.len() {
+                return Err(WorkspaceError::Io {
+                    path,
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+            let final_path = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..size as usize]));
+            let root = fs::canonicalize(self.root.join(ARTIFACTS_DIR)).map_err(|source| {
+                WorkspaceError::Io {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            let root = root.to_string_lossy().to_lowercase();
+            let opened = final_path.to_string_lossy().to_lowercase();
+            if !opened.starts_with(&(root.trim_end_matches('\\').to_string() + "\\")) {
+                return Err(WorkspaceError::InvalidArtifactPath(path));
+            }
+        }
+        Ok(file)
     }
 
     pub fn list_artifacts(&self) -> Result<Vec<ArtifactMetadata>, WorkspaceError> {
@@ -273,6 +344,18 @@ impl Workspace {
             .into_iter()
             .find(|p| p.operation_id == record.operation_id)
         {
+            if matches!(
+                previous.status,
+                OperationStatus::Success | OperationStatus::Failed | OperationStatus::Canceled
+            ) && matches!(
+                record.status,
+                OperationStatus::Pending | OperationStatus::Running | OperationStatus::Unknown
+            ) {
+                record.status = previous.status.clone();
+                record.summary = previous.summary.clone();
+                record.artifacts = previous.artifacts.clone();
+                record.raw_output = previous.raw_output.clone();
+            }
             record.created_at = previous.created_at;
             record.details.session_id = previous.details.session_id.or(record.details.session_id);
             record.details.input = previous.details.input.or(record.details.input);
@@ -487,6 +570,10 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, WorkspaceError> {
 }
 
 fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), WorkspaceError> {
+    let _guard = JSONL_IO_LOCK.lock().map_err(|_| WorkspaceError::Io {
+        path: path.clone(),
+        source: std::io::Error::other("JSONL lock poisoned"),
+    })?;
     if let Some(parent) = path.parent() {
         create_dir(parent)?;
     }
@@ -510,6 +597,10 @@ fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), Worksp
 }
 
 fn read_json_lines<T: DeserializeOwned>(path: PathBuf) -> Result<Vec<T>, WorkspaceError> {
+    let _guard = JSONL_IO_LOCK.lock().map_err(|_| WorkspaceError::Io {
+        path: path.clone(),
+        source: std::io::Error::other("JSONL lock poisoned"),
+    })?;
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -608,6 +699,8 @@ mod tests {
             .unwrap();
 
         let metadata = ArtifactMetadata {
+            producer_session_id: None,
+            producer_execution_id: None,
             artifact_id: ArtifactRef::new(Id::new("artifact-001").unwrap()),
             kind: "raw".to_string(),
             relative_path: artifact_path
