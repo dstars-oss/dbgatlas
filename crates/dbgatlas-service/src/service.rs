@@ -330,6 +330,7 @@ use host_recording::RemoteRecording;
 mod execution;
 mod host_service;
 mod host_worker_ops;
+mod mcp_protocol;
 mod output_read;
 mod recording_executor;
 mod session_model;

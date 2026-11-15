@@ -219,8 +219,13 @@ pub(super) fn rpc_error_for(error: ServiceError) -> JsonRpcError {
 }
 
 pub(super) fn mcp_error_for(error: ServiceError) -> JsonRpcError {
+    let code = match &error {
+        ServiceError::Rpc(message) if message.starts_with("unknown MCP method") => -32601,
+        ServiceError::Rpc(_) | ServiceError::Json(_) => -32602,
+        _ => -32603,
+    };
     JsonRpcError {
-        code: -32000,
+        code,
         message: error.to_string(),
     }
 }

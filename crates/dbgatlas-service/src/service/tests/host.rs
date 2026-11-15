@@ -657,8 +657,11 @@ fn write_complete_windbg_runtime(root: &Path) {
 }
 
 #[test]
-fn mcp_tool_schemas_expose_structured_targets_and_write_items() {
-    let tools = mcp_tool_descriptors();
+fn compatibility_method_schemas_expose_structured_targets_and_write_items() {
+    let tools: Vec<_> = method_registry::method_specs()
+        .into_iter()
+        .map(|spec| spec.descriptor)
+        .collect();
     let debug = tools
         .iter()
         .find(|tool| tool["name"] == "debug.session.create")

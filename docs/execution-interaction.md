@@ -1,6 +1,6 @@
 # 原生执行与可靠交互：迭代 3 方案
 
-日期：2026-11-15。实现基线：`d2fb7d1`。状态：3A/3B 已完成本机验证，3C 公共接口与输出读取已实现；验证范围见 [3C 记录](iteration-3c-validation.md)。3D 协议/CLI 收敛与安装态验收仍未完成。
+日期：2026-11-15。方案起始基线：`d2fb7d1`；3C 提交：`16013df`。状态：3A—3D 本机实现与验证已完成，协议和 CLI 已收敛；安装态验收仍缺前置环境。分层证据与未覆盖项见[迭代 3 验证记录](iteration-3-validation.md)。
 
 本文以 Session + Execution 细化原生执行、等待、事件、输出和中断的接口契约；实施顺序与验收状态由 [PLAN.md](../PLAN.md)维护。沿用[迭代 2 会话模型](environment-session-model.md)的生命周期与归属规则及[进程所有权规则](worker-model.md)，在本轮统一业务命名，不引入新的后端服务、命令语言或通用任务平台。[3A 验证记录](iteration-3a-validation.md)已固定首版机制和 MCP 选择；默认等待预算仍需产品端测量。
 
@@ -87,7 +87,7 @@ Session
 
 请求取消已完成操作返回 `already_finished` 及现有结果，不改变原操作。running 操作只有后端确认确实被取消才变为 canceled；若先成功则保留 success，无法确认则保持 running 或在执行侧失联后转 unknown。某些扩展不响应协作中断时返回未确认，调用者仍可显式 kill。
 
-客户端断开仅丢失本次响应/等待，不销毁业务会话。协议取消与业务取消分层：取消一个已经附着到 Execution 的查询等待，停止等待即可；明确的 `execution.cancel` 或标准 task cancel 才进入协作取消路径。各 MCP 版本的断连/取消映射在协议适配层测试，不套用一种处理覆盖全部版本。
+客户端断开仅丢失本次响应，不销毁业务会话。协议取消与业务取消分层：3D 无状态适配器不通过跨客户端可能重复的 JSON-RPC id 取消执行，也不维护请求等待取消表；`notifications/cancelled` 返回 HTTP 202，服务端已有等待继续受 wait_ms（最多 30000 ms）约束，不宣称提前停止等待。明确的 `execution.cancel` 才进入业务协作取消路径。未来若实现请求级取消，应只解除对应客户端的观察等待；若实现 Tasks，再单独定义 task cancel 的映射。
 
 本轮不增加默认执行期限；`startup_timeout_ms`、正常关闭收尾期限、TTD 录制时长继续保有各自定义，不能全局改名为 wait_ms。
 
@@ -103,7 +103,7 @@ Session
 
 ## 4. 业务接口
 
-以下 API 已在 3C 的 RPC/普通 MCP 工具入口实现；CLI 专用命令与 MCP 版本/工具列表收敛留在 3D。
+以下 API 已在 RPC、普通 MCP 工具与 CLI 入口实现；CLI 用 `session exec` / `execution read` 等子命令映射点分方法名。
 
 | 接口 | 参数/响应重点 | 调整 |
 | --- | --- | --- |
@@ -198,17 +198,21 @@ flowchart LR
 
 ## 6. MCP 与 AI 工具面
 
-当前实现固定 initialize=2024-11-05、单个 JSON HTTP 响应，仅返回 text content；未实现 Tasks、progress 通知、资源读取或订阅。HTTP 可以并发处理独立连接，但不能据此推断某个 AI 客户端会并发发工具调用。
+3D 实现无状态 Streamable HTTP：POST 返回单个 JSON 响应，不分配 MCP session id；通知及客户端响应返回 202 空正文，GET/DELETE 返回 405。支持 2024-11-05、2025-03-26、2025-06-18；initialize 对已知版本原样协商，未知版本返回服务支持的 2025-06-18。后续请求按 MCP-Protocol-Version 独立选择响应形状，不在全局记住最后一个客户端版本；缺失 header 按规范使用 2025-03-26，不支持的 header 返回 400。[传输规范](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)、[生命周期规范](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)。
+
+2025-06-18 返回一次完整 structuredContent 和精简文本导航摘要；两个旧版本保留完整 JSON text。规范建议为兼容而复制结构化正文到 text，本项目在验证实际 Codex 客户端保留结构化结果后，选择摘要以避免重复输出；不能由此推断只读 text 的所有客户端均支持新响应。动作已知 failed/unknown 时 isError=true，成功查询一个失败 Execution 仍为查询成功。[工具结果规范](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)。
+
+不声明 Tasks、progress、资源订阅或 SSE。没有 id 的通知不会派发 tools/call；取消通知的边界见 §3.3。HTTP 支持并发连接，实际 Codex app-server 工具调用已验证，但不据此推断模型会并发调用或收到通知后自动继续。
 
 官方 MCP 2026-07-28 将 Tasks 移入扩展，并改变了版本/能力传递和发现方式；2025-11-25 的实验 Tasks 与新扩展不是同一个 wire contract。因此不能只修改 initialize 的版本字符串或把 execution_id 改叫 taskId。[版本变更](https://modelcontextprotocol.io/specification/2026-07-28/changelog)。
 
 落地策略：
 
-1. 3A 实测 Codex app-server 的 stdio/HTTP 均声明 2025-06-18，未声明 Tasks；首版固定该版本的普通工具调用与 session.exec 有界等待、execution.get/read、session.get/read。保留现有 2024-11-05 客户端所需的兼容响应，按请求版本协商，不把未知版本原样回显。完整客户端工具回合与旧版兼容仍在 3D 验收；以下 Tasks 分支是后续条件，不是首版能力。
+1. 3A 实测 Codex app-server 的 stdio/HTTP 均声明 2025-06-18，未声明 Tasks；3D 已完成该版本普通调用与 session.exec 有界等待、execution.get/read、session.get/read，以及两个旧版本的兼容响应。真实客户端发现、短/长命令、读取和中断见 [3D 记录](iteration-3d-validation.md)。以下 Tasks 分支是后续条件，不是首版能力。
 2. 标准任务和业务 Execution 使用同一个执行任务与结果存储，taskId 可映射 execution_id，但状态和保留期限不能混为一谈。MCP task 过期不删除工作区事实；业务 unknown 映射协议失败并带明确诊断，不能映射 completed。
 3. 若实现 2026-07-28，按该版完整处理 server/discover、每请求版本/能力和结果形状；Tasks 使用扩展的 tasks/get、tasks/update、tasks/cancel。不得向未声明扩展能力的请求返回任务句柄。
 4. 只有实际客户端要求旧 Tasks 时才实现 2025-11-25 分支，不一次性维护所有历史版本。旧版与新版取消语义分别适配；不直接照搬新扩展的协作取消到旧协议。
-5. 默认工具列表固定、描述简短；核心工具统一为 session.* 和 execution.*，旧 debug.eval、eval_steps、modules/threads/stack/add_symbols 不再作为主要 MCP 命令面。debug.read_memory 保留必要的后端专属二进制产物用途，经同一执行协调器产生 Execution。service/recording/artifact/audit 方法按现有职责保留，不把“精简调试接口”扩成全仓库删工具。
+5. 默认工具列表固定为 25 项、单页且描述简短；核心工具统一为 session.* 和 execution.*，全部 operation.* 及 debug.*（除 read_memory）从发现面隐藏，兼容调用保留。debug.read_memory 保留必要的后端专属二进制产物用途，经同一执行协调器产生 Execution。service/recording/artifact/audit 方法按现有职责保留。
 6. `session.help` 按需给出后端指引；优先复用 SDK 可用能力，而非增加调试指令 DSL。支持结构化结果的版本返回一次正文及精简文本摘要，避免完整输出同时复制进 text 和 structuredContent。
 
 新 Tasks 扩展允许协作取消最终仍然完成，并要求请求声明扩展能力；通知也不能证明 AI 已读取结果。[Tasks 规范](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks)。本轮不依赖模型收到后台通知后自动继续，必须能主动查询找回结果。
@@ -228,7 +232,7 @@ flowchart LR
 | last_operation_id | last_execution_id | 公共摘要映射；新增 active_execution_id 与 session.engine，不复用旧 Ready/Error 作为引擎状态 |
 
 - 3C 对外 API/包版本已升至 0.4.0；worker v9 防止旧 worker 静默忽略 invasive attach 配置，DbgEng ABI 为 0.7.0。三者与 MCP 版本分开。
-- `debug.eval` 作为过渡 RPC/CLI 别名委托新执行路径，默认 MCP 列表裁剪在 3D；3C 已移除超时杀 worker 路径。旧 `timeout_ms` 显式拒绝并指引 wait_ms，不静默赋予相反语义。CLI 参数、错误响应和帮助同步修改。
+- `debug.eval` 作为过渡 RPC/CLI 别名委托新执行路径，3D 已在默认 MCP 列表和 CLI 主帮助中隐藏旧调试入口；3C 已移除超时杀 worker 路径。旧 `timeout_ms` 显式拒绝并指引 wait_ms，不静默赋予相反语义。CLI 原样发送单条原生命令，不拆分、不自动重试、不自动轮询；`--json` 保留响应信封，动作 failed/unknown 或 RPC 错误返回非零，观察失败执行的查询本身仍成功。
 - `debug.eval_steps` 保留为兼容入口，批次及各步均记录为 Execution，步骤关联 parent_execution_id；复用新执行协调器，不新增另一套核心批处理命名。每步确认为结束且引擎可接受普通命令后才继续；遇到目标运行、unknown、取消或关闭停止后续步骤并返回未执行索引，不隐含等待未来断点后自动执行剩余命令。continue_on_error 只适用于已知失败且会话仍可用。
 - modules/threads/stack/add_symbols 等兼容入口委托同一准入/执行实现，不能绕过事件、输出及协作取消；二进制 read_memory 保留受控输出能力。
 - operation.stream 作为过渡读取入口委托 execution.read，更新描述；不继续无界回传整个数组。session.read 承载独立会话事件，不把旧 operation.stream 的返回误当会话完整历史。流式游标和 execution.get/read 的跨服务重启恢复仍由迭代 4 实现；execution.list 延续已有持久化列表读取能力。
@@ -271,10 +275,10 @@ flowchart LR
 
 ### 3D：MCP、CLI 和安装态验收
 
-- 按 3A 固定的协议实现标准任务/兼容路径，收敛工具描述及按需帮助，同步 CLI、文档和 schema。
+- 已按 3A 选定的普通 MCP 调用与 Execution 查询路线实现版本兼容、结构化结果和精简发现面；CLI 与按需帮助同步落地，不实现或声明 Tasks。
 - 运行受影响的 model/debug/protocol/service/workspace/CLI 窄范围测试及 native MSVC 测试，再做工作区回归。
 - 用 `script/build-release-install.ps1 -BuildOnly` 构建完整 MSVC release；通过已连接 DbgAtlas MCP `service.update(source_dir=<当前仓库绝对 target/release>, restart=true)` 更新，随后 service.health 和实际客户端冒烟。不能以手工复制或独立 HTTP 调用冒充已连接 MCP 安装验收。
-- 3A 已执行独立 MSVC 原型，尚未构建产品 release 或更新安装态服务；当前未发现本机 DbgAtlas SCM 服务，也无已连接 DbgAtlas MCP 工具。实施到安装验收时重新检查并补齐前置条件，不能把 WinDbg MCP 或协议探针当作 DbgAtlas 安装态验收。
+- 3D 本机契约、真实后端、release 与实际 Codex 客户端验证见 [3D 记录](iteration-3d-validation.md)。本机仍未发现 DbgAtlas SCM 服务，也无已连接 DbgAtlas MCP 工具，安装态 update/health 与冒烟尚未执行；不能把开发态服务、WinDbg MCP 或协议探针当作安装态验收。
 
 ## 9. 验收矩阵
 
@@ -292,7 +296,7 @@ flowchart LR
 | HTTP 断连/响应丢失 | 同键核对得到原操作，不重复执行；业务会话存活 |
 | close/kill/服务退出 | 正常关闭保留目标；强制清理只处理确认归属实例；活动操作有真实终态或 unknown |
 | 后端卡死/worker 崩溃 | 结果未知可见，清理失败可见；不透明重启，不报告普通取消成功 |
-| MCP 标准与 fallback | 标准任务取回/取消、无能力客户端普通返回分别验证；无通知仍可完成工作流 |
+| MCP 协商与兼容返回 | 三个支持版本分别验证；新版本结构化结果、旧版 text 及无通知查询流程可用，不声明 Tasks |
 | 现有录制回归 | ETW CPU、TTD 录制/回放及异常清理没有被 v8/transport 改造破坏 |
 | 新旧命名与历史记录 | 旧 operation_id 与 execution_id 定位同一实例，兼容调用不双写；原 JSONL 和 Artifact 引用仍可读取 |
 | 会话关闭后的 Execution | 同一服务运行期内仍可 get/read/list，输出不依赖活动 worker，不被关闭删除 |

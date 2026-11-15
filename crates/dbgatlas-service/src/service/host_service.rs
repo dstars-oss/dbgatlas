@@ -240,67 +240,6 @@ impl ServiceHost {
         }
     }
 
-    pub fn handle_mcp(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
-        let context = DiagnosticContext::from_rpc(&request);
-        if request.id.is_none() {
-            if let Err(error) = self.handle_mcp_method(request) {
-                append_service_diagnostic_log(&format!(
-                    "mcp_dispatch_error {} error={}",
-                    context.log_fields(),
-                    sanitize_log_value(&error.to_string())
-                ));
-            }
-            return None;
-        }
-        let id = request.id.clone();
-        Some(match self.handle_mcp_method(request) {
-            Ok(result) => JsonRpcResponse::result(id, result),
-            Err(error) => {
-                append_service_diagnostic_log(&format!(
-                    "mcp_dispatch_error {} error={}",
-                    context.log_fields(),
-                    sanitize_log_value(&error.to_string())
-                ));
-                JsonRpcResponse::error(id, mcp_error_for(error))
-            }
-        })
-    }
-
-    pub(super) fn handle_mcp_method(&self, request: JsonRpcRequest) -> Result<Value, ServiceError> {
-        match request.method.as_str() {
-            "initialize" => Ok(json!({
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {
-                    "name": "dbgatlas-mcp",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {
-                    "tools": {},
-                },
-            })),
-            "ping" => Ok(json!({})),
-            "notifications/initialized" => Ok(json!(null)),
-            "tools/list" => Ok(json!({ "tools": mcp_tool_descriptors() })),
-            "tools/call" => {
-                let params: ToolCallParams =
-                    serde_json::from_value(request.params.unwrap_or_else(|| json!({})))?;
-                let arguments = params.arguments.unwrap_or_else(|| json!({}));
-                let result = self.call_mcp_tool_output(&params.name, arguments.clone())?;
-                if result.is_error {
-                    append_mcp_tool_error_log(&params.name, &arguments, &result);
-                }
-                Ok(json!({
-                    "content": [{
-                        "type": "text",
-                        "text": serde_json::to_string_pretty(&result.value)?,
-                    }],
-                    "isError": result.is_error,
-                }))
-            }
-            other => Err(ServiceError::Rpc(format!("unknown MCP method `{other}`"))),
-        }
-    }
-
     pub(super) fn call_mcp_tool_output(
         &self,
         name: &str,

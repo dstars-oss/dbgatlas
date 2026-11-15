@@ -56,6 +56,10 @@ fn registered_method_specs() -> &'static [MethodSpec] {
 pub(super) fn mcp_tool_descriptors() -> Vec<Value> {
     method_specs()
         .into_iter()
+        .filter(|spec| {
+            (!spec.name.starts_with("debug.") || spec.name == "debug.read_memory")
+                && !spec.name.starts_with("operation.")
+        })
         .map(|spec| spec.descriptor)
         .collect()
 }
@@ -79,7 +83,7 @@ fn registered_method_descriptors() -> Vec<Value> {
         mcp_tool(
             "session.interrupt",
             "Request a break for the observed target run through the independent control channel. Accepted is not a confirmed stop; query session.get. A stale epoch never interrupts a later run.",
-            json!({"type":"object","properties":{"session_id":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"expected_epoch":{"type":"integer","minimum":1}},"required":["session_id"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"session_id":session_ref_schema(),"expected_run_epoch":{"type":"integer","minimum":1}},"required":["session_id"],"additionalProperties":false}),
         ),
         mcp_tool(
             "service.health",
@@ -351,6 +355,10 @@ fn registered_method_descriptors() -> Vec<Value> {
                 tool["inputSchema"]["properties"]["expected_run_epoch"] =
                     json!({"type":"integer","minimum":1});
             }
+        }
+        if name == "debug.read_memory" {
+            tool["inputSchema"]["properties"]["wait_ms"] =
+                json!({"type":"integer","minimum":0,"maximum":30000,"default":1000});
         }
         if name == "operation.stream" {
             tool["description"] = json!(

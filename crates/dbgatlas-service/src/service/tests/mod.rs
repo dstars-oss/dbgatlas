@@ -1032,3 +1032,5 @@ impl WorkerSupervisor for InstrumentedWorkerSupervisor {
         Ok(())
     }
 }
+
+mod mcp_protocol;

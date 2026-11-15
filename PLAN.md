@@ -24,7 +24,7 @@
 | --- | --- | --- | --- |
 | 1. 剥离 IDA，明确产品边界 | 删除 IDA 实现与依赖；同步定位和文档 | 无 IDA 依赖的构建、安装与现有调试/录制冒烟通过 | 已验收（2026-11-14） |
 | 2. 调整环境、会话和进程架构 | 建立环境/目标/会话关联模型；拆分控制与执行及进程生命周期 | 默认本机环境的调试链路通过新模型运行，所有权与失败状态明确 | 已实现并完成代表性验收（2026-11-14） |
-| 3. 收敛 AI 交互接口 | 原生 exec 为主入口；明确状态、中断、关闭及长操作交互 | 短命令、长查询、继续、断点命中及中断均有明确结果 | 3A/3B/3C 本机实现与验证完成；3D 协议/CLI 和安装验收待推进（2026-11-15） |
+| 3. 收敛 AI 交互接口 | 原生 exec 为主入口；明确状态、中断、关闭及长操作交互 | 短命令、长查询、继续、断点命中及中断均有明确结果 | 3A—3D 本机实现与验证完成；安装态验收缺前置环境（2026-11-15） |
 | 4. 建立持久化操作历史 | SQLite 管理记录与输出索引；提供检索和输出读取 | 重启后可查询历史，大输出可按需读取并追溯来源 | 待开始 |
 | 5. 接入远端调试后端 | 远端连接与会话管理；断线核对及产物取回 | 同一接口操作本机和远端，重连后可确认操作结果 | 待开始 |
 | 6. 跨会话继承调试信息 | 稳定目标身份与历史关联；重新打开同一目标后复用历史 | 同一 Dump/回放记录可跨会话检索，现场状态互不混淆 | 待开始 |
@@ -96,7 +96,13 @@
 
 已落地 API 0.4.0 的 session.open/exec/get/list/interrupt/read/close/kill/help 和 execution.get/list/cancel/read；服务持有任务、每会话准入、有限等待与同实例去重，legacy debug 入口复用同一 Execution。旧 debug timeout_ms 明确拒绝，operation.stream 已改为有界读取。UTF-8 游标跨 .part 归档和关闭保持连续，Artifact 保存 producer_session_id/producer_execution_id，支持同 workspace 显式输入引用。显式 invasive attach、批次父子关联与中断后未执行步骤同步实现；worker v9 / DbgEng ABI 0.7.0。
 
-验证、release 状态及未覆盖项见 [3C 验证记录](docs/iteration-3c-validation.md)。下一阶段 3D 仍需 MCP 版本协商、结构化返回/工具列表收敛、CLI 命令收敛与真实客户端/安装态验收；本轮未宣称整个迭代 3 完成。
+3C 已提交为 `16013df`，验证、release 状态及未覆盖项见 [3C 验证记录](docs/iteration-3c-validation.md)。
+
+#### 3D 实现进展
+
+已实现 MCP 三版本协商、2025-06-18 结构化结果与精简摘要、旧版完整 text、25 项默认工具列表和 Session + Execution CLI。兼容别名保留，CLI 不自动重试或轮询；通知不会派发工具，也不会取消业务 Execution。真实 Codex app-server 客户端已完成发现、短/长命令、输出读取和中断。实现、测试与 MSVC release 证据见 [3D 验证记录](docs/iteration-3d-validation.md)。
+
+安装态 `service.update` / `service.health` 和 MCP 冒烟尚未执行：本机没有 DbgAtlas SCM 服务及已连接 DbgAtlas MCP 工具。迭代 3 的分层验收与剩余边界见[总记录](docs/iteration-3-validation.md)，不将本机通过标成完整安装验收。
 
 ### 迭代 4：SQLite 操作历史
 

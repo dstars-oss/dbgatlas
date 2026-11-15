@@ -6,7 +6,7 @@ DbgAtlas 面向 AI 提供原生调试命令执行、会话管理、状态查询�
 
 - 本文定义总体职责和依赖方向；[环境与会话模型](environment-session-model.md)定义环境、目标、会话及状态语义。
 - [后端执行边界](adapter-model.md)定义原生执行与后端契约；[进程与生命周期](worker-model.md)定义进程所有权和故障处理。
-- [原生执行与可靠交互](execution-interaction.md)细化迭代 3 的接口、执行侧改造和验收方案；[3A 原型验证](iteration-3a-validation.md)已收敛机制与协议，[3B 执行侧实现](iteration-3b-validation.md)已完成本机验证；[3C 公共接口与有限等待](iteration-3c-validation.md)已落地，MCP/CLI 收敛与安装态验收留在 3D。
+- [原生执行与可靠交互](execution-interaction.md)细化迭代 3 的接口、执行侧改造和验收方案；[3A 原型验证](iteration-3a-validation.md)已收敛机制与协议，[3B 执行侧实现](iteration-3b-validation.md)、[3C 公共接口与有限等待](iteration-3c-validation.md)、[3D MCP/CLI 收敛](iteration-3d-validation.md)已完成本机验证；安装态验收仍缺前置环境，完整范围见[迭代 3 验证记录](iteration-3-validation.md)。
 - [运行时模型](runtime-model.md)、[工作区模型](workspace-model.md)、[录制模型](recording-model.md)分别维护部署、持久化和采集规格。
 - [PLAN.md](../PLAN.md)只负责实施顺序、验收和进度；[当前实现基线](roadmap.md)描述已存在的代码路径。验证记录是对应提交的历史证据，不是后续功能的验收证明。
 
@@ -43,7 +43,7 @@ flowchart TB
 
 原生命令执行是主要入口，补充会话发现/建立、状态、中断、关闭和历史读取。不要把 WinDbg/GDB 的全部命令重新设计成统一 JSON 工具，也不要因采用原生命令而放弃可靠的状态与事件获取。
 
-平台统一执行外层信息：execution_id、会话与目标上下文、完成情况、结果预览和完整输出引用。原生输出及平台特有字段保留；不同后端的命令、异常/信号和能力无需强行同构。迭代 3 采用 session.* 和 execution.* 命名，具体契约见[执行交互方案](execution-interaction.md)，3C 已提供 session.* / execution.*、有限等待及有界输出读取；协议与 CLI 的最终收敛见 3D。
+平台统一执行外层信息：execution_id、会话与目标上下文、完成情况、结果预览和完整输出引用。原生输出及平台特有字段保留；不同后端的命令、异常/信号和能力无需强行同构。迭代 3 采用 session.* 和 execution.* 命名，具体契约见[执行交互方案](execution-interaction.md)；RPC、MCP 与 CLI 已复用这些接口、有限等待及有界输出读取。MCP 默认发现面隐藏旧 debug/operation 别名，兼容调用仍进入同一执行协调器。
 
 命令知识与调试方法按需提供。平台不把高层分析结论作为工具事实，也不建立独立的 Observation 业务资源；Execution 承载一次动作的输入和输出，会话承载无直接请求来源的事件。execution.cancel 请求取消指定执行，session.interrupt 请求中断当前目标运行，两者不能互换。
 

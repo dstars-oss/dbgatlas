@@ -34,7 +34,9 @@
 
 Read cursors are resource- and service-instance-bound. Default/max text budgets are 8/64 KiB; at most 64 Artifact references accompany each response. Native output, engine-event JSONL and lifecycle-event JSONL keep separate source labels. Closing retains execution output. Same-workspace file inputs may explicitly reference an Artifact without changing its producer; external inputs and old unowned records remain unowned.
 
-[3A](iteration-3a-validation.md) selected MCP 2025-06-18 ordinary calls plus Execution queries. The current protocol adapter still negotiates the legacy 2024-11-05 shape, returns text content, and lists compatibility tools. Version negotiation, structured results, default tool-list pruning and CLI convergence remain in 3D. Tasks, notifications and real AI turn scheduling are not established by these service tests.
+[3D](iteration-3d-validation.md) implements stateless HTTP MCP negotiation for 2024-11-05, 2025-03-26 and 2025-06-18. The newest supported version returns structured content once with a compact text summary; legacy versions retain full JSON text. Each request selects its format from the protocol header, defaulting to 2025-03-26 when absent. The default inventory has 25 tools; debug helpers (except read_memory) and operation aliases remain callable but hidden. Canonical CLI session/execution commands reuse the same RPC API, preserve raw commands and report action failures through exit status.
+
+Real Codex app-server MCP calls cover discovery, short/long commands, output reads and interruption. This is client transport validation, not a model conversation or proof of AI scheduling. No Tasks, SSE or progress/resource notifications are advertised. Cancellation notifications are acknowledged without dispatching business cancellation; the server-side wait remains bounded by wait_ms, at most 30000 ms. Explicit execution.cancel remains separate.
 
 Execution get/read and retry keys retain only this service instance's runtime association. `execution.list` reads persisted facts and projects old unfinished records as unknown; this does not restore a debugger after restart. Internal Operation types and JSONL names are retained for compatibility.
 
@@ -50,3 +52,5 @@ Iteration 2 evidence and explicit untested paths are recorded in [iteration-2-va
 3B validation, release payload checks and the missing installed-service/MCP prerequisite are recorded in [iteration-3b-validation.md](iteration-3b-validation.md).
 
 3C implementation and validation evidence are recorded in [iteration-3c-validation.md](iteration-3c-validation.md); installed-service acceptance remains explicitly separate.
+
+[3D validation](iteration-3d-validation.md) records protocol/CLI tests, real client calls and release regressions. [Iteration 3 acceptance](iteration-3-validation.md) separates completed local checks from the missing installed-service/MCP prerequisite.

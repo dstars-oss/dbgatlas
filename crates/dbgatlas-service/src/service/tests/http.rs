@@ -33,7 +33,7 @@ fn http_mcp_initialize_returns_capabilities() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {}
+            "params": {"protocolVersion":"2024-11-05"}
         }),
     );
 
@@ -52,7 +52,7 @@ fn http_handler_waits_for_a_delayed_request_body() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": {}
+        "params": {"protocolVersion":"2024-11-05"}
     }))
     .unwrap();
     let mut stream = TcpStream::connect(server.endpoint).unwrap();
@@ -98,7 +98,8 @@ fn http_mcp_tools_list_returns_current_tools() {
     assert_eq!(http_status(&response), 200);
     let body = http_body_json(&response);
     let tools = body["result"]["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|tool| tool["name"] == "debug.eval"));
+    assert!(tools.iter().any(|tool| tool["name"] == "session.exec"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "debug.eval"));
     assert!(tools.iter().any(|tool| tool["name"] == "session.list"));
     let service_update = tools
         .iter()
@@ -120,7 +121,7 @@ fn http_mcp_tools_list_returns_current_tools() {
         "recording.cancel",
         "recording.kill",
         "artifact.list",
-        "operation.list",
+        "execution.list",
         "audit.list_commands",
     ] {
         assert!(

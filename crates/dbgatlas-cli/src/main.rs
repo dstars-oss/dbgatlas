@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "dbgatlas")]
+#[command(name = "dbgatlas", version)]
 #[command(about = "DbgAtlas command line interface")]
 struct Cli {
     #[arg(long, global = true)]
@@ -39,6 +39,10 @@ enum Commands {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    Execution {
+        #[command(subcommand)]
+        command: ExecutionCommand,
     },
     Workspace {
         #[command(subcommand)]
@@ -66,40 +70,8 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
-enum SessionCommand {
-    Get {
-        session_id: String,
-        #[arg(long)]
-        endpoint: Option<SocketAddr>,
-    },
-    List {
-        #[arg(long, default_value="debug", value_parser=["debug","recording","all"])]
-        kind: String,
-        #[arg(long)]
-        include_terminal: bool,
-        #[arg(long)]
-        endpoint: Option<SocketAddr>,
-    },
-}
-fn run_session(command: SessionCommand, as_json: bool) -> Result<()> {
-    let response = match command {
-        SessionCommand::Get {
-            session_id,
-            endpoint,
-        } => call_service(endpoint, "session.get", json!({"session_id":session_id}))?,
-        SessionCommand::List {
-            kind,
-            include_terminal,
-            endpoint,
-        } => call_service(
-            endpoint,
-            "session.list",
-            json!({"kind":kind,"include_terminal":include_terminal}),
-        )?,
-    };
-    print_rpc_response(response, as_json)
-}
+mod execution_cli;
+use execution_cli::{ExecutionCommand, SessionCommand};
 
 #[derive(Subcommand)]
 enum WorkspaceCommand {
@@ -227,26 +199,31 @@ enum RpcCommand {
 
 #[derive(Subcommand)]
 enum DebugCommand {
+    #[command(hide = true)]
     Session {
         #[command(subcommand)]
         command: DebugSessionCommand,
     },
+    #[command(hide = true)]
     Eval {
         session_id: String,
         command: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
     },
+    #[command(hide = true)]
     Modules {
         session_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
     },
+    #[command(hide = true)]
     Threads {
         session_id: String,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
     },
+    #[command(hide = true)]
     Stack {
         session_id: String,
         #[arg(long)]
@@ -260,7 +237,10 @@ enum DebugCommand {
         length: u64,
         #[arg(long)]
         endpoint: Option<SocketAddr>,
+        #[arg(long,default_value_t=1000,value_parser=clap::value_parser!(u64).range(0..=30000))]
+        wait_ms: u64,
     },
+    #[command(hide = true)]
     AddSymbols {
         session_id: String,
         symbol_path: String,
@@ -390,7 +370,8 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Session { command } => run_session(command, cli.json),
+        Commands::Session { command } => execution_cli::run(command.request()?, cli.json),
+        Commands::Execution { command } => execution_cli::run(command.request()?, cli.json),
         Commands::Workspace { command } => run_workspace(command, cli.json),
         Commands::Service { command } => run_service(command, cli.json),
         Commands::Rpc { command } => run_rpc(command),
@@ -670,6 +651,7 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
             session_id,
             address,
             length,
+            wait_ms,
             endpoint,
         } => {
             let response = call_service(
@@ -679,6 +661,7 @@ fn run_debug(command: DebugCommand, as_json: bool) -> Result<()> {
                     "session_id": { "id": session_id },
                     "address": address,
                     "length": length,
+                    "wait_ms":wait_ms,
                 }),
             )?;
             print_rpc_response(response, as_json)
@@ -930,15 +913,33 @@ fn call_service(
 }
 
 fn print_rpc_response(response: dbgatlas_service::JsonRpcResponse, as_json: bool) -> Result<()> {
+    let failed = rpc_failure(&response);
     if as_json {
-        print_json(serde_json::to_value(response)?)?;
-        return Ok(());
+        print_json(serde_json::to_value(&response)?)?;
+    } else if let Some(result) = &response.result {
+        print_json(result.clone())?;
     }
+    if let Some(message) = failed {
+        anyhow::bail!("{message}");
+    }
+    Ok(())
+}
 
-    if let Some(error) = response.error {
-        anyhow::bail!("{} ({})", error.message, error.code);
+fn rpc_failure(response: &JsonRpcResponse) -> Option<String> {
+    if let Some(error) = &response.error {
+        return Some(format!("{} ({})", error.message, error.code));
     }
-    print_json(response.result.unwrap_or(Value::Null))
+    let result = response.result.as_ref()?;
+    let execution = result
+        .get("control_execution")
+        .or_else(|| result.get("execution"))?;
+    if matches!(execution["status"].as_str(), Some("failed" | "unknown")) {
+        return Some(format!(
+            "execution {} is {}; inspect the returned result before retrying",
+            execution["execution_id"], execution["status"]
+        ));
+    }
+    None
 }
 
 struct ClientConnection {

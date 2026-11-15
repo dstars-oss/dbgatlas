@@ -743,10 +743,31 @@ pub(super) fn handle_http_stream(
         append_http_diagnostic_log("validate_request", &context, &error.to_string());
         return Err(error);
     }
+    let mcp_version = request
+        .headers
+        .get("mcp-protocol-version")
+        .map(String::as_str)
+        .unwrap_or(mcp_protocol::HEADER_DEFAULT_VERSION);
+    if request.path == "/mcp" && !mcp_protocol::supported(mcp_version) {
+        return Err(ServiceError::InvalidHttpRequest(
+            "unsupported MCP-Protocol-Version".into(),
+        ));
+    }
     if request.method != "POST" {
         let error = ServiceError::UnsupportedHttpMethod(request.method);
         append_http_diagnostic_log("method", &context, &error.to_string());
         return Err(error);
+    }
+    // We issue no client requests; late client responses have no pending work.
+    if request.path == "/mcp" {
+        let message: Value = serde_json::from_slice(&request.body)?;
+        if message.get("method").is_none()
+            && message["jsonrpc"] == "2.0"
+            && message.get("id").is_some()
+            && (message.get("result").is_some() != message.get("error").is_some())
+        {
+            return Ok(http_empty_response(202, "Accepted"));
+        }
     }
     let rpc: JsonRpcRequest = match serde_json::from_slice(&request.body) {
         Ok(rpc) => rpc,
@@ -771,7 +792,7 @@ pub(super) fn handle_http_stream(
             append_http_success_log(200, started.elapsed(), &context);
             Ok(response)
         }
-        "/mcp" => match host.handle_mcp(rpc) {
+        "/mcp" => match host.handle_mcp_version(rpc, mcp_version) {
             Some(response) => {
                 let response = http_json_response(200, &response)?;
                 append_http_success_log(200, started.elapsed(), &context);
