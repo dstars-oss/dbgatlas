@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct WorkerTransport {
     pub(super) snapshot: Arc<Mutex<Option<dbgatlas_worker_protocol::WorkerSnapshot>>>,
-    pub(super) file: std::fs::File,
+    pub(super) file: PipeStream,
 }
 
 pub(super) struct WorkerPipeServer {
@@ -15,161 +15,23 @@ impl WorkerTransport {
         create_worker_pipe_server(pipe_name)
     }
 
-    pub(super) fn into_file(self) -> std::fs::File {
+    pub(super) fn into_file(self) -> PipeStream {
         self.file
     }
 
-    pub(super) fn request(
+    pub(super) fn control(
         &mut self,
-        worker: &WorkerHandle,
-        request: WorkerRequest,
-    ) -> Result<WorkerResponse, ServiceError> {
-        self.request_inner(worker, request, None)
-    }
-
-    pub(super) fn request_with_timeout(
-        &mut self,
-        worker: &WorkerHandle,
-        request: WorkerRequest,
-        timeout: Duration,
-    ) -> Result<WorkerResponse, ServiceError> {
-        self.request_inner(worker, request, Some(timeout))
-    }
-
-    pub(super) fn request_inner(
-        &mut self,
-        worker: &WorkerHandle,
-        request: WorkerRequest,
-        response_timeout: Option<Duration>,
-    ) -> Result<WorkerResponse, ServiceError> {
-        let request_id = next_worker_request_id();
-        let method = request.method_name();
-        let session_id = request.session_id().id.as_str().to_string();
-        let operation_id = request
-            .operation_id()
-            .map(|operation| operation.id.as_str().to_string());
-        let started = Instant::now();
-        append_worker_transport_log(
-            "start",
-            worker,
-            method,
-            &request_id,
-            &session_id,
-            operation_id.as_deref(),
-            None,
-            None,
-            started.elapsed(),
-        );
-        let envelope = WorkerEnvelope::new(request_id.clone(), request);
-        let line = encode_jsonl(&envelope).map_err(|error| {
-            append_worker_transport_log(
-                "encode_failed",
-                worker,
-                method,
-                &request_id,
-                &session_id,
-                operation_id.as_deref(),
-                None,
-                Some(&error.to_string()),
-                started.elapsed(),
-            );
-            ServiceError::from(error)
-        })?;
-        if let Err(error) = self.file.write_all(line.as_bytes()) {
-            append_worker_transport_log(
-                "write_failed",
-                worker,
-                method,
-                &request_id,
-                &session_id,
-                operation_id.as_deref(),
-                None,
-                Some(&error.to_string()),
-                started.elapsed(),
-            );
-            return Err(error.into());
-        }
-        if let Err(error) = self.file.flush() {
-            append_worker_transport_log(
-                "flush_failed",
-                worker,
-                method,
-                &request_id,
-                &session_id,
-                operation_id.as_deref(),
-                None,
-                Some(&error.to_string()),
-                started.elapsed(),
-            );
-            return Err(error.into());
-        }
-        let response_line = match response_timeout {
-            Some(timeout) => read_jsonl_line_with_timeout(&mut self.file, timeout),
-            None => read_jsonl_line(&mut self.file),
-        }
-        .inspect_err(|error| {
-            append_worker_transport_log(
-                "read_failed",
-                worker,
-                method,
-                &request_id,
-                &session_id,
-                operation_id.as_deref(),
-                None,
-                Some(&error.to_string()),
-                started.elapsed(),
-            );
-        })?;
-        let response: WorkerEnvelope<WorkerResponse> =
-            decode_jsonl(&response_line).map_err(|error| {
-                append_worker_transport_log(
-                    "decode_failed",
-                    worker,
-                    method,
-                    &request_id,
-                    &session_id,
-                    operation_id.as_deref(),
-                    None,
-                    Some(&error.to_string()),
-                    started.elapsed(),
-                );
-                ServiceError::from(error)
-            })?;
-        if response.request_id != request_id {
-            let message = format!(
-                "worker response id mismatch: expected {request_id}, got {}",
-                response.request_id
-            );
-            append_worker_transport_log(
-                "response_id_mismatch",
-                worker,
-                method,
-                &request_id,
-                &session_id,
-                operation_id.as_deref(),
-                None,
-                Some(&message),
-                started.elapsed(),
-            );
-            return Err(ServiceError::Worker(message.to_string()));
-        }
-        append_worker_transport_log(
-            "complete",
-            worker,
-            method,
-            &request_id,
-            &session_id,
-            operation_id.as_deref(),
-            Some(worker_response_kind(&response.message)),
-            None,
-            started.elapsed(),
-        );
-        if let Some(snapshot) = response.snapshot {
-            *self
-                .snapshot
-                .lock()
-                .map_err(|_| ServiceError::Worker("worker snapshot lock poisoned".into()))? =
-                Some(snapshot);
+        request: dbgatlas_worker_protocol::WorkerControlRequest,
+    ) -> Result<dbgatlas_worker_protocol::WorkerControlResponse, ServiceError> {
+        let id = next_worker_request_id();
+        let line = encode_jsonl(&WorkerEnvelope::new(id.clone(), request))?;
+        self.file.write_all(line.as_bytes())?;
+        self.file.flush()?;
+        let line = read_jsonl_line_with_timeout(&mut self.file, Duration::from_secs(3))?;
+        let response: WorkerEnvelope<dbgatlas_worker_protocol::WorkerControlResponse> =
+            decode_jsonl(&line)?;
+        if response.request_id != id {
+            return Err(ServiceError::Worker("control response id mismatch".into()));
         }
         Ok(response.message)
     }
@@ -212,7 +74,7 @@ pub(super) fn read_jsonl_line(reader: &mut impl Read) -> Result<String, ServiceE
 
 #[cfg(windows)]
 pub(super) fn read_jsonl_line_with_timeout(
-    reader: &mut std::fs::File,
+    reader: &mut PipeStream,
     timeout: Duration,
 ) -> Result<String, ServiceError> {
     use std::os::windows::io::AsRawHandle;
@@ -269,7 +131,7 @@ pub(super) fn read_jsonl_line_with_timeout(
 
 #[cfg(not(windows))]
 pub(super) fn read_jsonl_line_with_timeout(
-    reader: &mut std::fs::File,
+    reader: &mut PipeStream,
     _timeout: Duration,
 ) -> Result<String, ServiceError> {
     read_jsonl_line(reader)
@@ -415,8 +277,10 @@ pub(super) fn connect_worker_pipe_server(
                 let wait =
                     unsafe { WaitForSingleObject(event, timeout_ms.min(u32::MAX as u64) as u32) };
                 if wait == WAIT_TIMEOUT {
+                    let mut transferred = 0;
                     unsafe {
                         CancelIoEx(server.handle, &overlapped);
+                        GetOverlappedResult(server.handle, &overlapped, &mut transferred, 1);
                         CloseHandle(event);
                     }
                     return Err(ServiceError::Worker(format!(
@@ -424,11 +288,14 @@ pub(super) fn connect_worker_pipe_server(
                     )));
                 }
                 if wait != WAIT_OBJECT_0 {
+                    let error = std::io::Error::last_os_error();
+                    let mut transferred = 0;
                     unsafe {
                         CancelIoEx(server.handle, &overlapped);
+                        GetOverlappedResult(server.handle, &overlapped, &mut transferred, 1);
                         CloseHandle(event);
                     }
-                    return Err(std::io::Error::last_os_error().into());
+                    return Err(error.into());
                 }
                 let mut transferred = 0;
                 let ok =
@@ -455,7 +322,7 @@ pub(super) fn connect_worker_pipe_server(
     std::mem::forget(server);
     let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
     Ok(WorkerTransport {
-        file,
+        file: PipeStream::from_file(file),
         snapshot: Arc::new(Mutex::new(None)),
     })
 }

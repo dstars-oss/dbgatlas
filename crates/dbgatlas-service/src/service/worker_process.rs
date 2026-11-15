@@ -486,6 +486,8 @@ pub(super) fn worker_process_args(
     let mut args = vec![
         "--pipe".to_string(),
         pipe_name.to_string(),
+        "--control-pipe".to_string(),
+        format!("{pipe_name}-control"),
         "--lifetime-pipe".to_string(),
         lifetime_pipe_name.to_string(),
         "--session-id".to_string(),

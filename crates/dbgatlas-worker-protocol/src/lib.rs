@@ -4,14 +4,47 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 7;
+pub const WORKER_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerSnapshot {
+    #[serde(default)]
+    pub sequence: u64,
     pub target_process: Option<dbgatlas_model::ProcessInstance>,
     pub target_state: dbgatlas_model::TargetState,
     pub observed_at: Timestamp,
     pub context: serde_json::Value,
+}
+
+/// Business responses and unsolicited observations share a single reader. Control
+/// requests use another pipe and never queue behind a business response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerMessage {
+    Response { result: WorkerResponse },
+    Event { events: Vec<serde_json::Value> },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerControlRequest {
+    pub session_id: SessionRef,
+    #[serde(flatten)]
+    pub action: WorkerControlAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum WorkerControlAction {
+    Interrupt { expected_epoch: u64 },
+    Cancel { operation_id: OperationRef },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerControlResponse {
+    pub accepted: bool,
+    pub code: String,
+    pub epoch: Option<u64>,
+    pub native_hresult: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

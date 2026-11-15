@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../native/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../../native/include/dbgatlas_dbgeng.h");
     println!("cargo:rerun-if-changed=../../native/adapters/dbgeng/dbgatlas_dbgeng.cpp");
+    println!("cargo:rerun-if-changed=../../native/adapters/dbgeng/interaction.h");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

@@ -7,3 +7,4 @@ pub mod process_identity;
 mod service;
 
 pub use service::*;
+pub mod pipe_io;

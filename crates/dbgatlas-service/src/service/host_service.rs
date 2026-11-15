@@ -213,6 +213,7 @@ impl ServiceHost {
             },
             MethodRoute::Session => match name {
                 "session.get" => self.session_get(params),
+                "session.interrupt" => self.session_interrupt(params),
                 "session.list" => self.session_list(params),
                 _ => unhandled_registered_method(name),
             },

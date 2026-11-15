@@ -1,3 +1,4 @@
+use crate::pipe_io::PipeStream;
 use dbgatlas_debug::{
     AddSymbolsRequest, CreateDebugSession, DebugCommandResult, DebugMemoryResult,
     DebugSessionState, DebugTarget, EvalDebugCommand, ReadMemoryRequest,
@@ -529,6 +530,15 @@ pub struct WorkerCreateRequest {
 }
 
 pub trait WorkerSupervisor: Send + Sync {
+    fn interrupt_worker(
+        &self,
+        _worker: &WorkerHandle,
+        _expected_epoch: u64,
+    ) -> Result<dbgatlas_worker_protocol::WorkerControlResponse, ServiceError> {
+        Err(ServiceError::Worker(
+            "target interruption is unsupported by this supervisor".into(),
+        ))
+    }
     fn is_mock(&self) -> bool {
         false
     }
@@ -790,7 +800,8 @@ struct ProcessWorkerState {
     ownership_file: PathBuf,
     snapshot: Arc<Mutex<Option<dbgatlas_worker_protocol::WorkerSnapshot>>>,
     child: Mutex<WorkerProcess>,
-    transport: Mutex<WorkerTransport>,
+    transport: WorkerConnection,
+    control: Mutex<Option<WorkerTransport>>,
     lifetime: Mutex<WorkerLifetime>,
 }
 
@@ -904,6 +915,30 @@ impl Drop for WorkerLifetime {
 }
 
 impl ProcessWorkerSupervisor {
+    fn control_worker(
+        &self,
+        worker: &WorkerHandle,
+        action: dbgatlas_worker_protocol::WorkerControlAction,
+    ) -> Result<dbgatlas_worker_protocol::WorkerControlResponse, ServiceError> {
+        let state = self.get_worker(worker)?;
+        let mut transport = state
+            .control
+            .lock()
+            .map_err(|_| ServiceError::Worker("control transport poisoned".into()))?;
+        let result = transport
+            .as_mut()
+            .ok_or_else(|| ServiceError::Worker("control connection unavailable".into()))?
+            .control(dbgatlas_worker_protocol::WorkerControlRequest {
+                session_id: worker.session_id.clone(),
+                action,
+            });
+        // After a timeout/partial frame the reply is ambiguous. Do not misdeliver a
+        // late acknowledgement to a later control request or replay the request.
+        if result.is_err() {
+            transport.take();
+        }
+        result
+    }
     pub fn new() -> Result<Self, ServiceError> {
         Ok(Self {
             identity: WorkerIdentity::CurrentUserDevMode,
@@ -941,6 +976,16 @@ impl ProcessWorkerSupervisor {
 }
 
 impl WorkerSupervisor for ProcessWorkerSupervisor {
+    fn interrupt_worker(
+        &self,
+        worker: &WorkerHandle,
+        expected_epoch: u64,
+    ) -> Result<dbgatlas_worker_protocol::WorkerControlResponse, ServiceError> {
+        self.control_worker(
+            worker,
+            dbgatlas_worker_protocol::WorkerControlAction::Interrupt { expected_epoch },
+        )
+    }
     fn process_instance(&self, worker: &WorkerHandle) -> Option<dbgatlas_model::ProcessInstance> {
         let state = self.get_worker(worker).ok()?;
         let child = state.child.lock().ok()?;
@@ -969,6 +1014,7 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         .expect("generated worker ids are valid");
         let pipe_name = unique_pipe_name(&request.session_id);
         let lifetime_pipe_name = unique_lifetime_pipe_name(&request.session_id);
+        let control_transport = WorkerTransport::create_server(&format!("{pipe_name}-control"))?;
         let identity = request.identity.unwrap_or_else(|| self.identity.clone());
         let dbgeng_dirs = prepare_dbgeng_dirs_for_worker_identity(&identity, &request.dbgeng_dirs)?;
         let dbgeng_dir_count = dbgeng_dirs.len();
@@ -1072,11 +1118,29 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
             }
         };
         let lifetime = WorkerLifetime::start(&worker_id, &request.session_id, lifetime_connected);
+        let control_connected = match control_transport.connect(request.startup_timeout_ms) {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let snapshot = connected.snapshot.clone();
+        let connected = match WorkerConnection::start(connected) {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let state = Arc::new(ProcessWorkerState {
             ownership_file: request.artifact_dir.join("owned-processes.json"),
-            snapshot: connected.snapshot.clone(),
+            snapshot,
             child: Mutex::new(child),
-            transport: Mutex::new(connected),
+            transport: connected,
+            control: Mutex::new(Some(control_connected)),
             lifetime: Mutex::new(lifetime),
         });
         self.workers
@@ -1104,12 +1168,9 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         worker: &WorkerHandle,
         request: WorkerRequest,
     ) -> Result<WorkerResponse, ServiceError> {
-        let worker_state = self.get_worker(worker)?;
-        let mut transport = worker_state
+        self.get_worker(worker)?
             .transport
-            .lock()
-            .map_err(|_| ServiceError::Worker("worker transport lock poisoned".to_string()))?;
-        transport.request(worker, request)
+            .request(worker, request, None)
     }
 
     fn request_worker_with_timeout(
@@ -1118,29 +1179,9 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         request: WorkerRequest,
         timeout: Duration,
     ) -> Result<WorkerResponse, ServiceError> {
-        let worker_state = self.get_worker(worker)?;
-        let started = Instant::now();
-        loop {
-            match worker_state.transport.try_lock() {
-                Ok(mut transport) => {
-                    return transport.request_with_timeout(worker, request, timeout);
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err(ServiceError::Worker(
-                        "worker transport lock poisoned".to_string(),
-                    ));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if started.elapsed() >= timeout {
-                        return Err(ServiceError::Worker(format!(
-                            "timed out waiting for worker transport lock after {} ms",
-                            timeout.as_millis()
-                        )));
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-            }
-        }
+        self.get_worker(worker)?
+            .transport
+            .request(worker, request, Some(timeout))
     }
 
     fn cancel_worker_operation(
@@ -1149,33 +1190,22 @@ impl WorkerSupervisor for ProcessWorkerSupervisor {
         session_id: &SessionRef,
         operation_id: &OperationRef,
     ) -> Result<WorkerCancelOutcome, ServiceError> {
-        let worker_state = self.get_worker(worker)?;
-        if let Ok(mut transport) = worker_state.transport.try_lock() {
-            let _ = transport.request(
-                worker,
-                WorkerRequest::CancelOperation {
-                    session_id: session_id.clone(),
-                    operation_id: operation_id.clone(),
-                },
-            )?;
-            append_service_diagnostic_log(&format!(
-                "worker_cancel_notified worker_id={} session_id={} operation_id={}",
-                sanitize_log_value(worker.worker_id.as_str()),
-                sanitize_log_value(session_id.id.as_str()),
-                sanitize_log_value(operation_id.id.as_str())
-            ));
-            return Ok(WorkerCancelOutcome::Notified);
+        if session_id != &worker.session_id {
+            return Err(ServiceError::Worker("control session mismatch".into()));
         }
-        // worker pipe 同一时间只能服务一个请求；拿不到锁说明目标请求仍在执行。
-        // 这时继续排队 cancel 已经无法及时生效，只能终止 worker 保证上层 operation 进入终态。
-        self.kill_worker(worker)?;
-        append_service_diagnostic_log(&format!(
-            "worker_cancel_killed worker_id={} session_id={} operation_id={}",
-            sanitize_log_value(worker.worker_id.as_str()),
-            sanitize_log_value(session_id.id.as_str()),
-            sanitize_log_value(operation_id.id.as_str())
-        ));
-        Ok(WorkerCancelOutcome::WorkerKilled)
+        let result = self.control_worker(
+            worker,
+            dbgatlas_worker_protocol::WorkerControlAction::Cancel {
+                operation_id: operation_id.clone(),
+            },
+        )?;
+        if !result.accepted {
+            return Err(ServiceError::Worker(format!(
+                "cancel rejected: {} (native={:?})",
+                result.code, result.native_hresult
+            )));
+        }
+        Ok(WorkerCancelOutcome::Notified)
     }
 
     fn close_worker(&self, worker: &WorkerHandle) -> Result<(), ServiceError> {
@@ -1319,6 +1349,8 @@ use install::*;
 
 mod worker_transport;
 use worker_transport::*;
+mod worker_connection;
+use worker_connection::*;
 
 mod rpc_http;
 use rpc_http::*;

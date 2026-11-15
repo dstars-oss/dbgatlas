@@ -2,6 +2,8 @@
 
 本文定义迭代 2 的业务契约。实现进度和运行证据分别见 [PLAN.md](../PLAN.md)、[当前实现基线](roadmap.md)与[迭代 2 验证记录](iteration-2-validation.md)。进程处置见[进程与生命周期](worker-model.md)。
 
+迭代 3 的目标命名已统一为 Session + Execution，接口采用 session.* 与 execution.*；新增的执行观察、Artifact 来源/输入引用和旧字段映射见[执行交互方案](execution-interaction.md)。下文的 Operation、operation.* 和 JSONL 字段描述迭代 2 基线，不表示目标方案仍使用旧命名，也不代表新接口已实现。
+
 ## 核心资源
 
 Session 和 Operation 是两个核心业务资源。环境、目标、后端、执行身份和处置策略是会话的结构化信息；产物复用已有引用。
@@ -67,7 +69,7 @@ Session 和 Operation 是两个核心业务资源。环境、目标、后端、�
 - 新录制 session_id 与 recording_id 使用同一个标识值，后者继续作为兼容字段。
 - 业务响应增加 session 公共摘要。旧字段由适配层保留，不能将旧 Ready/Error 等字段当作完整目标状态。
 - CLI、RPC、MCP 复用 ServiceHost；不增加任意 JSON 的 operation.create。
-- 内部 worker 协议为 v7，拒绝不匹配版本；它仍包含本机路径，不是远端通信协议。
+- 内部 worker 协议为 v8，拒绝不匹配版本；它仍包含本机路径，不是远端通信协议。
 
 原始更新追加到既有 JSONL，同一操作使用同一 ID 和递增 update_seq。读取合并为最新状态，原始行保留；旧字段缺失按未知处理，不造身份或成功结果。会话元数据存为既有 session/recording 目录内的版本化 session.json。服务重启不恢复 worker，也不把历史 active 当作当前会话；完整跨重启查询在迭代 4 实现。
 

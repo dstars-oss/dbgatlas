@@ -23,6 +23,8 @@ typedef enum DA_DbgEngStatus {
     DA_DBGENG_OK = 0,
     DA_DBGENG_ERR_INVALID_ARGUMENT = 1,
     DA_DBGENG_ERR_BUFFER_TOO_SMALL = 2,
+    DA_DBGENG_ERR_STALE_ACTIVITY = 3,
+    DA_DBGENG_ERR_BUSY = 4,
     DA_DBGENG_ERR_INTERNAL = 500,
     DA_DBGENG_ERR_OUTPUT_AFTER_SUCCESS = 501,
     DA_DBGENG_ERR_OUTPUT_AFTER_FAILURE = 502
@@ -54,6 +56,46 @@ typedef struct DA_DbgEngArtifactResult {
 } DA_DbgEngArtifactResult;
 
 typedef struct DA_DbgEngSessionHandle DA_DbgEngSessionHandle;
+typedef struct DA_DbgEngControlHandle DA_DbgEngControlHandle;
+
+/* Only control handles may cross threads. Session calls remain owner-thread only.
+   An activity epoch is never reused. Interrupt acceptance is not completion. */
+typedef struct DA_DbgEngEvent {
+    uint64_t sequence;
+    uint64_t epoch;
+    uint64_t argument;
+    uint32_t kind; /* 1 breakpoint, 2 exception, 3 exit, 4 engine, 5 input, 6 gap */
+    uint32_t code;
+} DA_DbgEngEvent;
+
+typedef struct DA_DbgEngEvents {
+    uint32_t struct_size;
+    uint32_t output_error; /* Win32 error writing asynchronous output */
+    const DA_DbgEngEvent* data;
+    size_t len;
+    void* owner;
+    uint64_t output_byte_len;
+} DA_DbgEngEvents;
+
+/* Configure once, after opening, before publishing the control handle. */
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_enable_interaction(
+    DA_DbgEngSessionHandle* handle, const char* output_path_utf8,
+    DA_DbgEngControlHandle** out_control);
+DA_DBGENG_EXPORT int32_t da_dbgeng_control_release(DA_DbgEngControlHandle* handle);
+DA_DBGENG_EXPORT int32_t da_dbgeng_control_interrupt(
+    DA_DbgEngControlHandle* handle, uint64_t expected_epoch,
+    uint32_t kind, int32_t* native_hresult); /* 0 ACTIVE, 1 PASSIVE, 2 EXIT */
+/* Drains cached events only; never calls the engine. One consumer per handle. */
+DA_DBGENG_EXPORT int32_t da_dbgeng_control_read_events(
+    DA_DbgEngControlHandle* handle, DA_DbgEngEvents* out);
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_begin_activity(
+    DA_DbgEngSessionHandle* handle, uint32_t kind, uint64_t* epoch); /* 1 command, 2 event wait */
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_end_activity(
+    DA_DbgEngSessionHandle* handle, uint64_t epoch, int32_t* native_hresult);
+/* Always waits indefinitely. API wait budgets must never reach this call.
+   native_hresult preserves S_OK, E_PENDING, E_UNEXPECTED and other engine outcomes. */
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_wait_event(
+    DA_DbgEngSessionHandle* handle, uint64_t epoch, int32_t* native_hresult);
 
 typedef struct DA_DbgEngState {
     uint32_t struct_size;

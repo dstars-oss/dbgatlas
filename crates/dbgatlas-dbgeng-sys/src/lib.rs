@@ -3,6 +3,7 @@ use std::ffi::{c_char, c_void};
 pub const DA_DBGENG_OK: i32 = 0;
 pub const DA_DBGENG_ERR_INVALID_ARGUMENT: i32 = 1;
 pub const DA_DBGENG_ERR_BUFFER_TOO_SMALL: i32 = 2;
+pub const DA_DBGENG_ERR_STALE_ACTIVITY: i32 = 3;
 pub const DA_DBGENG_ERR_INTERNAL: i32 = 500;
 
 #[repr(C)]
@@ -63,9 +64,66 @@ pub struct DA_DbgEngSessionHandle {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct DA_DbgEngControlHandle {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DA_DbgEngEvent {
+    pub sequence: u64,
+    pub epoch: u64,
+    pub argument: u64,
+    pub kind: u32,
+    pub code: u32,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct DA_DbgEngEvents {
+    pub struct_size: u32,
+    pub output_error: u32,
+    pub data: *const DA_DbgEngEvent,
+    pub len: usize,
+    pub owner: *mut c_void,
+    pub output_byte_len: u64,
+}
+
 #[cfg(windows)]
 #[link(name = "dbgatlas_dbgeng")]
 unsafe extern "C" {
+    pub fn da_dbgeng_session_enable_interaction(
+        handle: *mut DA_DbgEngSessionHandle,
+        path: *const c_char,
+        out: *mut *mut DA_DbgEngControlHandle,
+    ) -> i32;
+    pub fn da_dbgeng_control_release(handle: *mut DA_DbgEngControlHandle) -> i32;
+    pub fn da_dbgeng_control_interrupt(
+        handle: *mut DA_DbgEngControlHandle,
+        epoch: u64,
+        kind: u32,
+        native_hresult: *mut i32,
+    ) -> i32;
+    pub fn da_dbgeng_control_read_events(
+        handle: *mut DA_DbgEngControlHandle,
+        out: *mut DA_DbgEngEvents,
+    ) -> i32;
+    pub fn da_dbgeng_session_begin_activity(
+        handle: *mut DA_DbgEngSessionHandle,
+        kind: u32,
+        epoch: *mut u64,
+    ) -> i32;
+    pub fn da_dbgeng_session_end_activity(
+        handle: *mut DA_DbgEngSessionHandle,
+        epoch: u64,
+        native_hresult: *mut i32,
+    ) -> i32;
+    pub fn da_dbgeng_session_wait_event(
+        handle: *mut DA_DbgEngSessionHandle,
+        epoch: u64,
+        native_hresult: *mut i32,
+    ) -> i32;
     pub fn da_dbgeng_session_state(
         handle: *mut DA_DbgEngSessionHandle,
         out: *mut DA_DbgEngState,

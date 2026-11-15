@@ -6,6 +6,7 @@ use dbgatlas_model::{
     DEFAULT_INLINE_RESULT_BYTE_LIMIT, OperationRef, ResultPreview, SessionRef, Timestamp,
 };
 use dbgatlas_runtime::RuntimeConfig;
+use dbgatlas_service::pipe_io::PipeStream;
 use dbgatlas_worker_protocol::{
     WorkerArtifactRole, WorkerArtifactWrite, WorkerEnvelope, WorkerRequest, WorkerResponse,
     decode_jsonl, encode_jsonl,
@@ -17,6 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const LIFETIME_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[path = "dbgatlas-worker/interaction.rs"]
+mod interaction;
 
 fn main() {
     if let Err(error) = run() {
@@ -35,38 +39,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let args = WorkerArgs::parse()?;
-    let mut pipe = open_pipe(&args.pipe)?;
+    let pipe = open_pipe(&args.pipe)?;
     let lifetime_pipe = open_pipe(&args.lifetime_pipe)?;
+    let control_pipe = open_pipe(&args.control_pipe)?;
     let ownership_file = std::sync::Arc::new(std::sync::Mutex::new(None));
     let _watchdog = start_lifetime_watchdog(lifetime_pipe, ownership_file.clone());
-    let mut state = WorkerState::new(args.session_id.clone(), args.dbgeng_dirs);
+    let mut state = WorkerState::new(args.session_id.clone(), args.dbgeng_dirs.clone());
     state.ownership_file = ownership_file;
-    loop {
-        // worker 与 service 之间只走一行一个 JSON envelope 的 pipe 协议。
-        // 运行诊断由 service 侧记录；worker 只负责执行 native capability 并回传 artifact 写入声明。
-        let line = read_jsonl_line(&mut pipe)?;
-        let request: WorkerEnvelope<WorkerRequest> = decode_jsonl(&line)?;
-        let is_terminal_request = matches!(
-            request.message,
-            WorkerRequest::CloseSession { .. } | WorkerRequest::KillSession { .. }
-        );
-        let response = state.handle_request(request.message);
-        let should_exit = is_terminal_request && matches!(response, WorkerResponse::Ok { .. });
-        let mut response = WorkerEnvelope::new(request.request_id, response);
-        response.snapshot = state.snapshot();
-        let line = encode_jsonl(&response)?;
-        pipe.write_all(line.as_bytes())?;
-        pipe.flush()?;
-        if should_exit {
-            break;
-        }
-    }
-    Ok(())
+    interaction::run(args, state, pipe, control_pipe)
 }
 
 #[derive(Debug)]
 struct WorkerArgs {
     pipe: String,
+    control_pipe: String,
     lifetime_pipe: String,
     session_id: String,
     dbgeng_dirs: Vec<PathBuf>,
@@ -84,12 +70,14 @@ impl WorkerArgs {
         let mut args = args.into_iter();
         let mut pipe = None;
         let mut lifetime_pipe = None;
+        let mut control_pipe = None;
         let mut session_id = None;
         let mut dbgeng_dirs = Vec::new();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--pipe" => pipe = args.next(),
                 "--lifetime-pipe" => lifetime_pipe = args.next(),
+                "--control-pipe" => control_pipe = args.next(),
                 "--session-id" => session_id = args.next(),
                 "--dbgeng-dir" => {
                     dbgeng_dirs.push(
@@ -104,6 +92,7 @@ impl WorkerArgs {
         Ok(Self {
             pipe: pipe.ok_or_else(|| "missing --pipe".to_string())?,
             lifetime_pipe: lifetime_pipe.ok_or_else(|| "missing --lifetime-pipe".to_string())?,
+            control_pipe: control_pipe.ok_or_else(|| "missing --control-pipe".to_string())?,
             session_id: session_id.ok_or_else(|| "missing --session-id".to_string())?,
             dbgeng_dirs,
         })
@@ -111,7 +100,7 @@ impl WorkerArgs {
 }
 
 fn start_lifetime_watchdog(
-    mut lifetime_pipe: std::fs::File,
+    mut lifetime_pipe: PipeStream,
     ownership_file: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -137,7 +126,7 @@ fn start_lifetime_watchdog(
 
 #[cfg(windows)]
 fn read_lifetime_line_with_timeout(
-    reader: &mut std::fs::File,
+    reader: &mut PipeStream,
     timeout: Duration,
 ) -> Result<String, std::io::Error> {
     use std::os::windows::io::AsRawHandle;
@@ -194,16 +183,18 @@ fn read_lifetime_line_with_timeout(
 
 #[cfg(not(windows))]
 fn read_lifetime_line_with_timeout(
-    reader: &mut std::fs::File,
+    reader: &mut PipeStream,
     _timeout: Duration,
 ) -> Result<String, std::io::Error> {
     read_jsonl_line(reader)
 }
 
 struct WorkerState {
+    interaction: std::sync::Arc<std::sync::Mutex<interaction::Shared>>,
     recording: Option<dbgatlas_service::RecordingExecutor>,
     ownership_file: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     file_target: bool,
+    observation_only: bool,
     normal_exit: bool,
     expected_session_id: String,
     dbgeng_dirs: Vec<PathBuf>,
@@ -243,9 +234,11 @@ impl WorkerState {
                 .collect();
         }
         Self {
+            interaction: std::sync::Arc::new(std::sync::Mutex::new(interaction::Shared::default())),
             recording: None,
             ownership_file: std::sync::Arc::new(std::sync::Mutex::new(None)),
             file_target: false,
+            observation_only: false,
             normal_exit: false,
             expected_session_id,
             dbgeng_dirs,
@@ -414,11 +407,10 @@ impl WorkerState {
                 self.session = None;
                 WorkerResponse::ok("debug session killed")
             }
-            WorkerRequest::CancelOperation { .. } => {
-                // 真实的强制取消由 service supervisor 负责；worker 能收到该请求时，
-                // 说明 pipe 空闲，返回 ack 让上层把 operation 标记为 canceled 即可。
-                WorkerResponse::ok("operation cancel acknowledged")
-            }
+            WorkerRequest::CancelOperation { .. } => WorkerResponse::failed(
+                "control_channel_required",
+                "cancellation requires the independent control channel",
+            ),
         }
     }
 
@@ -435,6 +427,7 @@ impl WorkerState {
         }
         use dbgatlas_model::TargetState;
         Some(dbgatlas_worker_protocol::WorkerSnapshot {
+            sequence: 0,
             target_process: if self.file_target || pid == 0 {
                 None
             } else {
@@ -442,6 +435,8 @@ impl WorkerState {
             },
             target_state: if self.file_target {
                 TargetState::Offline
+            } else if self.observation_only {
+                TargetState::Unknown
             } else {
                 match status {
                     1 => TargetState::Running,
@@ -450,7 +445,7 @@ impl WorkerState {
                 }
             },
             observed_at: Timestamp::now(),
-            context: serde_json::json!({"thread_id":engine.thread_id,"frame_index":engine.frame_index}),
+            context: serde_json::json!({"thread_id":engine.thread_id,"frame_index":engine.frame_index,"target_control":!self.observation_only && !self.file_target}),
         })
     }
 
@@ -459,6 +454,7 @@ impl WorkerState {
             return WorkerResponse::failed("already_open", "worker is already bound");
         }
         self.file_target = matches!(target, DebugTarget::File { .. });
+        self.observation_only = matches!(target, DebugTarget::Attach { .. });
         let created = matches!(target, DebugTarget::Launch { .. });
         let ownership_path = artifact_dir.join("owned-processes.json");
         *self.ownership_file.lock().unwrap() = Some(ownership_path.clone());
@@ -509,6 +505,19 @@ impl WorkerState {
                     }
                     if let Err(error) = session.commit_launch() {
                         return WorkerResponse::failed("launch_commit_failed", error.to_string());
+                    }
+                }
+                match session.enable_interaction(&artifact_dir.join("session-output.log")) {
+                    Ok(control) => {
+                        let mut interaction = self.interaction.lock().unwrap();
+                        interaction.control = Some(control);
+                        interaction.artifact_dir = Some(artifact_dir.to_path_buf());
+                    }
+                    Err(error) => {
+                        return WorkerResponse::failed(
+                            "interaction_setup_failed",
+                            error.to_string(),
+                        );
                     }
                 }
                 self.session = Some(session);
@@ -740,11 +749,17 @@ fn read_jsonl_line(reader: &mut impl Read) -> Result<String, std::io::Error> {
 }
 
 #[cfg(windows)]
-fn open_pipe(pipe_name: &str) -> Result<std::fs::File, std::io::Error> {
+fn open_pipe(pipe_name: &str) -> Result<PipeStream, std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
     let mut last_error = None;
     for _ in 0..50 {
-        match OpenOptions::new().read(true).write(true).open(pipe_name) {
-            Ok(file) => return Ok(file),
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED)
+            .open(pipe_name)
+        {
+            Ok(file) => return Ok(PipeStream::from_file(file)),
             Err(error) => {
                 last_error = Some(error);
                 thread::sleep(Duration::from_millis(100));
@@ -757,7 +772,7 @@ fn open_pipe(pipe_name: &str) -> Result<std::fs::File, std::io::Error> {
 }
 
 #[cfg(not(windows))]
-fn open_pipe(_pipe_name: &str) -> Result<std::fs::File, std::io::Error> {
+fn open_pipe(_pipe_name: &str) -> Result<PipeStream, std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "named pipe worker transport is only supported on Windows",
@@ -805,6 +820,8 @@ mod tests {
     #[test]
     fn worker_args_accept_lifetime_pipe() {
         let args = WorkerArgs::parse_from(vec![
+            "--control-pipe".to_string(),
+            r"\\.\pipe\dbgatlas-control-test".to_string(),
             "--pipe".to_string(),
             r"\\.\pipe\dbgatlas-rpc-test".to_string(),
             "--lifetime-pipe".to_string(),

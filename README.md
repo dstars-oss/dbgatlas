@@ -1,8 +1,8 @@
 # DbgAtlas
 
-DbgAtlas is an AI-oriented debugging platform. AI clients use native debugger commands with session management, state, and recorded outputs. Windows debugging and recording are implemented first; environment/session/process restructuring, remote backends, persistent searchable history, Linux, and a management UI follow [PLAN.md](PLAN.md).
+DbgAtlas is an AI-oriented debugging platform. AI clients use native debugger commands with session management, state, and recorded outputs. Windows debugging and recording include the iteration 2 environment/session/process model; reliable execution interaction, remote backends, persistent searchable history, Linux, and a management UI follow [PLAN.md](PLAN.md).
 
-The [architecture specification](docs/architecture.md) and [environment/session model](docs/environment-session-model.md) define the target design. The next iteration restructures environments, sessions, and process ownership on the local path; remote transport and the later AI execution interface are separate iterations. See the [implementation baseline](docs/roadmap.md) for current code paths and limitations.
+The [architecture specification](docs/architecture.md) and [environment/session model](docs/environment-session-model.md) describe the design and iteration 2 baseline. The next iteration adopts Session + Execution through session.* and execution.* interfaces, with bounded waits, reliable interruption and Artifact source/reference tracking. Its [3A prototype](docs/iteration-3a-validation.md) has fixed the execution and MCP direction; [3B](docs/iteration-3b-validation.md) now implements continuous engine observations and independent control. The remaining [product interfaces](docs/execution-interaction.md), service-owned bounded waits and Execution naming migration follow in 3C. See the [implementation baseline](docs/roadmap.md) for current code paths and limitations.
 
 IDA static analysis belongs to external tools. DbgAtlas provides debugger-native symbols, types, disassembly, and memory inspection.
 
@@ -12,7 +12,8 @@ Current implementation includes:
 
 - A `0.3.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
 - A Rust workspace split into `model`, `workspace`, `adapter`, `core`, `cli`, and a minimal `dbgeng` native wrapper.
-- Session/Operation model with terminal summaries, immutable execution context and versioned JSONL updates. Dedicated workers for DbgEng, ETW and TTD recording, using local named-pipe protocol v7.
+- Session/Operation model with terminal summaries, immutable execution context and versioned JSONL updates. Dedicated workers for DbgEng, ETW and TTD recording, using local named-pipe protocol v8.
+- Independent `session.interrupt` and cooperative command cancellation, with epoch validation, native events and raw output spooling. Explicit legacy execution timeouts still kill workers until 3C.
 - Runtime configuration types in `dbgatlas-runtime`, kept separate from workspace manifests.
 - A visible analysis workspace layout with `artifacts/`, `analysis/`, and optional `inputs/`.
 - Controlled artifact helpers for debug and recording sessions.

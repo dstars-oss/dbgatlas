@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
+mod interaction;
+pub use interaction::*;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeVersion {
     pub abi_major: u32,
@@ -391,7 +394,8 @@ impl DbgEngSession {
             )
         };
         if let Err(error) = status_to_result(status) {
-            let _ = std::fs::remove_file(&part_path);
+            // A failed or canceled native command may already have emitted useful
+            // output. Keep its .part file for recovery/audit; never imply success.
             return Err(error);
         }
         let preview = match text_view_to_string(result.preview) {
@@ -951,6 +955,42 @@ mod tests {
             .read_memory(marker_address, size_of::<u64>() as u32)
             .unwrap();
         assert_eq!(bytes, (*marker).to_le_bytes());
+
+        let control = session
+            .enable_interaction(&temp.path().join("events.log"))
+            .unwrap();
+        let first = session.begin_activity(ActivityKind::Command).unwrap();
+        assert!(session.begin_activity(ActivityKind::Command).is_err());
+        session.execute(".echo first-epoch").unwrap();
+        assert_eq!(session.end_activity(first).unwrap(), 0);
+        let second = session.begin_activity(ActivityKind::Command).unwrap();
+        assert!(second > first);
+        let late = control.clone();
+        std::thread::spawn(move || {
+            assert!(late.interrupt(first, InterruptKind::Passive).is_err());
+            assert!(late.interrupt(second, InterruptKind::Active).is_err());
+        })
+        .join()
+        .unwrap();
+        assert!(
+            session
+                .execute(".echo successor-unaffected")
+                .unwrap()
+                .contains("successor-unaffected")
+        );
+        assert_eq!(session.end_activity(second).unwrap(), 0);
+        // Closing the COM owner must invalidate borrowed control pointers even if
+        // another thread retains the safe interrupt handle.
+        let racing = control.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..100 {
+                assert!(racing.interrupt(first, InterruptKind::Passive).is_err());
+                racing.read_events().unwrap();
+            }
+        });
+        drop(session);
+        reader.join().unwrap();
+        assert!(control.interrupt(second, InterruptKind::Passive).is_err());
     }
 
     #[cfg(windows)]

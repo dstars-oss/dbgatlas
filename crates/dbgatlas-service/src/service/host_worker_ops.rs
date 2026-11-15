@@ -324,6 +324,11 @@ impl ServiceHost {
                         "artifact_refs":[],"output_error":message,"warnings":["execution result known; do not replay to recover output"]}),
                     );
                 }
+                let failure_status = if code == "execution_canceled" {
+                    OperationStatus::Canceled
+                } else {
+                    OperationStatus::Failed
+                };
                 let registered = match register_worker_writes(workspace, &operation_id, &writes) {
                     Ok(registered) => registered,
                     Err(error) => {
@@ -333,7 +338,7 @@ impl ServiceHost {
                             &operation_id,
                             capability,
                             &audit_command,
-                            OperationStatus::Failed,
+                            failure_status.clone(),
                             &error,
                         )?;
                         return Err(error);
@@ -346,7 +351,7 @@ impl ServiceHost {
                         operation_id: operation_id.clone(),
                         adapter_id: "service".to_string(),
                         capability: capability.to_string(),
-                        status: OperationStatus::Failed,
+                        status: failure_status.clone(),
                         created_at: Timestamp::now(),
                         summary: message.clone(),
                         artifacts: registered.artifacts.clone(),
@@ -359,13 +364,13 @@ impl ServiceHost {
                     capability: capability.to_string(),
                     command: audit_command,
                     created_at: Timestamp::now(),
-                    status: OperationStatus::Failed,
+                    status: failure_status.clone(),
                     artifacts: registered.artifacts.clone(),
                     raw_output: registered.raw_output.clone(),
                 })?;
                 self.finish_operation_in_memory(
                     &operation_id,
-                    ServiceOperationStatus::Failed,
+                    failure_status.clone(),
                     message.clone(),
                     registered.artifacts.clone(),
                     registered.raw_output.clone(),
@@ -374,7 +379,7 @@ impl ServiceHost {
                     capability,
                     &session.session_id,
                     &operation_id,
-                    &OperationStatus::Failed,
+                    &failure_status.clone(),
                     registered.artifacts.len(),
                     registered.raw_output.as_ref(),
                     Some(&format!("{code}: {message}")),

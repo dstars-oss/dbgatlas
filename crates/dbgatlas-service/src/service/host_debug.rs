@@ -206,6 +206,76 @@ impl ServiceHost {
         self.finish_session(params, SessionFinishMode::Close)
     }
 
+    pub(super) fn session_interrupt(&self, params: Option<Value>) -> Result<Value, ServiceError> {
+        #[derive(Deserialize)]
+        struct Params {
+            session_id: SessionRef,
+            expected_epoch: Option<u64>,
+        }
+        let params: Params = parse_params(params)?;
+        let session = self.reusable_debug_session(&params.session_id)?;
+        let observation = self
+            .supervisor
+            .snapshot(&session.worker)
+            .ok_or_else(|| ServiceError::Worker("no backend observation available".into()))?;
+        let epoch = params
+            .expected_epoch
+            .or_else(|| observation.context["engine"]["epoch"].as_u64())
+            .ok_or_else(|| {
+                ServiceError::Worker(
+                    "no active target run; use operation.cancel for an active command".into(),
+                )
+            })?;
+        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let id = next_operation_ref();
+        self.begin_operation_record(
+            &workspace,
+            &id,
+            &session.session_id,
+            "session.interrupt",
+            json!({"expected_epoch":epoch}),
+        )?;
+        let delivered = self.supervisor.interrupt_worker(&session.worker, epoch);
+        let accepted = delivered.as_ref().is_ok_and(|result| result.accepted);
+        let summary = match &delivered {
+            Ok(result) => result.code.clone(),
+            Err(error) => error.to_string(),
+        };
+        self.append_operation_result(
+            &workspace,
+            &OperationRecord {
+                details: Default::default(),
+                operation_id: id.clone(),
+                adapter_id: "service".into(),
+                capability: "session.interrupt".into(),
+                status: if accepted {
+                    OperationStatus::Success
+                } else {
+                    OperationStatus::Failed
+                },
+                created_at: Timestamp::now(),
+                summary: summary.clone(),
+                artifacts: vec![],
+                raw_output: None,
+            },
+        )?;
+        self.finish_operation_in_memory(
+            &id,
+            if accepted {
+                ServiceOperationStatus::Success
+            } else {
+                ServiceOperationStatus::Failed
+            },
+            summary,
+            vec![],
+            None,
+        )?;
+        let result = delivered?;
+        Ok(
+            json!({"execution_id":id,"session_id":session.session_id,"accepted":result.accepted,"epoch":result.epoch,"native_hresult":result.native_hresult,"code":result.code,"session":self.session_get(Some(json!({"session_id":session.session_id})))?}),
+        )
+    }
+
     pub(super) fn debug_session_kill(&self, params: Option<Value>) -> Result<Value, ServiceError> {
         self.finish_session(params, SessionFinishMode::Kill)
     }

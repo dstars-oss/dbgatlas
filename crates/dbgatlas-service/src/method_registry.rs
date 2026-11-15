@@ -75,6 +75,11 @@ fn method_route(name: &str) -> MethodRoute {
 fn registered_method_descriptors() -> Vec<Value> {
     let tools = vec![
         mcp_tool(
+            "session.interrupt",
+            "Request a break for the observed target run through the independent control channel. Accepted is not a confirmed stop; query session.get. A stale epoch never interrupts a later run.",
+            json!({"type":"object","properties":{"session_id":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"expected_epoch":{"type":"integer","minimum":1}},"required":["session_id"],"additionalProperties":false}),
+        ),
+        mcp_tool(
             "service.health",
             "Return DbgAtlas service health.",
             empty_object_schema(),

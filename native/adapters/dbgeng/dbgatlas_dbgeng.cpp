@@ -7,6 +7,8 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <deque>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -267,6 +269,8 @@ private:
     volatile LONG refs_ = 1;
 };
 
+#include "interaction.h"
+
 struct DbgEngSession final {
     ComPtr<IDebugClient> client;
     ComPtr<IDebugControl> control;
@@ -274,8 +278,26 @@ struct DbgEngSession final {
     ComPtr<IDebugDataSpaces> data_spaces;
     bool detach_processes_on_close = false;
     bool unpublished_launch = false;
+    std::shared_ptr<InteractionState> interaction;
+    std::unique_ptr<SessionEventCallbacks> events;
+    std::unique_ptr<SessionOutputCallbacks> output;
+    std::unique_ptr<SessionInputCallbacks> input;
+
+    void disable_interaction() {
+        if (interaction) {
+            std::lock_guard lock(interaction->control_mutex);
+            interaction->control = nullptr;
+            interaction->activity = 0;
+        }
+        if (client && interaction) {
+            client->SetEventCallbacks(nullptr);
+            client->SetOutputCallbacks(nullptr);
+            client->SetInputCallbacks(nullptr);
+        }
+    }
 
     ~DbgEngSession() {
+        disable_interaction();
         if (client) {
             if (unpublished_launch) client->TerminateProcesses();
             if (detach_processes_on_close) {
@@ -624,6 +646,21 @@ DbgEngSession* session_from_handle(DA_DbgEngSessionHandle* handle) {
     return reinterpret_cast<DbgEngSession*>(handle);
 }
 
+HRESULT execute_native(DbgEngSession& session, const char* command) {
+    bool canceled_before_entry = false;
+    if (session.interaction) {
+        std::lock_guard lock(session.interaction->control_mutex);
+        canceled_before_entry = session.interaction->activity == 1 && session.interaction->submitted;
+    }
+    const HRESULT hr = canceled_before_entry ? static_cast<HRESULT>(0xd000013a) :
+        session.control->Execute(DEBUG_OUTCTL_THIS_CLIENT, command, DEBUG_EXECUTE_DEFAULT);
+    if (session.interaction) {
+        std::lock_guard lock(session.interaction->control_mutex);
+        session.interaction->native_hresult = hr;
+    }
+    return hr;
+}
+
 int32_t execute_command(DbgEngSession& session, const char* command_utf8, DA_DbgEngTextView* out) {
     // Temporarily replace the output callback to capture this command only.
     // Always restore the previous callback before returning so later commands
@@ -643,7 +680,7 @@ int32_t execute_command(DbgEngSession& session, const char* command_utf8, DA_Dbg
         return fail_hr("IDebugClient::SetOutputCallbacks", hr);
     }
 
-    hr = session.control->Execute(DEBUG_OUTCTL_THIS_CLIENT, command_utf8, DEBUG_EXECUTE_DEFAULT);
+    hr = execute_native(session, command_utf8);
 
     const HRESULT restore_hr = session.client->SetOutputCallbacks(previous);
     if (previous != nullptr) {
@@ -695,8 +732,7 @@ int32_t execute_command_to_file(
             callback_installed = SUCCEEDED(set_hr);
         }
         if (callback_installed) {
-            execute_hr = session.control->Execute(
-                DEBUG_OUTCTL_THIS_CLIENT, command_utf8, DEBUG_EXECUTE_DEFAULT);
+            execute_hr = execute_native(session, command_utf8);
             restore_hr = session.client->SetOutputCallbacks(previous);
         }
     }
@@ -736,7 +772,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_abi_version(DA_DbgEngVersion* out) {
         out->struct_size = sizeof(DA_DbgEngVersion);
         out->flags = 0;
         out->abi_major = 0;
-        out->abi_minor = 5;
+        out->abi_minor = 6;
         out->abi_patch = 0;
         g_last_error.clear();
         return DA_DBGENG_OK;
@@ -1160,6 +1196,7 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_detach(DA_DbgEngSessionHandle* handle
 #ifdef _WIN32
         auto& session = *session_from_handle(handle);
         if (!session.client) return DA_DBGENG_OK;
+        session.disable_interaction();
         if (session.detach_processes_on_close) {
             ULONG status = 0;
             const bool no_debuggee = SUCCEEDED(session.control->GetExecutionStatus(&status)) &&
@@ -1190,5 +1227,163 @@ DA_DBGENG_EXPORT int32_t da_dbgeng_session_close(DA_DbgEngSessionHandle* handle)
 #endif
         g_last_error.clear();
         return DA_DBGENG_OK;
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_enable_interaction(
+    DA_DbgEngSessionHandle* handle, const char* path, DA_DbgEngControlHandle** out) {
+    return guard([&]() -> int32_t {
+        if (!handle || !path || !*path || !out) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "invalid interaction arguments");
+        *out = nullptr;
+#ifdef _WIN32
+        auto& session = *session_from_handle(handle);
+        if (session.interaction || !session.client) return fail(DA_DBGENG_ERR_BUSY, "interaction already configured or session closed");
+        auto state = std::make_shared<InteractionState>();
+        state->output = CreateFileW(utf8_to_wide(path).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+            nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (state->output == INVALID_HANDLE_VALUE) return fail_hr("CreateFile(session output)", HRESULT_FROM_WIN32(GetLastError()));
+        state->control = session.control.get();
+        auto events = std::make_unique<SessionEventCallbacks>(state);
+        auto output = std::make_unique<SessionOutputCallbacks>(state);
+        auto input = std::make_unique<SessionInputCallbacks>(state);
+        auto control = std::make_unique<InteractionHandle>();
+        control->state = state;
+        session.interaction = state;
+        session.events = std::move(events);
+        session.output = std::move(output);
+        session.input = std::move(input);
+        HRESULT hr = session.client->SetEventCallbacks(session.events.get());
+        if (SUCCEEDED(hr)) hr = session.client->SetOutputCallbacks(session.output.get());
+        if (SUCCEEDED(hr)) hr = session.client->SetInputCallbacks(session.input.get());
+        if (FAILED(hr)) { session.disable_interaction(); return fail_hr("install session callbacks", hr); }
+        *out = reinterpret_cast<DA_DbgEngControlHandle*>(control.release());
+        return DA_DBGENG_OK;
+#else
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_control_release(DA_DbgEngControlHandle* handle) {
+    return guard([&]() -> int32_t {
+#ifdef _WIN32
+        delete reinterpret_cast<InteractionHandle*>(handle);
+#else
+        (void)handle;
+#endif
+        return DA_DBGENG_OK;
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_control_interrupt(
+    DA_DbgEngControlHandle* handle, uint64_t epoch, uint32_t kind, int32_t* native_hr) {
+    return guard([&]() -> int32_t {
+        if (!handle || !native_hr || kind > 2) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "invalid interrupt arguments");
+        *native_hr = 0;
+#ifdef _WIN32
+        auto& state = *reinterpret_cast<InteractionHandle*>(handle)->state;
+        std::lock_guard lock(state.control_mutex);
+        if (!state.control || !state.activity || state.epoch != epoch)
+            return fail(DA_DBGENG_ERR_STALE_ACTIVITY, "activity finished, replaced or session closed");
+        if ((state.activity == 1 && kind != 1) || (state.activity == 2 && kind == 1))
+            return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "interrupt kind does not match activity");
+        if (kind == 2) state.exit_requested = true;
+        *native_hr = state.control->SetInterrupt(kind);
+        if (SUCCEEDED(*native_hr)) state.submitted = true;
+        return DA_DBGENG_OK;
+#else
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_begin_activity(
+    DA_DbgEngSessionHandle* handle, uint32_t kind, uint64_t* epoch) {
+    return guard([&]() -> int32_t {
+        if (!handle || !epoch || (kind != 1 && kind != 2)) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "invalid activity arguments");
+#ifdef _WIN32
+        auto shared = session_from_handle(handle)->interaction;
+        if (!shared) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "interaction not configured");
+        auto& state = *shared;
+        std::lock_guard lock(state.control_mutex);
+        if (!state.control || state.activity || state.epoch == UINT64_MAX) return fail(DA_DBGENG_ERR_BUSY, "activity unavailable");
+        *epoch = ++state.epoch;
+        state.activity = kind;
+        state.event_epoch.store(*epoch);
+        state.submitted = state.exit_requested = false;
+        state.native_hresult = S_OK;
+        return DA_DBGENG_OK;
+#else
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_end_activity(
+    DA_DbgEngSessionHandle* handle, uint64_t epoch, int32_t* native_hr) {
+    return guard([&]() -> int32_t {
+        if (!handle || !native_hr) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "invalid activity arguments");
+#ifdef _WIN32
+        auto shared = session_from_handle(handle)->interaction;
+        if (!shared) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "interaction not configured");
+        auto& state = *shared;
+        std::lock_guard lock(state.control_mutex);
+        if (!state.activity || state.epoch != epoch) return fail(DA_DBGENG_ERR_STALE_ACTIVITY, "stale activity");
+        *native_hr = state.native_hresult;
+        state.activity = 0;
+        state.event_epoch.store(0);
+        // Arbitrate completion and late requests before allowing another activity.
+        if (state.submitted && state.control) state.control->GetInterrupt();
+        return DA_DBGENG_OK;
+#else
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_session_wait_event(
+    DA_DbgEngSessionHandle* handle, uint64_t epoch, int32_t* native_hr) {
+    return guard([&]() -> int32_t {
+        if (!handle || !native_hr) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "invalid wait arguments");
+#ifdef _WIN32
+        auto& session = *session_from_handle(handle);
+        auto shared = session.interaction;
+        if (!shared) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "interaction not configured");
+        bool exit_requested;
+        {
+            std::lock_guard lock(shared->control_mutex);
+            if (shared->epoch != epoch || shared->activity != 2) return fail(DA_DBGENG_ERR_STALE_ACTIVITY, "stale wait");
+            exit_requested = shared->exit_requested;
+        }
+        // EXIT can race entry. Control caller retries E_PENDING for the same epoch.
+        *native_hr = exit_requested ? E_PENDING : session.control->WaitForEvent(0, INFINITE);
+        { std::lock_guard lock(shared->control_mutex); shared->native_hresult = *native_hr; }
+        return DA_DBGENG_OK;
+#else
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#endif
+    });
+}
+
+DA_DBGENG_EXPORT int32_t da_dbgeng_control_read_events(DA_DbgEngControlHandle* handle, DA_DbgEngEvents* out) {
+    return guard([&]() -> int32_t {
+        if (!handle || !out || out->struct_size < sizeof(*out)) return fail(DA_DBGENG_ERR_INVALID_ARGUMENT, "invalid events arguments");
+        out->data = nullptr; out->len = 0; out->owner = nullptr;
+#ifdef _WIN32
+        auto& state = *reinterpret_cast<InteractionHandle*>(handle)->state;
+        auto owner = std::make_unique<InteractionEventsOwner>();
+        std::lock_guard lock(state.events_mutex);
+        owner->events.reserve(state.events.size() + 1);
+        const auto gaps = state.dropped + state.allocation_gaps.exchange(0);
+        if (gaps) owner->events.push_back({state.events.empty() ? state.sequence : state.events.front().sequence - 1, 0, gaps, 6, 0});
+        owner->events.insert(owner->events.end(), state.events.begin(), state.events.end());
+        state.events.clear(); state.dropped = 0;
+        out->output_error = state.output_error;
+        out->output_byte_len = state.output_bytes;
+        out->data = owner->events.data(); out->len = owner->events.size(); out->owner = owner.release();
+        return DA_DBGENG_OK;
+#else
+        return fail(DA_DBGENG_ERR_INTERNAL, "DbgEng is only available on Windows");
+#endif
     });
 }

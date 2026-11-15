@@ -30,7 +30,7 @@
 
 迭代 2 实现环境/会话绑定、后端进程所有权、连接与执行责任分离，并让当前本机 debug、ETW 和 TTD 录制路径通过专用 worker 边界。允许最小必要的请求/响应调整，需同步 CLI、RPC/MCP、测试和文档，不强行保留本机 worker 字段作为平台概念。
 
-迭代 3 收敛原生 exec、长操作、事件读取及中断语义。等待超时只结束本次等待，不能隐含杀 worker；执行期限、显式取消和强制终止分别表达。具体 MCP 版本、Tasks 映射及客户端兼容策略在实际验证后确定，不声称当前已支持。
+迭代 3 采用 Session + Execution：session.exec 接受原生命令，execution.* 追踪执行与输出，session.get/read 观察现场和会话事件。等待超时只结束本次等待，不能隐含杀 worker；execution.cancel、session.interrupt 和 session.kill 分别表达取消执行、中断目标和强制清理。命名与接口契约见[执行交互方案](execution-interaction.md)；具体 MCP 版本、Tasks 映射及客户端兼容策略在实际验证后确定，不声称当前已支持。
 
 迭代 5 实现远端 transport、连接身份、断线核对和文件回收。操作重试需先核对执行结果，不承诺跨崩溃的 exactly-once；结果无法确认时保留未知。迭代 2 的接口可表达远端，不等于已经完成远端验证。
 
@@ -40,7 +40,7 @@
 
 此抽象没有完整的会话连接、进程所有权和异步中断契约；不能直接升级成覆盖所有后端的大接口。现有调试链路主要由 `ServiceHost`、`WorkerSupervisor` 与 worker 消息执行，不是全部经过 `Core::invoke()`。
 
-现有 worker protocol v7 是内部本机 JSONL 协议，包含 `StartDebugSession`、`EvalDebugCommand` 等请求及本机 `artifact_dir`。它可以作为本地实现材料，但不能直接视为最终跨机器协议。
+现有 worker protocol v8 是内部本机 JSONL 协议，包含 `StartDebugSession`、`EvalDebugCommand` 等请求及本机 `artifact_dir`。它可以作为本地实现材料，但不能直接视为最终跨机器协议。
 
 旧文档“第一版不设计 session trait/streaming callback”只反映早期短调用范围，不再限制当前环境、会话和进程架构调整。仍不引入与已实现路径无关的大型事件总线、插件系统或统一命令语言。
 
