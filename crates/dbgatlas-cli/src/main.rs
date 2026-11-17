@@ -108,6 +108,10 @@ enum ServiceCommand {
     Run {
         #[arg(long, default_value = "127.0.0.1:7331")]
         bind: SocketAddr,
+        #[arg(long, default_value = "127.0.0.1:7332")]
+        management_bind: SocketAddr,
+        #[arg(long)]
+        no_management: bool,
         #[arg(long, hide = true)]
         windows_service: bool,
         #[arg(long, hide = true)]
@@ -491,6 +495,8 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
     match command {
         ServiceCommand::Run {
             bind,
+            management_bind,
+            no_management,
             windows_service,
             install_root,
             config,
@@ -518,8 +524,15 @@ fn run_service(command: ServiceCommand, as_json: bool) -> Result<()> {
                     config.bind
                 );
                 println!("DbgAtlas MCP listening on http://{}/mcp", config.bind);
+                if !no_management {
+                    println!("DbgAtlas management listening on http://{management_bind}/");
+                }
             }
-            run_http_service(config, ServiceHost::with_process_workers()?)?;
+            run_http_service(
+                config,
+                ServiceHost::with_process_workers()?
+                    .with_management_bind((!no_management).then_some(management_bind)),
+            )?;
         }
         ServiceCommand::Health { endpoint } => {
             let response = call_service(endpoint, "service.health", json!({}))?;

@@ -1871,9 +1871,16 @@ pub(super) mod windows_service_control {
         append_service_log(&format!("reported running on {}", config.bind));
         let result = run_http_service_until(
             config,
-            ServiceHost::with_installed_process_workers()?.with_capabilities(
-                ServiceCapabilities::from_runtime_config_with_install_paths(&runtime, &paths),
-            ),
+            ServiceHost::with_installed_process_workers()?
+                .with_management_bind(
+                    runtime
+                        .server
+                        .management_enabled
+                        .then_some(runtime.server.management_bind),
+                )
+                .with_capabilities(ServiceCapabilities::from_runtime_config_with_install_paths(
+                    &runtime, &paths,
+                )),
             shutdown,
         );
         set_status(&status_handle, ServiceState::Stopped)?;

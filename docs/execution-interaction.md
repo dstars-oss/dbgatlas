@@ -235,7 +235,7 @@ flowchart LR
 - `debug.eval` 作为过渡 RPC/CLI 别名委托新执行路径，3D 已在默认 MCP 列表和 CLI 主帮助中隐藏旧调试入口；3C 已移除超时杀 worker 路径。旧 `timeout_ms` 显式拒绝并指引 wait_ms，不静默赋予相反语义。CLI 原样发送单条原生命令，不拆分、不自动重试、不自动轮询；`--json` 保留响应信封，动作 failed/unknown 或 RPC 错误返回非零，观察失败执行的查询本身仍成功。
 - `debug.eval_steps` 保留为兼容入口，批次及各步均记录为 Execution，步骤关联 parent_execution_id；复用新执行协调器，不新增另一套核心批处理命名。每步确认为结束且引擎可接受普通命令后才继续；遇到目标运行、unknown、取消或关闭停止后续步骤并返回未执行索引，不隐含等待未来断点后自动执行剩余命令。continue_on_error 只适用于已知失败且会话仍可用。
 - modules/threads/stack/add_symbols 等兼容入口委托同一准入/执行实现，不能绕过事件、输出及协作取消；二进制 read_memory 保留受控输出能力。
-- operation.stream 作为过渡读取入口委托 execution.read，更新描述；不继续无界回传整个数组。session.read 承载独立会话事件，不把旧 operation.stream 的返回误当会话完整历史。流式游标和 execution.get/read 的跨服务重启恢复仍由迭代 4 实现；execution.list 延续已有持久化列表读取能力。
+- operation.stream 作为过渡读取入口委托 execution.read，更新描述；不继续无界回传整个数组。session.read 承载独立会话事件，不把旧 operation.stream 的返回误当会话完整历史。迭代 4 优先提供显式工作区范围内的历史查询与文件读取；旧流式游标跨服务重启续读不作为 MVP 前置条件。execution.list 延续已有持久化列表读取能力。
 - 公共模型统一为 Execution，复用现有 OperationDetails 的事实字段和 update_seq 机制；旧 Operation* 类型及 capability 等字段通过明确适配逐步迁移，不能误把已有 ExecutionContext（上下文快照）当执行实例。新 Execution 的动作字段为 action，输入与输出分开；schema_version 和缺省读取规则同步维护。
 - 旧 operations.jsonl 文件名、标识值、Artifact 引用和原始记录保留可读，不因命名调整移动文件或改写历史验收记录。旧 capability 可映射到已知 action，无法映射时保留原值及来源；缺失的会话或产物归属为未知，不补造事实。API 兼容层对 recording.* 返回的旧 operation 引用也指向同一 Execution，录制流程本身不重写。
 

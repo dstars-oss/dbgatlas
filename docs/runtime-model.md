@@ -8,7 +8,7 @@ DbgAtlas 区分 analysis workspace 和 runtime install/config。workspace 保存
 - 后端环境解析其工具、PID、工作目录和本地文件，控制端保存关联与逻辑输出引用。远端环境的路径不能通过控制端 PathBuf 直接验证或打开。
 - 后端进程所在环境与目标环境可以不同，例如本机调试器连接远程内核；本机/远端连接不决定目标语义。
 - 本机 LocalSystem、active interactive user、SCM、named pipe 和安装 runtime 路径属于 Windows 执行实现，不作为所有平台的环境协议。
-- 迭代 2 建立归属和接口边界，迭代 5 才实现远端连接/部署；不提前新增远端地址、凭据或 VM 快照配置。
+- 迭代 2 建立归属和接口边界，迭代 6 才实现远端连接/部署；不提前新增远端地址、凭据或 VM 快照配置。
 
 ## 当前本机实现
 
@@ -38,6 +38,7 @@ analysis-workspace/
 - `process.elevate_if_admin`
 - `proxy`
 - `server.bind`
+- `server.management_bind`（默认 `127.0.0.1:7332`）与 `server.management_enabled`（默认 true）；[管理页面](management-ui.md)使用独立 loopback listener。
 
 安装态 Windows service 默认使用 machine-wide Program Files 下的 install root；安装器或提权脚本应复用 service 命令默认行为，只有自定义目录时才传入 `--install-root`：
 

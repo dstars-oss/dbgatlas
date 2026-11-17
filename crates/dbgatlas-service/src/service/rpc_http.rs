@@ -602,74 +602,100 @@ pub fn run_http_service_until(
     shutdown: ServiceShutdown,
 ) -> Result<(), ServiceError> {
     validate_config(&config)?;
+    if let Some(bind) = host.management_bind {
+        if !bind.ip().is_loopback() {
+            return Err(ServiceError::NonLoopbackBind(bind));
+        }
+        if bind == config.bind && bind.port() != 0 {
+            return Err(ServiceError::Rpc(
+                "management and RPC listeners require separate ports".into(),
+            ));
+        }
+    }
     let listener = TcpListener::bind(config.bind)?;
     listener.set_nonblocking(true)?;
+    let management = host.management_bind.map(TcpListener::bind).transpose()?;
+    if let Some(listener) = &management {
+        listener.set_nonblocking(true)?;
+        append_service_diagnostic_log(&format!("management_start bind={}", listener.local_addr()?));
+    }
     append_service_diagnostic_log(&format!(
         "http_service_start bind={}",
         sanitize_log_value(&config.bind.to_string())
     ));
     while !shutdown.is_stopping() {
-        let (mut stream, peer_addr) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        // On Windows an accepted socket can inherit the listener's nonblocking
-        // mode. Request handlers use blocking reads, so restore blocking mode
-        // before handing the stream to a worker thread.
-        if let Err(error) = stream.set_nonblocking(false) {
-            append_http_diagnostic_log(
-                "configure_stream",
-                &DiagnosticContext {
-                    remote_addr: Some(peer_addr.to_string()),
-                    ..Default::default()
-                },
-                &error.to_string(),
-            );
-            continue;
-        }
-        let host = host.clone();
-        shutdown.handler_started();
-        let handler_shutdown = shutdown.clone();
-        std::thread::spawn(move || {
-            let _handler_guard = HttpHandlerGuard(handler_shutdown);
-            let response_result = handle_http_stream(&mut stream, &host, Some(peer_addr));
-            let (response, write_stage) = match response_result {
-                Ok(response) => (response, "write_response"),
-                Err(error) => match http_json_response(
-                    http_status_for(&error),
-                    &JsonRpcResponse::error(None, rpc_error_for(error)),
-                ) {
-                    Ok(response) => (response, "write_error_response"),
-                    Err(error) => {
-                        if let Err(write_error) = stream.write_all(error.to_string().as_bytes()) {
-                            append_http_diagnostic_log(
-                                "write_error_response",
-                                &DiagnosticContext {
-                                    remote_addr: Some(peer_addr.to_string()),
-                                    ..Default::default()
-                                },
-                                &write_error.to_string(),
-                            );
-                        }
-                        return;
-                    }
-                },
+        let mut accepted_any = false;
+        for (listener, is_management) in std::iter::once((&listener, false))
+            .chain(management.as_ref().map(|listener| (listener, true)))
+        {
+            let (mut stream, peer_addr) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error.into()),
             };
-            if let Err(error) = stream.write_all(response.as_bytes()) {
+            accepted_any = true;
+            // On Windows an accepted socket can inherit the listener's nonblocking
+            // mode. Request handlers use blocking reads, so restore blocking mode
+            // before handing the stream to a worker thread.
+            if let Err(error) = stream.set_nonblocking(false) {
                 append_http_diagnostic_log(
-                    write_stage,
+                    "configure_stream",
                     &DiagnosticContext {
                         remote_addr: Some(peer_addr.to_string()),
                         ..Default::default()
                     },
                     &error.to_string(),
                 );
+                continue;
             }
-        });
+            let host = host.clone();
+            shutdown.handler_started();
+            let handler_shutdown = shutdown.clone();
+            std::thread::spawn(move || {
+                let _handler_guard = HttpHandlerGuard(handler_shutdown);
+                let response_result = if is_management {
+                    management::handle_stream(&mut stream, &host)
+                } else {
+                    handle_http_stream(&mut stream, &host, Some(peer_addr))
+                };
+                let (response, write_stage) = match response_result {
+                    Ok(response) => (response, "write_response"),
+                    Err(error) => match http_json_response(
+                        http_status_for(&error),
+                        &JsonRpcResponse::error(None, rpc_error_for(error)),
+                    ) {
+                        Ok(response) => (response, "write_error_response"),
+                        Err(error) => {
+                            if let Err(write_error) = stream.write_all(error.to_string().as_bytes())
+                            {
+                                append_http_diagnostic_log(
+                                    "write_error_response",
+                                    &DiagnosticContext {
+                                        remote_addr: Some(peer_addr.to_string()),
+                                        ..Default::default()
+                                    },
+                                    &write_error.to_string(),
+                                );
+                            }
+                            return;
+                        }
+                    },
+                };
+                if let Err(error) = stream.write_all(response.as_bytes()) {
+                    append_http_diagnostic_log(
+                        write_stage,
+                        &DiagnosticContext {
+                            remote_addr: Some(peer_addr.to_string()),
+                            ..Default::default()
+                        },
+                        &error.to_string(),
+                    );
+                }
+            });
+        }
+        if !accepted_any {
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
     append_service_diagnostic_log(&format!(
         "http_service_stop bind={}",
@@ -813,6 +839,13 @@ pub(super) fn handle_http_stream(
 }
 
 pub(super) fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ServiceError> {
+    read_http_request_bounded(stream, usize::MAX)
+}
+
+pub(super) fn read_http_request_bounded(
+    stream: &mut TcpStream,
+    body_limit: usize,
+) -> Result<HttpRequest, ServiceError> {
     let mut buffer = Vec::new();
     let mut header_end = None;
     loop {
@@ -862,6 +895,11 @@ pub(super) fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, S
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    if content_len > body_limit {
+        return Err(ServiceError::InvalidHttpRequest(
+            "request body is too large".into(),
+        ));
+    }
     let mut body = buffer[header_end..].to_vec();
     while body.len() < content_len {
         let mut chunk = vec![0u8; content_len - body.len()];

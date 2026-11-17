@@ -59,7 +59,7 @@ with socket.socket() as listener:
     port = listener.getsockname()[1]
 log = (run/'service.log').open('w')
 environment = dict(os.environ, _NT_SYMBOL_PATH=str(fixture), _NT_ALT_SYMBOL_PATH=str(fixture))
-invocation = [str(args.binary.resolve()), 'service', 'run', '--bind', f'127.0.0.1:{port}']
+invocation = [str(args.binary.resolve()), 'service', 'run', '--bind', f'127.0.0.1:{port}', '--no-management']
 if args.runtime:
     invocation = [str(args.binary.resolve().parent/'examples/interaction-host.exe'), '--bind', f'127.0.0.1:{port}', '--worker', str(args.binary.resolve().parent/'dbgatlas-worker.exe'), '--dbgeng', str(args.runtime.resolve())]
 service = subprocess.Popen(invocation, env=environment, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)

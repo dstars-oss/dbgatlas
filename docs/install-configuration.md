@@ -8,6 +8,7 @@
 - 安装形态：MSI 安装包，或从 `target\release` payload 注册 Windows service。
 - 默认安装根：`%ProgramFiles%\DbgAtlas`。
 - 默认监听地址：`127.0.0.1:7331`。
+- 独立管理页面默认监听 `127.0.0.1:7332`，浏览器访问 `http://localhost:7332/`；配置与关闭方式见[管理页面说明](management-ui.md)。
 - 服务启动类型：自动启动（`AUTO_START`），Windows 启动时由 SCM 启动，不依赖用户登录。MSI、安装脚本和 `service install --force` 均设置此默认值。
 - HTTP endpoint：
   - JSON-RPC：`http://127.0.0.1:7331/rpc`

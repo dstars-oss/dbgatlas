@@ -62,7 +62,7 @@ analysis-workspace/
 - 环境是执行和目标定位上下文，区分控制端、后端环境和目标环境；本机提供默认环境。环境不等于 VM 管理，PID 和路径必须有归属。
 - 会话绑定调试上下文及目标，不能等同于 worker PID 或客户端连接。同一目标的历史可共享，但不同会话的线程、栈帧和回放位置独立。
 - 区分平台创建的后端、接入的既有后端及目标进程所有权；关闭、失联和服务退出按明确策略处置，不默认终止非平台所有的进程。
-- 迭代 2 调整环境/会话模型和进程架构，不能仅抽取 WorkerSupervisor 接口；最小必要的 API/schema 调整应同步调用方、测试和文档。原生 exec/长操作交互在迭代 3 深化，远端传输在迭代 5 实现。
+- 迭代 2 调整环境/会话模型和进程架构，不能仅抽取 WorkerSupervisor 接口；最小必要的 API/schema 调整应同步调用方、测试和文档。原生 exec/长操作交互在迭代 3 深化，远端传输在迭代 6 实现。
 - DbgEng、ETW 和 TTD 录制均由会话专用主 worker 承载；TTD recorder 和清理 helper 是辅助进程。活动期间不得替换或复用主 worker。详细规格见 `docs/environment-session-model.md` 和 `docs/worker-model.md`。
 
 ## 开发语言
@@ -131,6 +131,8 @@ Rust/C++ 边界不通过中心化 FFI `protocol` 模块定义。每个 native ad
 ## 当前运行入口约定
 
 `dbgatlas service` 是当前安装态和开发态的主入口。它在同一个 loopback HTTP listener 上暴露两个 endpoint：`/rpc` 是 DbgAtlas 自有 JSON-RPC API，`/mcp` 是 Codex 等 MCP 客户端使用的 HTTP MCP endpoint。项目不再维护独立的 stdio MCP server 或 `dbgatlas-mcp` crate。
+
+管理页面使用独立 loopback listener，默认 `127.0.0.1:7332`，与 RPC/MCP 的 `7331` 分离。迭代 4、5 并行推进；M1 管理页只读查询既有 workspace，后续 SQLite 保存结构化会话/操作记录，完整输出继续保留文件。页面复用服务与 Workspace 能力，不提供通用 RPC 转发。详见 `docs/management-ui.md`。
 
 `/rpc` 和 `/mcp` 不使用认证，信任本机调用者；二者共享 loopback bind 限制和浏览器类客户端的 `Origin` 校验。这些限制不提供本机用户或进程隔离。Codex 项目配置可放在本地 `.codex/config.toml`，但 `.codex/` 应保持 ignored，不提交。
 

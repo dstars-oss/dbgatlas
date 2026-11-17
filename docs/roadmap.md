@@ -7,6 +7,7 @@
 | Area | Current implementation | Owning source |
 | --- | --- | --- |
 | Entry points | One loopback listener exposes /rpc and /mcp, without authentication; browser Origin checks remain | [rpc_http.rs](../crates/dbgatlas-service/src/service/rpc_http.rs) |
+| Management UI | Separate loopback listener (default 7332), read-only workspace/session/operation views and bounded Artifact text reads; embedded assets | [management.rs](../crates/dbgatlas-service/src/service/management.rs), [UI scope](management-ui.md) |
 | API inventory | One method registry supplies RPC routes and MCP tools | [method_registry.rs](../crates/dbgatlas-service/src/method_registry.rs) |
 | Sessions and executions | Service-owned accepted tasks, finite waits, same-instance deduplication, canonical session.* / execution.* with legacy aliases | [execution.rs](../crates/dbgatlas-service/src/service/execution.rs) |
 | Debug execution | Per-session engine owner, named-pipe JSONL v9 response/event dispatch and independent control pipe; epoch-checked interrupt/cancel, file/launch targets and explicit invasive/noninvasive attach | [worker protocol](../crates/dbgatlas-worker-protocol/src/lib.rs), [host_debug.rs](../crates/dbgatlas-service/src/service/host_debug.rs) |
@@ -40,7 +41,7 @@ Real Codex app-server MCP calls cover discovery, short/long commands, output rea
 
 Execution get/read and retry keys retain only this service instance's runtime association. `execution.list` reads persisted facts and projects old unfinished records as unknown; this does not restore a debugger after restart. Internal Operation types and JSONL names are retained for compatibility.
 
-SQLite history, remote backend transport, stable cross-session target matching, a Linux backend and a management page remain planned. Raw command access does not by itself establish a supported kernel or remote debugging lifecycle.
+The management MVP reads existing JSONL/session metadata, merges current service facts and reads full output from files. SQLite metadata, remote backend transport, stable cross-session target matching and a Linux backend remain planned. Raw command access does not by itself establish a supported kernel or remote debugging lifecycle.
 
 ## Validation evidence
 
@@ -53,4 +54,6 @@ Iteration 2 evidence and explicit untested paths are recorded in [iteration-2-va
 
 3C implementation and validation evidence are recorded in [iteration-3c-validation.md](iteration-3c-validation.md); installed-service acceptance remains explicitly separate.
 
-[3D validation](iteration-3d-validation.md) records protocol/CLI tests, real client calls and release regressions. [Iteration 3 acceptance](iteration-3-validation.md) separates completed local checks from the missing installed-service/MCP prerequisite.
+[3D validation](iteration-3d-validation.md) records protocol/CLI tests, real client calls and release regressions. [Installed-service validation](iteration-3-installed-validation.md) closes the installation prerequisite on 2026-11-16: MSVC release, connected MCP update/restart/health, matching payload hashes and eight installed MCP smoke groups passed. [Iteration 3 acceptance](iteration-3-validation.md) separates these checks from the remaining untested scenarios.
+
+[Management MVP validation](management-mvp-validation.md) records 168 relevant tests, release/install checks, connected MCP records, historical file reads and six real headless-browser checks on 2026-11-17. SQLite and large-workspace performance remain outside M1.

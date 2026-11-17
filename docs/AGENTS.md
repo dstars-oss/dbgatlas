@@ -9,7 +9,7 @@ Architecture documents must follow the current confirmed DbgAtlas direction.
 - Avoid specifying full GUI, full DbgEng wrapper, or complex serialization frameworks before the corresponding capability exists.
 
 - `architecture.md` and its linked topic documents own the design specification; root `PLAN.md` owns iteration scope and acceptance status; `roadmap.md` owns the current implementation baseline. Update them together when a decision changes, without duplicating an independent roadmap.
-- Iteration 2 restructures environments, sessions and process ownership, not merely a worker interface. Distinguish this model change from iteration 3 execution interaction and iteration 5 remote transport.
+- Iteration 2 restructures environments, sessions and process ownership, not merely a worker interface. Distinguish this model change from iteration 3 execution interaction and iteration 6 remote transport.
 - Verify current-code claims against owning sources. DbgEng, ETW and TTD recording use dedicated per-session workers; recorder and cleanup helpers are auxiliary processes. Verify changes and validation claims against their owning paths.
 - Distinguish target requirements, implemented behavior and runtime evidence. Preserve dated validation records as historical evidence. IDA static analysis is external; do not add IDA migration or retirement guides.
 - For documentation-only changes, check whitespace, relative links, renamed plan references and semantic consistency. Do not mark a feature accepted or redeploy the service because its specification was updated.

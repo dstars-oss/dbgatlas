@@ -306,6 +306,7 @@ pub enum ServiceError {
 
 #[derive(Clone)]
 pub struct ServiceHost {
+    management_bind: Option<SocketAddr>,
     service_instance: String,
     state: Arc<Mutex<ServiceState>>,
     supervisor: Arc<dyn WorkerSupervisor>,
@@ -330,6 +331,7 @@ use host_recording::RemoteRecording;
 mod execution;
 mod host_service;
 mod host_worker_ops;
+mod management;
 mod mcp_protocol;
 mod output_read;
 mod recording_executor;

@@ -32,7 +32,7 @@
 
 迭代 3 采用 Session + Execution：session.exec 接受原生命令，execution.* 追踪执行与输出，session.get/read 观察现场和会话事件。等待超时只结束本次等待，不能隐含杀 worker；execution.cancel、session.interrupt 和 session.kill 分别表达取消执行、中断目标和强制清理。命名与接口契约见[执行交互方案](execution-interaction.md)；具体 MCP 版本、Tasks 映射及客户端兼容策略在实际验证后确定，不声称当前已支持。
 
-迭代 5 实现远端 transport、连接身份、断线核对和文件回收。操作重试需先核对执行结果，不承诺跨崩溃的 exactly-once；结果无法确认时保留未知。迭代 2 的接口可表达远端，不等于已经完成远端验证。
+迭代 6 实现远端 transport、连接身份、断线核对和文件回收。操作重试需先核对执行结果，不承诺跨崩溃的 exactly-once；结果无法确认时保留未知。迭代 2 的接口可表达远端，不等于已经完成远端验证。
 
 ## 当前实现及限制
 

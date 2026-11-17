@@ -67,6 +67,11 @@ impl RuntimeConfig {
         if !self.server.bind.ip().is_loopback() {
             return Err(RuntimeConfigError::NonLoopbackBind(self.server.bind));
         }
+        if !self.server.management_bind.ip().is_loopback() {
+            return Err(RuntimeConfigError::NonLoopbackBind(
+                self.server.management_bind,
+            ));
+        }
         self.tools.validate()?;
         self.proxy.validate()?;
         Ok(())
@@ -103,12 +108,26 @@ impl Default for RuntimeConfig {
 pub struct ServerRuntimeConfig {
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
+    #[serde(default = "default_management_bind")]
+    pub management_bind: SocketAddr,
+    #[serde(default = "management_enabled")]
+    pub management_enabled: bool,
+}
+
+fn default_management_bind() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 7332))
+}
+
+fn management_enabled() -> bool {
+    true
 }
 
 impl Default for ServerRuntimeConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            management_bind: default_management_bind(),
+            management_enabled: true,
         }
     }
 }
@@ -577,6 +596,27 @@ bind = "0.0.0.0:7331"
         .unwrap_err();
 
         assert!(matches!(error, RuntimeConfigError::NonLoopbackBind(_)));
+    }
+
+    #[test]
+    fn management_config_defaults_and_local_boundary() {
+        let old =
+            RuntimeConfig::from_toml_str("version = 1\n[server]\nbind = '127.0.0.1:7331'").unwrap();
+        assert_eq!(
+            old.server.management_bind,
+            "127.0.0.1:7332".parse().unwrap()
+        );
+        assert!(old.server.management_enabled);
+        let disabled = RuntimeConfig::from_toml_str(
+            "version = 1\n[server]\nmanagement_enabled = false\nmanagement_bind = '127.0.0.1:7442'",
+        )
+        .unwrap();
+        assert!(!disabled.server.management_enabled);
+        assert_eq!(disabled.server.management_bind.port(), 7442);
+        assert!(
+            RuntimeConfig::from_toml_str("version = 1\n[server]\nmanagement_bind = '0.0.0.0:7332'")
+                .is_err()
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::thread;
 impl ServiceHost {
     pub fn new(supervisor: Arc<dyn WorkerSupervisor>) -> Self {
         Self {
+            management_bind: None,
             service_instance: format!(
                 "service-{}-{}",
                 std::process::id(),
@@ -23,6 +24,12 @@ impl ServiceHost {
 
     pub fn with_mock_workers() -> Self {
         Self::new(Arc::new(MockWorkerSupervisor::new()))
+    }
+
+    /// Enable the separate, loopback-only management listener.
+    pub fn with_management_bind(mut self, bind: Option<SocketAddr>) -> Self {
+        self.management_bind = bind;
+        self
     }
 
     pub fn with_process_workers() -> Result<Self, ServiceError> {

@@ -137,7 +137,7 @@ try:
     with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
     service_log=(run/'service.log').open('w')
     environment=dict(os.environ,_NT_SYMBOL_PATH=str(fixture),_NT_ALT_SYMBOL_PATH=str(fixture))
-    service=subprocess.Popen([str(binary),'service','run','--bind',f'127.0.0.1:{port}'],stdout=service_log,stderr=subprocess.STDOUT,env=environment,creationflags=subprocess.CREATE_NO_WINDOW)
+    service=subprocess.Popen([str(binary),'service','run','--bind',f'127.0.0.1:{port}','--no-management'],stdout=service_log,stderr=subprocess.STDOUT,env=environment,creationflags=subprocess.CREATE_NO_WINDOW)
     for _ in range(100):
         try:rpc('service.health');break
         except Exception:time.sleep(.05)

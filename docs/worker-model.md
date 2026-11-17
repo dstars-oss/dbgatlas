@@ -60,4 +60,4 @@ CPU sampling 和 TTD 的并发额度由控制服务统一管理，不能因多�
 
 目标运行时所有者持续 WaitForEvent(INFINITE)。关闭用 EXIT 唤醒；E_PENDING 后不查询线程/栈帧，也不将引擎 BREAK 当成目标停止，随后 detach。异步输出写 session-output.log，缓存事件有界并记录 gap，事件与 HRESULT 分别留在 engine-events.jsonl / engine-results.jsonl；3C 的 execution.read / session.read 已提供有界公共游标读取。
 
-当前 debug 显式执行超时仍可能杀 worker，并使会话失败、原操作结果 unknown；这不是“只停止本次等待”。远端传输在迭代 5 实现；本轮不承诺服务重启恢复现场、worker 池、迁移或真实既有调试器接入。
+当前 debug 显式执行超时仍可能杀 worker，并使会话失败、原操作结果 unknown；这不是“只停止本次等待”。远端传输在迭代 6 实现；本轮不承诺服务重启恢复现场、worker 池、迁移或真实既有调试器接入。

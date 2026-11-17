@@ -1,8 +1,8 @@
 # DbgAtlas
 
-DbgAtlas is an AI-oriented debugging platform. AI clients use native debugger commands with session management, state, and recorded outputs. Windows debugging and recording use dedicated session workers and service-owned executions; remote backends, persistent searchable history, Linux, and a management UI follow [PLAN.md](PLAN.md).
+DbgAtlas is an AI-oriented debugging platform. AI clients use native debugger commands with session management, state, and recorded outputs. Windows debugging and recording use dedicated session workers and service-owned executions. A local management UI browses real session records and output files; SQLite metadata, remote backends and Linux follow [PLAN.md](PLAN.md).
 
-The [architecture specification](docs/architecture.md) and [implementation baseline](docs/roadmap.md) describe the design and current code paths. Iteration 3 implements Session + Execution, bounded waits, reliable interruption, cursor-based output reads and Artifact provenance. MCP version negotiation, structured results and canonical CLI commands are implemented and locally validated with the real Codex client. Installed-service acceptance remains pending; see the [interaction contract](docs/execution-interaction.md) and [validation scope](docs/iteration-3-validation.md).
+The [architecture specification](docs/architecture.md) and [implementation baseline](docs/roadmap.md) describe the design and current code paths. Iteration 3 implements Session + Execution, bounded waits, reliable interruption, cursor-based output reads and Artifact provenance. MCP version negotiation, structured results and canonical CLI commands are implemented and locally validated with the real Codex client. Representative installed-service acceptance is complete; see the [interaction contract](docs/execution-interaction.md) and [validation scope](docs/iteration-3-validation.md).
 
 IDA static analysis belongs to external tools. DbgAtlas provides debugger-native symbols, types, disassembly, and memory inspection.
 
@@ -10,6 +10,7 @@ This repository contains the tool implementation. Real investigation data belong
 
 Current implementation includes:
 
+- A read-only management UI at **http://localhost:7332/**, on a separate loopback listener. Open an existing project directory to browse sessions, filter operations and inspect file outputs. See [management UI](docs/management-ui.md) for configuration and MVP limits.
 - A `0.4.0` service API with one method registry driving JSON-RPC dispatch and MCP tool schemas.
 - A Rust workspace split into `model`, `workspace`, `adapter`, `core`, `cli`, and a minimal `dbgeng` native wrapper.
 - Session/Execution API with terminal summaries, immutable execution context and versioned JSONL updates. Dedicated workers for DbgEng, ETW and TTD recording, using local named-pipe protocol v9; internal Operation records remain compatible.

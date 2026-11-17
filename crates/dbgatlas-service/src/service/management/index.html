@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DbgAtlas · 调试记录</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <aside class="rail">
+      <a class="brand" href="/" aria-label="DbgAtlas 首页"
+        ><span class="brand-icon">D<span>›</span></span
+        ><span>DbgAtlas<small>DEBUGGING WORKSPACE</small></span></a
+      >
+      <div class="rail-label">工作台</div>
+      <div class="nav-active"><span>▦</span> 调试记录</div>
+      <div class="rail-footer">
+        <span class="pulse"></span> 本机管理端<br /><small
+          >会话 · 操作 · 原始输出</small
+        >
+      </div>
+    </aside>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">WORKSPACE / ACTIVITY</div>
+          <h1>调试记录</h1>
+          <p>从会话追溯每一次操作，查看完整输出与产物来源。</p>
+        </div>
+        <div class="connection">
+          <span id="health-dot" class="dot"></span
+          ><span id="health">连接中</span><small id="version"></small>
+        </div>
+      </header>
+      <section class="workspace-bar" aria-label="选择工作区">
+        <form id="project-form">
+          <label for="project">项目目录</label>
+          <div class="project-row">
+            <input
+              id="project"
+              placeholder="例如 D:\Cases\case-001"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            /><button type="submit" id="open">
+              打开工作区 <span>↗</span>
+            </button>
+          </div>
+          <div class="project-hint">
+            选择包含 dbgatlas 工作区的项目目录。仅打开已有记录。
+          </div>
+        </form>
+        <div class="recent">
+          <label for="recent">最近 / 本次服务已知项目</label
+          ><select id="recent">
+            <option value="">选择项目…</option>
+          </select>
+        </div>
+      </section>
+      <div id="error" class="notice error" role="alert" hidden></div>
+      <div id="warning" class="notice" hidden></div>
+      <section class="metrics" aria-label="工作区概览">
+        <div>
+          <small>会话</small><strong id="session-count">—</strong
+          ><span>已留存的调试与采集会话</span>
+        </div>
+        <div>
+          <small>操作记录</small><strong id="operation-count">—</strong
+          ><span>输入、执行状态与上下文</span>
+        </div>
+        <div>
+          <small>文件产物</small><strong id="artifact-count">—</strong
+          ><span>完整输出保留在工作区文件中</span>
+        </div>
+      </section>
+      <section class="browser">
+        <aside class="sessions">
+          <div class="panel-title">
+            <h2>会话</h2>
+            <span id="session-total" class="count">0</span>
+          </div>
+          <button id="all-sessions" class="session-item selected">
+            全部会话
+          </button>
+          <div id="session-list">
+            <div class="empty small">打开工作区后，<br />在这里浏览会话。</div>
+          </div>
+        </aside>
+        <div class="records">
+          <div class="records-head">
+            <div>
+              <h2 id="records-title">操作记录</h2>
+              <span id="records-caption">选择项目，开始浏览</span>
+            </div>
+            <button id="refresh" class="secondary" disabled>↻ 刷新</button>
+          </div>
+          <div class="filters">
+            <label class="search"
+              ><span>⌕</span
+              ><input
+                id="search"
+                aria-label="搜索操作"
+                placeholder="搜索命令、操作 ID 或摘要" /></label
+            ><select id="status" aria-label="按状态筛选">
+              <option value="">所有状态</option>
+              <option value="success">成功</option>
+              <option value="running">运行中</option>
+              <option value="pending">等待中</option>
+              <option value="failed">失败</option>
+              <option value="canceled">已取消</option>
+              <option value="unknown">未知</option>
+            </select>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>操作 / 命令</th>
+                  <th>状态</th>
+                  <th>时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="operations"></tbody>
+            </table>
+            <div id="empty" class="empty">
+              <div class="empty-icon">⌘</div>
+              <h3>让调试过程清晰可见</h3>
+              <p>打开已有工作区，查看真实会话和原始输出。</p>
+            </div>
+          </div>
+          <footer class="pagination">
+            <span id="page-label">尚未选择工作区</span>
+            <div>
+              <button id="previous" class="secondary" disabled>← 上一页</button
+              ><button id="next" class="secondary" disabled>下一页 →</button>
+            </div>
+          </footer>
+        </div>
+      </section>
+      <section id="detail" class="detail" hidden aria-label="操作详情">
+        <div class="detail-head">
+          <div>
+            <div class="eyebrow">EXECUTION DETAIL</div>
+            <h2 id="detail-title"></h2>
+            <code id="detail-id"></code>
+          </div>
+          <button id="close-detail" class="secondary" aria-label="关闭详情">
+            关闭 ×
+          </button>
+        </div>
+        <div id="detail-summary" class="detail-summary"></div>
+        <div class="detail-grid">
+          <div>
+            <h3>输入命令</h3>
+            <pre id="command"></pre>
+            <details>
+              <summary>执行上下文与输入参数</summary>
+              <pre id="context"></pre>
+            </details>
+            <h3>关联产物</h3>
+            <div id="artifacts" class="artifact-list"></div>
+          </div>
+          <div class="output-panel">
+            <div class="output-head">
+              <h3>原始输出</h3>
+              <span id="output-meta"></span>
+            </div>
+            <pre id="output">选择产物查看内容</pre>
+            <div class="output-footer">
+              <span id="output-note"></span
+              ><button id="more" class="secondary" hidden>继续读取</button>
+            </div>
+          </div>
+        </div>
+      </section>
+      <footer class="page-footer">
+        <span>DbgAtlas / 本机调试工作台</span
+        ><span id="updated">记录来源：工作区</span>
+      </footer>
+    </main>
+  </body>
+</html>

@@ -159,6 +159,7 @@ fn cpu_test_host(mode: MockEtwMode) -> (ServiceHost, Arc<AtomicU64>) {
 mod execution;
 mod host;
 mod http;
+mod management;
 mod install;
 mod recording;
 

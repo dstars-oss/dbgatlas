@@ -6,11 +6,11 @@ DbgAtlas 面向 AI 提供原生调试命令执行、会话管理、状态查询�
 
 - 本文定义总体职责和依赖方向；[环境与会话模型](environment-session-model.md)定义环境、目标、会话及状态语义。
 - [后端执行边界](adapter-model.md)定义原生执行与后端契约；[进程与生命周期](worker-model.md)定义进程所有权和故障处理。
-- [原生执行与可靠交互](execution-interaction.md)细化迭代 3 的接口、执行侧改造和验收方案；[3A 原型验证](iteration-3a-validation.md)已收敛机制与协议，[3B 执行侧实现](iteration-3b-validation.md)、[3C 公共接口与有限等待](iteration-3c-validation.md)、[3D MCP/CLI 收敛](iteration-3d-validation.md)已完成本机验证；安装态验收仍缺前置环境，完整范围见[迭代 3 验证记录](iteration-3-validation.md)。
+- [原生执行与可靠交互](execution-interaction.md)细化迭代 3 的接口、执行侧改造和验收方案；[3A 原型验证](iteration-3a-validation.md)已收敛机制与协议，[3B 执行侧实现](iteration-3b-validation.md)、[3C 公共接口与有限等待](iteration-3c-validation.md)、[3D MCP/CLI 收敛](iteration-3d-validation.md)已完成本机验证；代表性安装态验收已于 2026-11-16 补齐，完整范围见[迭代 3 验证记录](iteration-3-validation.md)。
 - [运行时模型](runtime-model.md)、[工作区模型](workspace-model.md)、[录制模型](recording-model.md)分别维护部署、持久化和采集规格。
 - [PLAN.md](../PLAN.md)只负责实施顺序、验收和进度；[当前实现基线](roadmap.md)描述已存在的代码路径。验证记录是对应提交的历史证据，不是后续功能的验收证明。
 
-以下目标架构尚未全部实现。迭代 2 的重点是环境、会话和进程架构，迭代 3 才收敛 AI 执行交互，迭代 5 才实现远端传输。不要把目标图中的连线当成当前可调用能力。
+以下目标架构尚未全部实现。迭代 2 的重点是环境、会话和进程架构，迭代 3 才收敛 AI 执行交互，迭代 6 才实现远端传输。不要把目标图中的连线当成当前可调用能力。
 
 ## 目标职责分层
 
@@ -55,7 +55,7 @@ flowchart TB
 
 Artifact 是 Session/Execution 引用的材料：工具产物记录 producer_session_id，可确认时补充 producer_execution_id；外部输入无虚构 producer。身份与文件由 workspace 保管，后续会话可以引用同一材料，关闭会话不删除或改变其来源。该关系不要求物理汇聚多会话产物或引入第三个业务控制中心。
 
-历史归入显式 analysis workspace。当前使用 JSONL 和产物文件；迭代 4 引入本地 SQLite，迭代 6 完善稳定目标身份与跨会话检索。迭代 2 只建立关联位置和运行实例边界，不提前实现内容寻址、SQLite 表结构或自动结果缓存。
+历史归入显式 analysis workspace。当前使用 JSONL 和产物文件；迭代 4 与迭代 5 管理页面并行，M1 已通过独立本机管理端口展示真实记录，后续引入 SQLite 保存结构化记录、完整输出继续留在文件；迭代 7 完善稳定目标身份与跨会话检索。迭代 2 只建立关联位置和运行实例边界，不提前实现内容寻址、SQLite 表结构或自动结果缓存。
 
 工作区逻辑输出引用与执行侧文件位置分开。本机可由边界内的实现直接写受控目录；未来远端产物需要明确取回或远端引用状态，不能把远端绝对路径当成本机可读路径。
 
@@ -78,8 +78,10 @@ CLI、MCP 和管理页面必须复用平台业务实现。这里的控制层是�
 
 1. 迭代 2 建立环境/会话模型与进程执行边界，本机路径完整运行。允许为表达新模型作最小必要 API/schema 调整，不要求保留把 worker 当会话的假设。
 2. 迭代 3 明确命令等待、中断和长操作交互；不得将现有超时杀 worker 行为描述为目标规格。
-3. 迭代 4/6 依次实现历史存储和跨会话关联；历史保留不等于调试器进程可恢复。
-4. 迭代 5 实现远端连接、身份与结果核对；环境模型的存在不代表远端已可用。
+3. 迭代 4/7 依次实现历史存储和跨会话关联；历史保留不等于调试器进程可恢复。
+4. 迭代 6 实现远端连接、身份与结果核对；环境模型的存在不代表远端已可用。
 5. GDB、官方 DbgX MCP 等接入方案按实际能力验证选择，不强制所有后端使用 C++ DLL，不预先替换现有 DbgEng。
 
 当前 `/rpc` 和 `/mcp` 保持无认证的 loopback 服务，并校验浏览器 `Origin`。未来远端后端通道独立设计，不能直接放宽当前 listener 来代替。安装与验证命令见[安装配置](install-configuration.md)及根目录 AGENTS.md。
+
+管理页面通过独立 loopback listener 提供只读查询，默认 `127.0.0.1:7332`；复用服务已知状态与 Workspace 文件记录，不转发通用 RPC。迭代 4/5 的共同 MVP 先使用真实 JSONL，SQLite 元数据迁移与页面完善按共同里程碑推进，完整输出文件保留。范围见[管理页面说明](management-ui.md)。
