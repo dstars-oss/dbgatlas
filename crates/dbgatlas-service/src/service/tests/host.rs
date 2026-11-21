@@ -195,7 +195,9 @@ fn failed_session_create_is_recorded_as_failed_operation() {
     let response = create_debug_session(&host, temp.path());
 
     assert!(response.error.is_some());
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let operations = workspace.list_operations().unwrap();
     let operation = operations
         .iter()
@@ -257,7 +259,9 @@ fn debug_eval_truncates_inline_output_and_keeps_raw_artifact() {
     assert!(result.get("output").is_none());
     assert!(result.get("output_truncated").is_none());
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let raw_ref: ArtifactRef = serde_json::from_value(result["raw_output_ref"].clone()).unwrap();
     let raw = workspace.get_artifact(&raw_ref).unwrap().unwrap();
     let raw_path = workspace
@@ -281,7 +285,9 @@ fn debug_eval_recovers_complete_artifact_after_transport_failure() {
     let eval = eval_request(&host, session_id, ".echo recovery");
     assert!(eval.error.is_some());
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let artifact = workspace
         .list_artifacts()
         .unwrap()
@@ -307,7 +313,9 @@ fn debug_eval_removes_partial_artifact_after_transport_failure() {
     let eval = eval_request(&host, session_id, ".echo partial-only");
     assert!(eval.error.is_some());
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     assert!(
         workspace
             .list_artifacts()
@@ -361,7 +369,9 @@ fn debug_eval_steps_runs_commands_in_order() {
             .contains(".exepath")
     );
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let operations = workspace.list_operations().unwrap();
     assert!(
         operations
@@ -460,7 +470,9 @@ fn debug_eval_artifact_registration_failure_finalizes_operation() {
             && operation.details.output_error.is_some()
     }));
     drop(state);
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     assert!(
         workspace
             .list_operations()
@@ -876,7 +888,9 @@ fn eval_registers_raw_output_and_transcript_artifacts() {
     assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 3);
     assert!(result["raw_output_ref"].get("id").is_some());
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let artifacts = workspace.list_artifacts().unwrap();
     assert!(
         artifacts
@@ -915,7 +929,9 @@ fn failed_eval_is_recorded_in_command_audit() {
     });
     assert!(eval.error.is_some());
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let audit = workspace.list_command_audit().unwrap();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].command, ".echo fails");
@@ -978,7 +994,9 @@ fn add_symbols_uses_distinct_operation_capability() {
     });
     assert!(response.error.is_none(), "{:?}", response.error);
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let operations = workspace.list_operations().unwrap();
     assert!(
         operations
@@ -1214,7 +1232,9 @@ fn read_memory_registers_memory_artifact() {
     assert_eq!(result["operation_status"], "success");
     assert!(result["memory_ref"].get("id").is_some());
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let artifacts = workspace.list_artifacts().unwrap();
     assert!(
         artifacts
@@ -1253,7 +1273,9 @@ fn session_summary_binding_terminal_history_and_operation_context_are_stable() {
         .result
         .unwrap();
     let op: OperationRef = serde_json::from_value(eval["operation_id"].clone()).unwrap();
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let before = workspace.get_operation(&op).unwrap().unwrap();
     assert!(before.details.input.is_some());
     assert!(

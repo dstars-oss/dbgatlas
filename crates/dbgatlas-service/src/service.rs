@@ -18,10 +18,9 @@ use dbgatlas_worker_protocol::{
     WorkerResponse, decode_jsonl, encode_jsonl, write_atomic_bytes,
 };
 use dbgatlas_workspace::{
-    ArtifactMetadata, CommandAuditRecord, OperationRecord, OperationStatus, Workspace,
-    WorkspaceError, WorkspaceFacts,
+    ArtifactMetadata, CommandAuditRecord, HistoryStore, OperationRecord, OperationStatus,
+    Workspace, WorkspaceError,
 };
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -91,10 +90,6 @@ pub const WINDOWS_SERVICE_REQUIRED_PAYLOAD_FILES: &[&str] = &[
 ];
 const TTD_COMMAND_HELPER_ERROR_PREFIX: &str = "dbgatlas TTD command helper error:";
 
-static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
-static RECORDING_COUNTER: AtomicU64 = AtomicU64::new(1);
-static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
-static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(1);
 static WORKER_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SERVICE_INSTALL_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -306,6 +301,7 @@ pub enum ServiceError {
 
 #[derive(Clone)]
 pub struct ServiceHost {
+    history: HistoryStore,
     management_bind: Option<SocketAddr>,
     service_instance: String,
     state: Arc<Mutex<ServiceState>>,
@@ -1363,7 +1359,6 @@ mod rpc_http;
 use rpc_http::*;
 
 mod workspace_query;
-use workspace_query::*;
 
 mod service_util;
 use service_util::*;

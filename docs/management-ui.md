@@ -1,6 +1,6 @@
-# 本机管理页面 MVP
+# 本机管理页面
 
-管理页面是迭代 4（会话与操作记录）和迭代 5（可视化）的共同 M1。页面先接入真实 JSONL 和 session.json；SQLite 元数据存储与旧记录迁移属于 M2。完整输出继续保存在 workspace 文件中，Markdown 用于分析笔记和报告。
+管理页从服务中心库列出已登记项目及调试历史，并按产物引用读取项目文件。存储职责见[工作区模型](workspace-model.md)。
 
 ## 访问与配置
 
@@ -28,23 +28,23 @@ management_enabled = true
 
 ## 页面流程
 
-1. 输入项目目录，例如 `D:\Cases\case-001`，读取 `<project_root>\dbgatlas` 下的已有 workspace。页面不创建目录，也不扫描整块磁盘。最近项目保存在当前浏览器本地，选择器也包含本次服务已知项目。
-2. 浏览会话、操作与产物数量，按会话、状态或命令/ID/摘要文本筛选；操作列表每页 40 项。
-3. 打开操作详情，查看输入、执行上下文和产物引用。文本输出按最多 64 KiB 分段加载，保留 UTF-8 边界；二进制产物展示引用及路径，不尝试文本解码。
+1. 从已登记项目下拉框选择项目，或输入标准项目根目录。页面默认打开最近活动项目，并支持通过 URL 直接定位。
+2. 按会话、状态、命令、ID、摘要或创建时间范围筛选，默认每页 40 条。时间采用本地输入，查询使用毫秒时间戳和左闭右开区间。
+3. 打开操作详情，查看输入、上下文和执行历史。选择产物可查看生产者和引用会话。文本输出按最多 64 KiB 分段读取。
 4. 调试或采集后点击刷新。页面不自动发送调试命令或取消操作。
 
-原始输出作为文本显示，文件中的 HTML/Markdown 不执行。文件缺失显示读取错误，非法 UTF-8 显示提示。历史非终态在缺少当前运行期操作时投影为 unknown；同实例已知结果优先于旧 JSONL，输出归档错误单独展示。关闭会话不删除其文件，重启服务后仍可显式打开历史 workspace。
+原始输出按文本显示。项目离线或文件缺失时仍可查询执行结果与归档错误，读取正文会报告具体错误。缺少现场证据的非终态记录显示 unknown。
 
 ## 服务边界
 
-- `/`、`/app.js`、`/style.css` 提供内嵌页面；`POST /api/query` 提供 `overview`、`workspace`、`output` 三种只读查询。
-- query 使用显式 project_root，output 仅接受已登记 Artifact ID，通过 Workspace 的受控路径与文件句柄检查读取，不接受任意文件路径。
+- `POST /api/query` 与 MCP `history.query` 共用只读查询，支持 overview、workspace、history、provenance、output 和 facts。历史按 sequence 续读，每页最多 100 条。
+- 查询可传 project_root 或已登记 workspace_root，output 仅接受已登记 Artifact ID，通过 Workspace 的受控路径与文件句柄检查读取，不接受任意文件路径。
 - 管理端不转发通用 `/rpc` 或 `/mcp`。请求检查精确本机 Host、同源 Origin 和 Fetch Metadata；API 要求 JSON Content-Type，不开放 CORS。页面使用 CSP、禁止嵌入且通过 textContent 展示记录。
 - 与原服务一样信任本机调用者，无用户认证；loopback 和浏览器请求校验不构成本机用户隔离。
-- 页面查询复用 Workspace 记录、ServiceHost 状态和 Artifact 读取。MVP 会扫描 JSONL，并对结果分页；这是过渡实现，不能推断为大型工作区索引性能已通过验收。
+- 会话和时间筛选在 SQLite 内完成，分页后读取本页引用的产物元数据。当前服务掌握的运行态和归档错误优先显示。
 
 ## 后续里程碑
 
-M2 将结构化会话、操作、来源关系迁入 SQLite，完整输出仍保留文件；补齐迁移、版本管理、索引和时间筛选。M3 完善迁移中断、归档失败等故障验收。全文检索、网页命令执行、远端节点和稳定目标跨会话匹配另按 PLAN.md 推进。
+M3 验证异常退出、文件归档中断和派生索引重建。M1 浏览器验收记录仅适用于其当时版本。
 
-本轮测试、安装态更新、实际浏览器检查与未覆盖项见[管理 MVP 验证记录](management-mvp-validation.md)。
+历史验证见 [M1 管理页验收](management-mvp-validation.md)。M2 见 [中心库验收](management-m2-validation.md)。

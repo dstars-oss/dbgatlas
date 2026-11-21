@@ -771,3 +771,15 @@ tbody tr.selected {
     font-size: 9px;
   }
 }
+
+.filters {
+  flex-wrap: wrap;
+}
+.filters label:has(input[type="datetime-local"]) {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+#provenance {
+  overflow-wrap: anywhere;
+}

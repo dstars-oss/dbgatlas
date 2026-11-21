@@ -4,12 +4,12 @@ use std::thread;
 impl ServiceHost {
     pub fn new(supervisor: Arc<dyn WorkerSupervisor>) -> Self {
         Self {
+            #[cfg(not(test))]
+            history: HistoryStore::local(),
+            #[cfg(test)]
+            history: super::tests::test_history(),
             management_bind: None,
-            service_instance: format!(
-                "service-{}-{}",
-                std::process::id(),
-                Timestamp::now().unix_millis
-            ),
+            service_instance: format!("service-{}", uuid::Uuid::new_v4()),
             state: Arc::new(Mutex::new(ServiceState::default())),
             supervisor,
             capabilities: ServiceCapabilities::from_runtime_config(&RuntimeConfig::default()),
@@ -43,9 +43,9 @@ impl ServiceHost {
     }
 
     pub fn with_installed_process_workers() -> Result<Self, ServiceError> {
-        Ok(Self::new(Arc::new(
-            ProcessWorkerSupervisor::new_installed_service()?,
-        )))
+        let mut host = Self::new(Arc::new(ProcessWorkerSupervisor::new_installed_service()?));
+        host.history = HistoryStore::installed()?;
+        Ok(host)
     }
 
     pub fn with_capabilities(mut self, capabilities: ServiceCapabilities) -> Self {
@@ -197,6 +197,7 @@ impl ServiceHost {
     ) -> Result<Value, ServiceError> {
         let name = spec.name.as_str();
         match spec.route {
+            MethodRoute::Workspace => self.workspace_request(name, params.unwrap_or_default()),
             MethodRoute::Service => match name {
                 "service.health" => self.service_health(),
                 "service.info" => self.service_info(),
@@ -401,7 +402,7 @@ impl ServiceHost {
                 "operation cancellation is unsupported; use the recording stop/kill action".into(),
             )
         })?;
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         let cancellation_id = self.action_operation_id();
         self.begin_operation_record(
             &workspace,
@@ -538,24 +539,16 @@ impl ServiceHost {
     }
 
     pub(super) fn artifact_list(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        let facts = project_facts(params)?;
-        Ok(json!({ "artifacts": facts.artifacts }))
+        Ok(json!({ "artifacts": self.project_workspace(params)?.list_artifacts()? }))
     }
 
     pub(super) fn operation_list(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        let facts = project_facts(params)?;
-        Ok(json!({ "operations": facts.operations }))
+        Ok(json!({ "operations": self.project_workspace(params)?.list_operations()? }))
     }
 
     pub(super) fn audit_list_commands(&self, params: Option<Value>) -> Result<Value, ServiceError> {
-        let facts = project_facts(params)?;
-        Ok(json!({ "commands": facts.command_audit }))
+        Ok(json!({ "commands": self.project_workspace(params)?.list_command_audit()? }))
     }
-}
-
-fn project_facts(params: Option<Value>) -> Result<WorkspaceFacts, ServiceError> {
-    let params: ProjectRootParams = parse_params(params)?;
-    workspace_facts_with_fallback(&params.project_root)
 }
 
 fn unhandled_registered_method(name: &str) -> Result<Value, ServiceError> {

@@ -59,7 +59,7 @@ impl ServiceHost {
         } else {
             None
         };
-        let workspace = ensure_project_workspace(&project_root)?;
+        let workspace = self.ensure_project_workspace(&project_root)?;
         let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
         let method = if ttd {
             "recording.ttd"
@@ -208,7 +208,7 @@ impl ServiceHost {
         response: Result<WorkerResponse, ServiceError>,
         terminal: bool,
     ) -> Result<Value, ServiceError> {
-        let workspace = Workspace::open(&recording.workspace_root)?;
+        let workspace = self.history.lookup(&recording.workspace_root)?;
         let (mut result, writes) = match response {
             Ok(WorkerResponse::Recording { result, writes }) => (result, writes),
             other => {
@@ -488,7 +488,7 @@ impl ServiceHost {
             RecordingFinishMode::Kill => "recording.kill",
         };
         let operation_id = next_operation_ref();
-        let workspace = Workspace::open(&recording.workspace_root)?;
+        let workspace = self.history.lookup(&recording.workspace_root)?;
         self.begin_operation_record(
             &workspace,
             &operation_id,

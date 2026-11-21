@@ -76,7 +76,8 @@ fn bounded_wait_deduplicates_and_retains_admission_until_completion() {
     let repeated = call(&host, "session.exec", input).unwrap();
     assert_eq!(first["execution_id"], repeated["execution_id"]);
     assert_eq!(supervisor.max_active.load(Ordering::SeqCst), 1);
-    let facts = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR))
+    let facts = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
         .unwrap()
         .list_operations()
         .unwrap();
@@ -228,7 +229,9 @@ fn artifact_provenance_and_input_reuse_do_not_change_producer() {
         json!({"session_id":sid,"command":".echo material"}),
     )
     .unwrap();
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let reference: ArtifactRef =
         serde_json::from_value(response["execution"]["raw_output_ref"].clone()).unwrap();
     let before = workspace.get_artifact(&reference).unwrap().unwrap();
@@ -294,7 +297,9 @@ fn output_loss_stays_visible_across_cursors_and_invalid_utf8_tails() {
         json!({"session_id":opened["session_id"],"command":".echo fixture"}),
     )
     .unwrap();
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let reference =
         serde_json::from_value(response["execution"]["raw_output_ref"].clone()).unwrap();
     let metadata = workspace.get_artifact(&reference).unwrap().unwrap();

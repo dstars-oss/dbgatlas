@@ -162,39 +162,21 @@ pub(super) fn etw_session_name(recording_id: &RecordingRef) -> String {
     format!("DbgAtlas-{}", recording_id.id.as_str())
 }
 
+fn catalog_id(prefix: &str) -> Id {
+    Id::new(format!("{prefix}-{}", uuid::Uuid::new_v4())).expect("generated catalog id")
+}
+
 pub(super) fn next_session_ref() -> SessionRef {
-    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    SessionRef::new(
-        Id::new(format!("session-{}-{count}", Timestamp::now().unix_millis))
-            .expect("generated session ids are valid"),
-    )
+    SessionRef::new(catalog_id("session"))
 }
-
 pub(super) fn next_recording_ref() -> RecordingRef {
-    let count = RECORDING_COUNTER.fetch_add(1, Ordering::Relaxed);
-    RecordingRef::new(
-        Id::new(format!(
-            "recording-{}-{count}",
-            Timestamp::now().unix_millis
-        ))
-        .expect("generated recording ids are valid"),
-    )
+    RecordingRef::new(catalog_id("recording"))
 }
-
 pub(super) fn next_operation_ref() -> OperationRef {
-    let count = OPERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    OperationRef::new(
-        Id::new(format!("op-{}-{count}", Timestamp::now().unix_millis))
-            .expect("generated operation ids are valid"),
-    )
+    OperationRef::new(catalog_id("op"))
 }
-
 pub(super) fn next_artifact_ref() -> ArtifactRef {
-    let count = ARTIFACT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    ArtifactRef::new(
-        Id::new(format!("artifact-{}-{count}", Timestamp::now().unix_millis))
-            .expect("generated artifact ids are valid"),
-    )
+    ArtifactRef::new(catalog_id("artifact"))
 }
 
 pub(super) fn rpc_error_for(error: ServiceError) -> JsonRpcError {

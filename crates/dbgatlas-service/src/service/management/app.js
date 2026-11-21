@@ -2,6 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const state = {
   project: "",
+  workspaceRoot: undefined,
   session: "",
   offset: 0,
   data: null,
@@ -40,26 +41,23 @@ function error(message) {
   $("error").textContent = message || "";
   $("error").hidden = !message;
 }
-function stored() {
-  try {
-    return JSON.parse(localStorage.getItem("dbgatlas-projects") || "[]").filter(
-      (p) => typeof p === "string",
+function recent(projects, roots) {
+  const select = $("recent");
+  select.replaceChildren(node("option", "选择项目…"));
+  select.firstChild.value = "";
+  const duplicates = new Set(
+    projects.filter((v, i) => projects.indexOf(v) !== i),
+  );
+  roots.forEach((root, i) => {
+    const option = node(
+      "option",
+      duplicates.has(projects[i]) ? root : projects[i],
     );
-  } catch {
-    return [];
-  }
-}
-let knownProjects = [];
-function recent(known) {
-  if (known) knownProjects = known;
-  const roots = [...new Set([...knownProjects, ...stored()])];
-  $("recent").replaceChildren(node("option", "选择项目…"));
-  $("recent").firstChild.value = "";
-  for (const root of roots) {
-    const option = node("option", root);
     option.value = root;
-    $("recent").append(option);
-  }
+    option.dataset.project = projects[i];
+    select.append(option);
+  });
+  select.value = state.workspaceRoot || "";
 }
 async function query(params) {
   const response = await fetch("/api/query", {
@@ -77,7 +75,11 @@ async function health() {
     $("health").textContent = "服务在线";
     $("health-dot").classList.add("online");
     $("version").textContent = "v" + value.version;
-    recent(value.projects);
+    recent(value.projects, value.workspace_roots);
+    if (!state.project && value.workspace_roots.length) {
+      $("project").value = value.projects[0];
+      openProject(value.workspace_roots[0]);
+    }
   } catch (e) {
     $("health").textContent = "连接失败";
     $("health-dot").classList.remove("online");
@@ -115,9 +117,16 @@ async function load(reset = false) {
     const data = await query({
       action: "workspace",
       project_root: state.project,
+      workspace_root: state.workspaceRoot,
       session_id: state.session,
       status: $("status").value,
       search: $("search").value,
+      start_ms: $("time-start").value
+        ? new Date($("time-start").value).getTime()
+        : undefined,
+      end_ms: $("time-end").value
+        ? new Date($("time-end").value).getTime()
+        : undefined,
       offset: state.offset,
       limit: 40,
     });
@@ -125,22 +134,14 @@ async function load(reset = false) {
     state.data = data;
     state.offset = data.offset;
     render();
-    try {
-      localStorage.setItem(
-        "dbgatlas-projects",
-        JSON.stringify(
-          [state.project, ...stored().filter((p) => p !== state.project)].slice(
-            0,
-            12,
-          ),
-        ),
-      );
-    } catch {}
-    recent();
     history.replaceState(
       null,
       "",
-      "/?project=" + encodeURIComponent(state.project),
+      "/?project=" +
+        encodeURIComponent(state.project) +
+        (state.workspaceRoot
+          ? "&workspace=" + encodeURIComponent(state.workspaceRoot)
+          : ""),
     );
     $("updated").textContent =
       "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
@@ -258,6 +259,10 @@ function render() {
 function showDetail(op) {
   hideDetail();
   state.selected = ref(op.operation_id);
+  $("execution-history").open = false;
+  $("history-content").textContent = "";
+  $("history-more").hidden = true;
+  $("provenance").textContent = "";
   $("detail").hidden = false;
   $("detail-title").textContent = op.capability;
   $("detail-id").textContent = state.selected;
@@ -309,6 +314,73 @@ function showDetail(op) {
   render();
   $("detail").scrollIntoView({ behavior: "smooth", block: "start" });
 }
+let historyAfter = 0;
+async function loadHistory(append) {
+  const id = state.selected,
+    project = state.project,
+    seq = state.querySeq;
+  if (!id) return;
+  $("history-more").disabled = true;
+  try {
+    const result = await query({
+      action: "history",
+      project_root: project,
+      workspace_root: state.workspaceRoot,
+      execution_id: id,
+      after: append ? historyAfter : 0,
+    });
+    if (id !== state.selected || seq !== state.querySeq) return;
+    const lines = result.entries.map(
+      (e) =>
+        new Date(e.observed).toLocaleString() +
+        " · " +
+        e.record.status +
+        " · " +
+        e.record.summary +
+        (e.record.output_error ? " · " + e.record.output_error : ""),
+    );
+    $("history-content").textContent =
+      (append ? $("history-content").textContent + "\n" : "") +
+      lines.join("\n");
+    historyAfter = result.entries.at(-1)?.sequence || 0;
+    $("history-more").hidden = result.entries.length < 100;
+  } catch (e) {
+    if (id === state.selected && seq === state.querySeq)
+      $("history-content").textContent = e.message;
+  } finally {
+    if (id === state.selected && seq === state.querySeq)
+      $("history-more").disabled = false;
+  }
+}
+$("execution-history").addEventListener("toggle", () => {
+  if ($("execution-history").open) loadHistory(false);
+});
+$("history-more").addEventListener("click", () => loadHistory(true));
+async function showProvenance(artifact, seq) {
+  $("provenance").textContent = "";
+  try {
+    const v = await query({
+      action: "provenance",
+      project_root: state.project,
+      workspace_root: state.workspaceRoot,
+      artifact_id: artifact.artifact_id,
+    });
+    if (seq !== state.outputSeq) return;
+    const source = [
+      ref(v.artifact.producer_session_id),
+      ref(v.artifact.producer_execution_id),
+    ]
+      .filter(Boolean)
+      .join(" / ");
+    $("provenance").textContent =
+      "来源：" +
+      (source || "无已知生产者") +
+      "；引用会话：" +
+      (v.consumer_sessions.map(ref).join("、") || "无");
+  } catch (e) {
+    if (seq === state.outputSeq) $("provenance").textContent = e.message;
+  }
+}
 function openArtifact(artifact) {
   state.artifact = artifact;
   state.outputOffset = 0;
@@ -317,6 +389,7 @@ function openArtifact(artifact) {
   $("output-meta").textContent = artifact.relative_path;
   $("output-note").textContent = "";
   $("more").hidden = true;
+  showProvenance(artifact, state.outputSeq);
   readMore(false);
 }
 async function readMore(append) {
@@ -328,6 +401,7 @@ async function readMore(append) {
     const value = await query({
       action: "output",
       project_root: state.project,
+      workspace_root: state.workspaceRoot,
       artifact_id: artifact.artifact_id,
       offset: state.outputOffset,
     });
@@ -354,10 +428,11 @@ async function readMore(append) {
     if (seq === state.outputSeq) $("more").disabled = false;
   }
 }
-function openProject() {
+function openProject(workspaceRoot) {
   const root = $("project").value.trim();
   if (!root) return;
   state.project = root;
+  state.workspaceRoot = workspaceRoot;
   state.session = "";
   hideDetail();
   state.data = null;
@@ -382,8 +457,8 @@ $("project-form").addEventListener("submit", (e) => {
 });
 $("recent").addEventListener("change", (e) => {
   if (e.target.value) {
-    $("project").value = e.target.value;
-    openProject();
+    $("project").value = e.target.selectedOptions[0].dataset.project;
+    openProject(e.target.value);
   }
 });
 $("all-sessions").addEventListener("click", () => {
@@ -400,6 +475,11 @@ $("status").addEventListener("change", () => {
   hideDetail();
   load(true);
 });
+for (const id of ["time-start", "time-end"])
+  $(id).addEventListener("change", () => {
+    hideDetail();
+    load(true);
+  });
 let timer;
 $("search").addEventListener("input", () => {
   clearTimeout(timer);
@@ -423,11 +503,11 @@ $("close-detail").addEventListener("click", () => {
   render();
 });
 $("more").addEventListener("click", () => readMore(true));
-recent();
 health();
-const initial =
-  new URLSearchParams(location.search).get("project") || stored()[0];
+const initial = new URLSearchParams(location.search).get("project");
 if (initial) {
   $("project").value = initial;
-  openProject();
+  openProject(
+    new URLSearchParams(location.search).get("workspace") || undefined,
+  );
 }

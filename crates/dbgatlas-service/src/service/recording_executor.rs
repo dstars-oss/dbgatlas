@@ -138,7 +138,7 @@ impl RecordingExecutor {
         .validate()?;
         let recording_id = self.recording_id.clone();
         let operation_id = self.operation_id.clone();
-        let workspace = ensure_project_workspace(&params.project_root)?;
+        let workspace = Workspace::open_files(params.project_root.join(INTERNAL_WORKSPACE_DIR))?;
         let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
         let now = Timestamp::now();
         let trace_path = artifact_dir.join("trace.etl");
@@ -339,7 +339,7 @@ impl RecordingExecutor {
         let current_dir = ttd_launch_start_directory(&request.target)?;
         let recording_id = self.recording_id.clone();
         let operation_id = self.operation_id.clone();
-        let workspace = ensure_project_workspace(&params.project_root)?;
+        let workspace = Workspace::open_files(params.project_root.join(INTERNAL_WORKSPACE_DIR))?;
         let artifact_dir = workspace.ensure_recording_artifact_dir(&recording_id.id)?;
         let traces_dir = artifact_dir.join("traces");
         fs::create_dir_all(&traces_dir)?;

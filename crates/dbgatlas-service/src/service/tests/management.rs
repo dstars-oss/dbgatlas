@@ -28,7 +28,7 @@ fn management_history_survives_host_restart_without_reviving_sessions() {
     );
     assert_eq!(executed["execution"]["status"], "success");
     let root = temp.path().join(INTERNAL_WORKSPACE_DIR);
-    let workspace = Workspace::open(&root).unwrap();
+    let workspace = test_history().open_workspace(&root).unwrap();
     let pending: OperationRecord = serde_json::from_value(json!({"operation_id":{"id":"pending-old"},"adapter_id":"dbgeng","capability":"session.exec","status":"running","summary":"incomplete","artifacts":[],"created_at":{"unix_millis":1},"session_id":sid})).unwrap();
     workspace.append_operation(&pending).unwrap();
     let mut known = ServiceOperation::success(
@@ -97,8 +97,9 @@ fn management_history_survives_host_restart_without_reviving_sessions() {
 #[test]
 fn management_output_is_bounded_and_preserves_utf8() {
     let temp = tempfile::tempdir().unwrap();
-    let workspace =
-        Workspace::init(temp.path().join(INTERNAL_WORKSPACE_DIR), Default::default()).unwrap();
+    let workspace = test_history()
+        .init_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR), Default::default())
+        .unwrap();
     let text = "界".repeat(30000);
     let relative = PathBuf::from("artifacts/output.txt");
     fs::write(workspace.root().join(&relative), &text).unwrap();
@@ -234,4 +235,164 @@ fn management_refuses_public_bind_and_does_not_create_workspaces() {
             .is_err()
     );
     assert!(!temp.path().join(INTERNAL_WORKSPACE_DIR).exists());
+}
+
+#[test]
+fn central_history_survives_restart_offline_files_and_shared_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("central.sqlite3");
+    let mut host = ServiceHost::with_mock_workers();
+    host.history = HistoryStore::new(database.clone());
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    let open = |host: &ServiceHost, root: &Path| {
+        rpc(
+            host,
+            "session.open",
+            json!({"project_root":root,"target":{"kind":"file","path":"fixture.dmp"},"wait_ms":30000}),
+        )
+    };
+    let s1 = open(&host, &first)["session_id"].clone();
+    let s2 = open(&host, &second)["session_id"].clone();
+    let marker = rpc(
+        &host,
+        "session.exec",
+        json!({"session_id":s1,"command":".echo central-one","wait_ms":30000}),
+    );
+    let id = marker["execution_id"]["id"].as_str().unwrap();
+    let artifact = &marker["execution"]["raw_output_ref"];
+    let consumer = rpc(
+        &host,
+        "session.open",
+        json!({"project_root":first,"target":{"kind":"file","artifact_ref":artifact},"wait_ms":30000}),
+    );
+    for sid in [&s1, &s2, &consumer["session_id"]] {
+        rpc(
+            &host,
+            "session.close",
+            json!({"session_id":sid,"wait_ms":30000}),
+        );
+    }
+    drop(host);
+    let mut host = ServiceHost::with_mock_workers();
+    host.history = HistoryStore::new(database);
+    assert_eq!(
+        rpc(&host, "history.query", json!({}))["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let provenance = rpc(
+        &host,
+        "history.query",
+        json!({"action":"provenance","project_root":first,"artifact_id":artifact}),
+    );
+    assert_eq!(
+        provenance["artifact"]["producer_execution_id"],
+        marker["execution_id"]
+    );
+    assert_eq!(
+        provenance["consumer_sessions"],
+        json!([consumer["session_id"]])
+    );
+    let changes = rpc(
+        &host,
+        "history.query",
+        json!({"action":"history","project_root":first,"execution_id":id}),
+    );
+    assert!(changes["entries"].as_array().unwrap().len() >= 2);
+    let time = marker["execution"]["created_at"]["unix_millis"]
+        .as_u64()
+        .unwrap();
+    let filter = json!({"action":"workspace","project_root":first,"search":"central-one","start_ms":time,"end_ms":time+1});
+    assert_eq!(
+        rpc(&host, "history.query", filter.clone())["filtered_count"],
+        1
+    );
+    assert_eq!(
+        rpc(
+            &host,
+            "history.query",
+            json!({"action":"workspace","project_root":second,"search":id})
+        )["filtered_count"],
+        0
+    );
+    let moved = temp.path().join("moved");
+    fs::rename(&first, &moved).unwrap();
+    assert_eq!(
+        rpc(&host, "history.query", filter)["operations"][0]["status"],
+        "success"
+    );
+    assert!(
+        host.management_query(
+            &json!({"action":"output","project_root":first,"artifact_id":artifact})
+        )
+        .is_err()
+    );
+    assert!(!first.exists());
+    host.history
+        .relink(&moved.join(INTERNAL_WORKSPACE_DIR), &host.service_instance)
+        .unwrap();
+    assert!(
+        rpc(
+            &host,
+            "history.query",
+            json!({"action":"output","project_root":moved,"artifact_id":artifact})
+        )["text"]
+            .as_str()
+            .unwrap()
+            .contains("central-one")
+    );
+}
+
+#[test]
+fn moving_active_workspace_preserves_control_and_requires_close_before_relink() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut host = ServiceHost::with_mock_workers();
+    host.history = HistoryStore::new(temp.path().join("history.sqlite3"));
+    let root = temp.path().join("project");
+    let moved = temp.path().join("moved");
+    let opened = rpc(
+        &host,
+        "session.open",
+        json!({"project_root":root,"target":{"kind":"file","path":"test.dmp"},"wait_ms":30000}),
+    );
+    fs::rename(&root, &moved).unwrap();
+    let path = moved.join(INTERNAL_WORKSPACE_DIR);
+    assert!(
+        host.workspace_request("workspace.relink", json!({"path":path}))
+            .is_err()
+    );
+    let close = rpc(
+        &host,
+        "session.close",
+        json!({"session_id":opened["session_id"],"wait_ms":30000}),
+    );
+    assert_eq!(close["execution"]["status"], "success");
+    assert!(close["execution"]["output_error"].is_string());
+    assert!(!root.exists());
+    let workspace = host
+        .history
+        .lookup(root.join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
+    let mut saved = workspace.sessions().unwrap().pop().unwrap();
+    saved.lifecycle = dbgatlas_model::SessionLifecycle::Failed;
+    saved.cleanup.complete = false;
+    workspace.save_session(&saved).unwrap();
+    assert!(
+        host.workspace_request("workspace.relink", json!({"path":path}))
+            .is_err()
+    );
+    saved.cleanup.complete = true;
+    workspace.save_session(&saved).unwrap();
+    host.workspace_request("workspace.relink", json!({"path":path}))
+        .unwrap();
+    let facts = rpc(
+        &host,
+        "history.query",
+        json!({"action":"workspace","project_root":moved,"search":close["execution_id"]["id"]}),
+    );
+    assert_eq!(facts["operations"][0]["status"], "success");
+    assert!(facts["operations"][0]["output_error"].is_string());
 }

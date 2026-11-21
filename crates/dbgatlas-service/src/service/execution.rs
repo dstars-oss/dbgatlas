@@ -13,7 +13,7 @@ pub(super) struct Scope {
 pub(super) struct Job {
     pub scope: Scope,
     pub action: String,
-    pub workspace: PathBuf,
+    pub workspace: Workspace,
     pub input: Value,
     pub related: Option<OperationRef>,
     pub state: Mutex<JobState>,
@@ -283,9 +283,10 @@ impl ServiceHost {
         let id = next_operation_ref();
         let workspace = if legacy == "debug.session.create" {
             let p = parse_debug_session_create_params(Some(params.clone()))?;
-            ensure_project_workspace(&p.project_root)?
+            self.ensure_project_workspace(&p.project_root)?
         } else {
-            Workspace::open(&summary.as_ref().unwrap().workspace.root)?
+            self.history
+                .lookup(&summary.as_ref().unwrap().workspace.root)?
         };
         if legacy == "debug.session.create" {
             self.open_session_record(
@@ -317,7 +318,7 @@ impl ServiceHost {
                 session_id: sid.clone(),
             },
             action,
-            workspace: workspace.root().into(),
+            workspace: workspace.clone(),
             input: params.clone(),
             related,
             state: Mutex::new(JobState::default()),
@@ -503,8 +504,9 @@ impl ServiceHost {
                 op.details.related_operation_id = job.related.clone();
             }
         }
-        if let Ok(workspace) = Workspace::open(&job.workspace) {
-            if let Err(error) = self.archive_execution_streams(job, &workspace) {
+        {
+            let workspace = &job.workspace;
+            if let Err(error) = self.archive_execution_streams(job, workspace) {
                 if let Ok(mut state) = self.lock_state() {
                     if let Some(op) = state.operations.get_mut(job.scope.operation_id.id.as_str()) {
                         op.details.output_error = Some(error.to_string());
@@ -518,7 +520,7 @@ impl ServiceHost {
             });
             if let Some(op) = op {
                 let persisted = self.append_operation_result(
-                    &workspace,
+                    workspace,
                     &OperationRecord {
                         details: op.details,
                         operation_id: op.operation_id,
@@ -876,7 +878,7 @@ impl ServiceHost {
                 "artifact_ref requires a file target".into(),
             ));
         }
-        let workspace = ensure_project_workspace(Path::new(
+        let workspace = self.ensure_project_workspace(Path::new(
             params["project_root"]
                 .as_str()
                 .ok_or_else(|| ServiceError::Rpc("project_root is required".into()))?,
@@ -973,7 +975,7 @@ impl ServiceHost {
         } else {
             return Ok(());
         };
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         let mut record = workspace
             .get_operation(id)?
             .ok_or_else(|| ServiceError::OperationNotFound(id.to_string()))?;

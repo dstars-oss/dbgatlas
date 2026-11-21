@@ -55,7 +55,7 @@ flowchart TB
 
 Artifact 是 Session/Execution 引用的材料：工具产物记录 producer_session_id，可确认时补充 producer_execution_id；外部输入无虚构 producer。身份与文件由 workspace 保管，后续会话可以引用同一材料，关闭会话不删除或改变其来源。该关系不要求物理汇聚多会话产物或引入第三个业务控制中心。
 
-历史归入显式 analysis workspace。当前使用 JSONL 和产物文件；迭代 4 与迭代 5 管理页面并行，M1 已通过独立本机管理端口展示真实记录，后续引入 SQLite 保存结构化记录、完整输出继续留在文件；迭代 7 完善稳定目标身份与跨会话检索。迭代 2 只建立关联位置和运行实例边界，不提前实现内容寻址、SQLite 表结构或自动结果缓存。
+操作历史由服务集中保存，并按工作区归属。SQLite 管理结构化事实，显式 analysis workspace 保管输出文件和分析材料。数据库与文件通过稳定 ID 关联，详见[工作区模型](workspace-model.md)。稳定目标身份与跨会话匹配按迭代 7 推进。
 
 工作区逻辑输出引用与执行侧文件位置分开。本机可由边界内的实现直接写受控目录；未来远端产物需要明确取回或远端引用状态，不能把远端绝对路径当成本机可读路径。
 
@@ -84,4 +84,4 @@ CLI、MCP 和管理页面必须复用平台业务实现。这里的控制层是�
 
 当前 `/rpc` 和 `/mcp` 保持无认证的 loopback 服务，并校验浏览器 `Origin`。未来远端后端通道独立设计，不能直接放宽当前 listener 来代替。安装与验证命令见[安装配置](install-configuration.md)及根目录 AGENTS.md。
 
-管理页面通过独立 loopback listener 提供只读查询，默认 `127.0.0.1:7332`；复用服务已知状态与 Workspace 文件记录，不转发通用 RPC。迭代 4/5 的共同 MVP 先使用真实 JSONL，SQLite 元数据迁移与页面完善按共同里程碑推进，完整输出文件保留。范围见[管理页面说明](management-ui.md)。
+管理页面通过独立 loopback listener 提供只读查询，默认 `127.0.0.1:7332`。页面从中心库列出项目、会话、执行和产物来源，通过登记的文件引用读取完整输出。范围见[管理页面说明](management-ui.md)。

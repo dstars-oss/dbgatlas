@@ -117,169 +117,112 @@ impl ServiceHost {
     pub(super) fn management_query(&self, params: &Value) -> Result<Value, ServiceError> {
         let action = params["action"].as_str().unwrap_or("overview");
         if action == "overview" {
-            let state = self.lock_state()?;
-            let mut roots: Vec<_> = state
-                .summaries
-                .values()
-                .filter_map(|s| s.workspace.root.parent().map(Path::to_path_buf))
+            let workspaces = self.history.workspaces()?;
+            let roots: Vec<_> = workspaces
+                .iter()
+                .map(|root| {
+                    if root.ends_with(INTERNAL_WORKSPACE_DIR) {
+                        root.parent().unwrap_or(root)
+                    } else {
+                        root
+                    }
+                })
                 .collect();
-            roots.sort();
-            roots.dedup();
+            let state = self.lock_state()?;
             return Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"service_instance":self.service_instance,"projects":roots,"active_sessions":state.summaries.values().filter(|s| !s.lifecycle.is_terminal()).count()}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"service_instance":self.service_instance,"projects":roots,"workspace_roots":workspaces,"active_sessions":state.summaries.values().filter(|s| !s.lifecycle.is_terminal()).count()}),
             );
         }
-        if !matches!(action, "workspace" | "output") {
+        if !matches!(
+            action,
+            "workspace" | "output" | "history" | "provenance" | "facts"
+        ) {
             return Err(ServiceError::Rpc("unsupported management query".into()));
         }
-        let project = Path::new(
-            params["project_root"]
-                .as_str()
-                .ok_or_else(|| ServiceError::Rpc("project_root is required".into()))?,
-        );
-        if !project.is_absolute() {
-            return Err(ServiceError::Rpc(
-                "project_root must be an absolute path".into(),
-            ));
+        let root = match params["workspace_root"].as_str() {
+            Some(path) => PathBuf::from(path),
+            None => Path::new(
+                params["project_root"]
+                    .as_str()
+                    .ok_or_else(|| ServiceError::Rpc("project_root is required".into()))?,
+            )
+            .join(INTERNAL_WORKSPACE_DIR),
+        };
+        if !root.is_absolute() {
+            return Err(ServiceError::Rpc("workspace path must be absolute".into()));
         }
-        // Opening a management view never creates a workspace or analysis data.
-        let workspace = Workspace::open(project.join(INTERNAL_WORKSPACE_DIR))?;
+        let workspace = self.history.lookup(root)?;
+        if action == "facts" {
+            return Ok(json!(workspace.facts()?));
+        }
         if action == "output" {
             return read_output(&workspace, params);
         }
-        let root = fs::canonicalize(workspace.root())?;
-        let live: HashMap<_, _> = self
-            .lock_state()?
-            .summaries
-            .values()
-            .filter(|s| fs::canonicalize(&s.workspace.root).ok().as_ref() == Some(&root))
-            .map(|s| (s.session_id.id.to_string(), s.clone()))
-            .collect();
-        let mut sessions = HashMap::new();
-        let mut warnings = Vec::new();
-        for directory in ["sessions", "recordings"] {
-            let path = workspace.root().join("artifacts").join(directory);
-            if !path.exists() {
-                continue;
+        if action == "history" {
+            let after = params["after"].as_i64().unwrap_or(0);
+            return Ok(
+                json!({"entries":workspace.history_entries(params["execution_id"].as_str(),params["session_id"].as_str(),after,100)?}),
+            );
+        }
+        if action == "provenance" {
+            let id: ArtifactRef = serde_json::from_value(params["artifact_id"].clone())?;
+            let artifact = workspace
+                .get_artifact(&id)?
+                .ok_or_else(|| ServiceError::Rpc("artifact not found".into()))?;
+            let consumers: Vec<_> = workspace
+                .artifact_consumers(&id)?
+                .into_iter()
+                .map(|s| s.session_id)
+                .collect();
+            return Ok(json!({"artifact":artifact,"consumer_sessions":consumers}));
+        }
+        let filter: dbgatlas_workspace::HistoryFilter = serde_json::from_value(params.clone())?;
+        if matches!((filter.start_ms,filter.end_ms),(Some(s),Some(e)) if s>=e) {
+            return Err(ServiceError::Rpc(
+                "end_ms must be later than start_ms".into(),
+            ));
+        }
+        let persisted = workspace.sessions()?;
+        let (sessions, overrides) = {
+            let state = self.lock_state()?;
+            let mut sessions = Vec::with_capacity(persisted.len());
+            for saved in &persisted {
+                let live = state
+                    .summaries
+                    .get(saved.session_id.id.as_str())
+                    .filter(|s| s.workspace.root == workspace.root());
+                sessions.push(session_view(live.unwrap_or(saved), live.is_some())?);
             }
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_dir() {
+            let mut overrides = serde_json::Map::new();
+            for op in state.operations.values() {
+                // Completed and archived operations already have the authoritative database row.
+                if execution::terminal(&op.status) && op.details.output_error.is_none() {
                     continue;
                 }
-                let relative = PathBuf::from("artifacts")
-                    .join(directory)
-                    .join(entry.file_name())
-                    .join("session.json");
-                if !workspace.root().join(&relative).exists() {
-                    continue;
-                }
-                let loaded = (|| -> Result<Value, ServiceError> {
-                    let file = workspace.open_artifact_read(&relative)?;
-                    let session: dbgatlas_model::Session =
-                        serde_json::from_reader(file.take(1024 * 1024))?;
-                    session_view(&session, false)
-                })();
-                match loaded {
-                    Ok(value) => {
-                        sessions.insert(
-                            value["session_id"]["id"].as_str().unwrap_or("").to_owned(),
-                            value,
-                        );
-                    }
-                    Err(error) => warnings.push(format!("{}: {error}", relative.display())),
+                let session = op
+                    .session_id
+                    .as_ref()
+                    .or(op.details.session_id.as_ref())
+                    .and_then(|sid| state.summaries.get(sid.id.as_str()));
+                if session.is_some_and(|s| s.workspace.root == workspace.root()) {
+                    overrides.insert(
+                        op.operation_id.id.to_string(),
+                        json!({"status":op.status,"summary":op.summary,"artifacts":op.artifacts,
+                        "raw_output":op.raw_output,"output_error":op.details.output_error}),
+                    );
                 }
             }
-        }
-        for (id, session) in &live {
-            sessions.insert(id.clone(), session_view(session, true)?);
-        }
-        let mut sessions: Vec<_> = sessions.into_values().collect();
-        sessions.sort_by_key(|s| {
-            std::cmp::Reverse(s["created_at"]["unix_millis"].as_u64().unwrap_or(0))
-        });
-        let mut operations = workspace.list_operations()?;
-        let current_operations = self.lock_state()?.operations.clone();
-        for op in &mut operations {
-            let current = current_operations
-                .get(op.operation_id.id.as_str())
-                .filter(|current| {
-                    let sid = current
-                        .session_id
-                        .as_ref()
-                        .or(current.details.session_id.as_ref());
-                    sid == op.details.session_id.as_ref()
-                        && sid.is_some_and(|id| live.contains_key(id.id.as_str()))
-                });
-            if let Some(current) = current {
-                // Execution can finish even when its final journal append fails.
-                // Keep that known result and its separate archival error visible.
-                op.status = current.status.clone();
-                op.summary = current.summary.clone();
-                op.details = current.details.clone();
-                op.artifacts = current.artifacts.clone();
-                op.raw_output = current.raw_output.clone();
-            } else if matches!(
-                op.status,
-                OperationStatus::Running | OperationStatus::Pending
-            ) {
-                op.status = OperationStatus::Unknown;
-            }
-        }
-        let total_operations = operations.len();
-        operations.sort_by(|a, b| {
-            b.created_at
-                .unix_millis
-                .cmp(&a.created_at.unix_millis)
-                .then_with(|| b.operation_id.to_string().cmp(&a.operation_id.to_string()))
-        });
-        let session_filter = params["session_id"].as_str().unwrap_or("");
-        let status_filter = params["status"].as_str().unwrap_or("");
-        let needle = params["search"].as_str().unwrap_or("").to_lowercase();
-        let operations: Vec<_> = operations
-            .into_iter()
-            .filter(|op| {
-                (session_filter.is_empty()
-                    || op
-                        .details
-                        .session_id
-                        .as_ref()
-                        .is_some_and(|s| s.id.as_str() == session_filter))
-                    && (status_filter.is_empty()
-                        || serde_json::to_value(&op.status)
-                            .ok()
-                            .and_then(|s| s.as_str().map(str::to_owned))
-                            .as_deref()
-                            == Some(status_filter))
-                    && (needle.is_empty()
-                        || format!(
-                            "{} {} {} {}",
-                            op.operation_id,
-                            op.capability,
-                            op.summary,
-                            op.details.input.as_ref().unwrap_or(&Value::Null)
-                        )
-                        .to_lowercase()
-                        .contains(&needle))
-            })
-            .collect();
-        let count = operations.len();
-        let offset = params["offset"].as_u64().unwrap_or(0).min(count as u64) as usize;
-        let limit = params["limit"].as_u64().unwrap_or(40).clamp(1, 100) as usize;
-        let page = &operations[offset..(offset + limit).min(count)];
-        let artifacts = workspace.list_artifacts()?;
-        let selected_artifacts: Vec<_> = artifacts
-            .iter()
-            .filter(|a| {
-                page.iter().any(|op| {
-                    op.artifacts.contains(&a.artifact_id)
-                        || op.raw_output.as_ref() == Some(&a.artifact_id)
-                })
-            })
-            .collect();
-        Ok(
-            json!({"workspace":workspace.info(),"sessions":sessions,"operations":page,"artifacts":selected_artifacts,"total_operations":total_operations,"total_artifacts":artifacts.len(),"filtered_count":count,"offset":offset,"has_more":offset + page.len() < count,"warnings":warnings}),
-        )
+            (sessions, Value::Object(overrides))
+        };
+        let mut response = serde_json::to_value(workspace.operation_page(&filter, &overrides)?)?;
+        response["workspace"] = json!(workspace.info());
+        response["sessions"] = json!(sessions);
+        response["warnings"] = if workspace.root().is_dir() {
+            json!([])
+        } else {
+            json!(["项目目录不可用；仍可查看中心库中的历史记录。"])
+        };
+        Ok(response)
     }
 }
 
@@ -300,6 +243,7 @@ fn read_output(workspace: &Workspace, params: &Value) -> Result<Value, ServiceEr
     let artifact = workspace
         .get_artifact(&id)?
         .ok_or_else(|| ServiceError::Rpc("artifact not found".into()))?;
+    let mut file = workspace.open_artifact_read(&artifact.relative_path)?;
     let extension = artifact
         .relative_path
         .extension()
@@ -312,7 +256,6 @@ fn read_output(workspace: &Workspace, params: &Value) -> Result<Value, ServiceEr
     ) {
         return Ok(json!({"artifact":artifact,"binary":true,"text":"","has_more":false}));
     }
-    let mut file = workspace.open_artifact_read(&artifact.relative_path)?;
     let length = file.metadata()?.len();
     let offset = params["offset"].as_u64().unwrap_or(0);
     if offset > length {

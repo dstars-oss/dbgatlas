@@ -14,7 +14,7 @@
 | Command output | Raw command previews, live/final UTF-8 cursor reads and separate session streams; full files retain session/execution producer attribution | [output_read.rs](../crates/dbgatlas-service/src/service/output_read.rs) |
 | ETW | Dedicated recording worker owns NativeEtwController, native session and real-time consumer; service owns admission and final artifact registration | [host_recording.rs](../crates/dbgatlas-service/src/service/host_recording.rs) |
 | TTD recording | Dedicated worker runs identity helpers, recorder and stop tools; helper ownership handshake and Job protect process cleanup | [recording_support.rs](../crates/dbgatlas-service/src/service/recording_support.rs) |
-| Persistence | Versioned session.json; append-only JSONL operation updates merged by ID/sequence, immutable input/context and output_error; existing artifact paths retained | [workspace implementation](../crates/dbgatlas-workspace/src/lib.rs) |
+| Persistence | Service-owned SQLite catalog and format-2 workspace identity. Session/recording files retain full output. | [workspace storage](../crates/dbgatlas-workspace/src/history.rs) |
 | Generic adapter | Synchronous invocation and artifact registration; not the complete debug backend lifecycle | [adapter](../crates/dbgatlas-adapter/src/lib.rs), [core](../crates/dbgatlas-core/src/lib.rs) |
 | Installation | Windows service, isolated runtime payload and service.update workflow | [install configuration](install-configuration.md) |
 
@@ -35,13 +35,13 @@
 
 Read cursors are resource- and service-instance-bound. Default/max text budgets are 8/64 KiB; at most 64 Artifact references accompany each response. Native output, engine-event JSONL and lifecycle-event JSONL keep separate source labels. Closing retains execution output. Same-workspace file inputs may explicitly reference an Artifact without changing its producer; external inputs and old unowned records remain unowned.
 
-[3D](iteration-3d-validation.md) implements stateless HTTP MCP negotiation for 2024-11-05, 2025-03-26 and 2025-06-18. The newest supported version returns structured content once with a compact text summary; legacy versions retain full JSON text. Each request selects its format from the protocol header, defaulting to 2025-03-26 when absent. The default inventory has 25 tools; debug helpers (except read_memory) and operation aliases remain callable but hidden. Canonical CLI session/execution commands reuse the same RPC API, preserve raw commands and report action failures through exit status.
+[3D](iteration-3d-validation.md) implements stateless HTTP MCP negotiation for 2024-11-05, 2025-03-26 and 2025-06-18. The newest supported version returns structured content once with a compact text summary; legacy versions retain full JSON text. Each request selects its format from the protocol header, defaulting to 2025-03-26 when absent. The iteration 3D default inventory had 25 tools; debug helpers (except read_memory) and operation aliases remain callable but hidden. Canonical CLI session/execution commands reuse the same RPC API, preserve raw commands and report action failures through exit status.
 
 Real Codex app-server MCP calls cover discovery, short/long commands, output reads and interruption. This is client transport validation, not a model conversation or proof of AI scheduling. No Tasks, SSE or progress/resource notifications are advertised. Cancellation notifications are acknowledged without dispatching business cancellation; the server-side wait remains bounded by wait_ms, at most 30000 ms. Explicit execution.cancel remains separate.
 
-Execution get/read and retry keys retain only this service instance's runtime association. `execution.list` reads persisted facts and projects old unfinished records as unknown; this does not restore a debugger after restart. Internal Operation types and JSONL names are retained for compatibility.
+Execution get/read and retry keys retain only this service instance's runtime association. `execution.list` reads persisted facts and projects old unfinished records as unknown; this does not restore a debugger after restart. Historical executions and their updates are stored in the controller catalog.
 
-The management MVP reads existing JSONL/session metadata, merges current service facts and reads full output from files. SQLite metadata, remote backend transport, stable cross-session target matching and a Linux backend remain planned. Raw command access does not by itself establish a supported kernel or remote debugging lifecycle.
+Management and `history.query` discover workspaces from the service catalog. History and provenance remain queryable when project files are offline. Output reads validate the registered identity and file location. Remote backends, stable target matching and Linux remain planned.
 
 ## Validation evidence
 
@@ -57,3 +57,5 @@ Iteration 2 evidence and explicit untested paths are recorded in [iteration-2-va
 [3D validation](iteration-3d-validation.md) records protocol/CLI tests, real client calls and release regressions. [Installed-service validation](iteration-3-installed-validation.md) closes the installation prerequisite on 2026-11-16: MSVC release, connected MCP update/restart/health, matching payload hashes and eight installed MCP smoke groups passed. [Iteration 3 acceptance](iteration-3-validation.md) separates these checks from the remaining untested scenarios.
 
 [Management MVP validation](management-mvp-validation.md) records 168 relevant tests, release/install checks, connected MCP records, historical file reads and six real headless-browser checks on 2026-11-17. SQLite and large-workspace performance remain outside M1.
+
+[M2 validation](management-m2-validation.md) covers central project discovery, restart, execution history, offline files and recorded artifact reuse.

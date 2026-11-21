@@ -354,11 +354,12 @@ fn project_fact_lists_require_project_root_and_reject_internal_workspace_path() 
 #[test]
 fn project_fact_lists_cover_empty_fallback_and_missing_projects() {
     let empty = tempfile::tempdir().unwrap();
-    Workspace::init(
-        empty.path().join(INTERNAL_WORKSPACE_DIR),
-        Default::default(),
-    )
-    .unwrap();
+    test_history()
+        .init_workspace(
+            empty.path().join(INTERNAL_WORKSPACE_DIR),
+            Default::default(),
+        )
+        .unwrap();
     let fallback = tempfile::tempdir().unwrap();
     let trace = fallback
         .path()
@@ -399,19 +400,9 @@ fn project_fact_lists_cover_empty_fallback_and_missing_projects() {
             params: Some(json!({ "project_root": fallback.path() })),
         });
         assert!(
-            fallback_result.error.is_none(),
-            "{method}: {:?}",
-            fallback_result.error
+            fallback_result.error.is_some(),
+            "unregistered workspace returned history"
         );
-        let rows = fallback_result.result.unwrap()[field]
-            .as_array()
-            .unwrap()
-            .clone();
-        if method == "artifact.list" {
-            assert_eq!(rows.len(), 1);
-        } else {
-            assert!(rows.is_empty());
-        }
 
         let missing_result = host.handle_rpc(JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -512,37 +503,6 @@ fn http_mcp_recording_cancel_and_kill_match_rpc_shapes() {
         );
         server.stop();
     }
-}
-
-#[test]
-fn workspace_facts_falls_back_to_project_artifacts_without_manifest() {
-    let temp = tempfile::tempdir().unwrap();
-    let trace = temp
-        .path()
-        .join(INTERNAL_WORKSPACE_DIR)
-        .join("artifacts")
-        .join("recordings")
-        .join("recording-1")
-        .join("traces")
-        .join("sample.run");
-    fs::create_dir_all(trace.parent().unwrap()).unwrap();
-    fs::write(&trace, b"run").unwrap();
-
-    let facts = workspace_facts_with_fallback(temp.path()).unwrap();
-
-    let artifact = facts
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.kind == "recording.ttd.trace")
-        .unwrap();
-    assert_eq!(artifact.byte_len, Some(3));
-    assert!(
-        artifact
-            .artifact_id
-            .id
-            .as_str()
-            .starts_with("artifact-synthetic-")
-    );
 }
 
 #[test]

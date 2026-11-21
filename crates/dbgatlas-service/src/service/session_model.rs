@@ -134,6 +134,7 @@ impl ServiceHost {
                 }),
             ..Default::default()
         };
+        let accepted_at = Timestamp::now();
         workspace.append_operation(&OperationRecord {
             details: details.clone(),
             operation_id: operation_id.clone(),
@@ -144,7 +145,7 @@ impl ServiceHost {
             } else {
                 OperationStatus::Pending
             },
-            created_at: Timestamp::now(),
+            created_at: accepted_at,
             summary: format!("{capability} accepted"),
             artifacts: vec![],
             raw_output: None,
@@ -155,6 +156,7 @@ impl ServiceHost {
             Some(session_id.clone()),
             "accepted",
         );
+        operation.created_at = accepted_at;
         operation.details = details;
         self.lock_state()?
             .operations
@@ -327,17 +329,9 @@ impl ServiceHost {
     }
 
     pub(super) fn persist_session(&self, session: &Session) -> Result<(), ServiceError> {
-        let workspace = Workspace::open(&session.workspace.root)?;
-        let dir = match session.kind {
-            SessionKind::Debug => workspace.ensure_session_artifact_dir(&session.session_id.id)?,
-            SessionKind::Recording => {
-                workspace.ensure_recording_artifact_dir(&session.session_id.id)?
-            }
-        };
-        write_atomic_bytes(
-            &dir.join("session.json"),
-            &serde_json::to_vec_pretty(session)?,
-        )?;
+        self.history
+            .lookup(&session.workspace.root)?
+            .save_session(session)?;
         Ok(())
     }
 
@@ -358,21 +352,24 @@ impl ServiceHost {
             )
         };
         if let Some(session) = session {
-            let workspace = Workspace::open(&session.workspace.root)?;
-            let directory = if session.kind == SessionKind::Debug {
-                workspace.ensure_session_artifact_dir(&session_id.id)?
+            let workspace = self.history.lookup(&session.workspace.root)?;
+            let event = json!({"schema_version":1,"session_id":session_id,"event":"worker_exited","observed_at":Timestamp::now(),"source":"process_monitor","cleanup":session.cleanup});
+            workspace.session_event(session_id.id.as_str(), "worker_exited", &event)?;
+            let domain = if session.kind == SessionKind::Debug {
+                "sessions"
             } else {
-                workspace.ensure_recording_artifact_dir(&session_id.id)?
+                "recordings"
             };
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(directory.join("session-events.jsonl"))?;
-            writeln!(
-                file,
-                "{}",
-                json!({"schema_version":1,"session_id":session_id,"event":"worker_exited","observed_at":Timestamp::now(),"source":"process_monitor","cleanup":session.cleanup})
-            )?;
+            // The durable observation survives loss of the optional session stream.
+            if workspace.verify_files().is_ok() {
+                let path = Path::new("artifacts")
+                    .join(domain)
+                    .join(session_id.id.as_str())
+                    .join("session-events.jsonl");
+                if let Err(error) = workspace.append_event_jsonl(path, &event) {
+                    append_service_diagnostic_log(&error.to_string());
+                }
+            }
             for operation in operations {
                 self.finish_operation_in_memory(
                     &operation.operation_id,

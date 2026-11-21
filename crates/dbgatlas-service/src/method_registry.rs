@@ -7,6 +7,7 @@ static METHOD_SPECS: OnceLock<Vec<MethodSpec>> = OnceLock::new();
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MethodRoute {
     Service,
+    Workspace,
     Session,
     Debug,
     Recording,
@@ -59,6 +60,7 @@ pub(super) fn mcp_tool_descriptors() -> Vec<Value> {
         .filter(|spec| {
             (!spec.name.starts_with("debug.") || spec.name == "debug.read_memory")
                 && !spec.name.starts_with("operation.")
+                && !spec.name.starts_with("workspace.")
         })
         .map(|spec| spec.descriptor)
         .collect()
@@ -66,6 +68,7 @@ pub(super) fn mcp_tool_descriptors() -> Vec<Value> {
 
 fn method_route(name: &str) -> MethodRoute {
     match name.split_once('.').map(|(prefix, _)| prefix) {
+        Some("workspace") | Some("history") => MethodRoute::Workspace,
         Some("service") => MethodRoute::Service,
         Some("session") => MethodRoute::Session,
         Some("debug") => MethodRoute::Debug,
@@ -80,6 +83,30 @@ fn method_route(name: &str) -> MethodRoute {
 
 fn registered_method_descriptors() -> Vec<Value> {
     let mut tools = vec![
+        mcp_tool(
+            "history.query",
+            "Browse the central catalog: overview lists projects; workspace pages executions; history reads changes; provenance finds file producers and consumers; output reads registered files.",
+            json!({"type":"object","properties":{
+                "action":{"enum":["overview","workspace","history","provenance","output","facts"]},"project_root":{"type":"string"},"workspace_root":{"type":"string"},
+                "execution_id":{"type":"string"},"session_id":{"type":"string"},"artifact_id":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},
+                "status":{"type":"string"},"search":{"type":"string"},"start_ms":{"type":"integer"},"end_ms":{"type":"integer"},"after":{"type":"integer"},"offset":{"type":"integer"},"limit":{"type":"integer"}
+            }}),
+        ),
+        mcp_tool(
+            "workspace.init",
+            "Register a new workspace.",
+            json!({"type":"object","properties":{"path":{"type":"string"},"with_inputs":{"type":"boolean"}},"required":["path"]}),
+        ),
+        mcp_tool(
+            "workspace.relink",
+            "Bind a moved workspace to its registered identity.",
+            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        ),
+        mcp_tool(
+            "workspace.info",
+            "Read registered workspace information.",
+            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        ),
         mcp_tool(
             "session.interrupt",
             "Request a break for the observed target run through the independent control channel. Accepted is not a confirmed stop; query session.get. A stale epoch never interrupts a later run.",

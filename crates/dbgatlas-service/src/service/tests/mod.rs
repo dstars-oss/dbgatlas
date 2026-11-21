@@ -159,8 +159,8 @@ fn cpu_test_host(mode: MockEtwMode) -> (ServiceHost, Arc<AtomicU64>) {
 mod execution;
 mod host;
 mod http;
-mod management;
 mod install;
+mod management;
 mod recording;
 
 struct TestServer {
@@ -1035,3 +1035,10 @@ impl WorkerSupervisor for InstrumentedWorkerSupervisor {
 }
 
 mod mcp_protocol;
+
+pub(super) fn test_history() -> HistoryStore {
+    static STORE: std::sync::OnceLock<HistoryStore> = std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| HistoryStore::new(PathBuf::from(":memory:")))
+        .clone()
+}

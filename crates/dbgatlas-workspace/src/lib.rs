@@ -1,10 +1,11 @@
-static OPERATION_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+mod history;
+pub use history::{HistoryFilter, HistoryStore, OperationPage};
 static JSONL_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use dbgatlas_model::{ArtifactRef, Id, InvalidId, OperationRef, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
@@ -12,9 +13,6 @@ pub const MANIFEST_FILE: &str = "dbgatlas-workspace.json";
 pub const ARTIFACTS_DIR: &str = "artifacts";
 pub const ANALYSIS_DIR: &str = "analysis";
 pub const INPUTS_DIR: &str = "inputs";
-pub const ARTIFACTS_LOG: &str = "artifacts/artifacts.jsonl";
-pub const OPERATIONS_LOG: &str = "artifacts/operations.jsonl";
-pub const COMMAND_AUDIT_LOG: &str = "artifacts/command_audit.jsonl";
 pub const SESSIONS_DIR: &str = "sessions";
 pub const RECORDINGS_DIR: &str = "recordings";
 pub const PROFILES_DIR: &str = "profiles";
@@ -42,6 +40,12 @@ pub enum WorkspaceError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("history database: {0}")]
+    History(String),
+    #[error("history database: {0}")]
+    Sql(#[from] rusqlite::Error),
+    #[error("history record: {0}")]
+    Record(#[from] serde_json::Error),
     #[error(transparent)]
     InvalidId(#[from] InvalidId),
 }
@@ -131,6 +135,7 @@ pub use dbgatlas_model::OperationState as OperationStatus;
 pub struct Workspace {
     root: PathBuf,
     manifest: WorkspaceManifest,
+    history: HistoryStore,
 }
 
 impl Workspace {
@@ -138,47 +143,49 @@ impl Workspace {
         root: impl Into<PathBuf>,
         options: WorkspaceInitOptions,
     ) -> Result<Self, WorkspaceError> {
-        let root = root.into();
-        let manifest_path = root.join(MANIFEST_FILE);
-        if manifest_path.exists() {
-            return Err(WorkspaceError::AlreadyExists(root));
-        }
-
-        create_dir(&root)?;
-        create_dir(root.join(ARTIFACTS_DIR))?;
-        create_dir(root.join(ANALYSIS_DIR))?;
-        if options.create_inputs {
-            create_dir(root.join(INPUTS_DIR))?;
-        }
-
-        let workspace_name = root
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("workspace");
-
-        let manifest = WorkspaceManifest {
-            schema_version: 1,
-            workspace_id: Id::new(workspace_name)?,
-            created_at: Timestamp::now(),
-            tool: ToolInfo {
-                name: "DbgAtlas".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        };
-
-        write_json_pretty(&manifest_path, &manifest)?;
-        Ok(Self { root, manifest })
+        HistoryStore::local().init_workspace(root.into(), options)
     }
 
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
-        let root = root.into();
-        let manifest_path = root.join(MANIFEST_FILE);
-        if !manifest_path.exists() {
-            return Err(WorkspaceError::ManifestNotFound(manifest_path));
+        HistoryStore::local().open_workspace(root.into())
+    }
+
+    pub fn load_manifest(root: &Path) -> Result<WorkspaceManifest, WorkspaceError> {
+        let path = root.join(MANIFEST_FILE);
+        if !path.try_exists().map_err(|source| WorkspaceError::Io {
+            path: path.clone(),
+            source,
+        })? {
+            return Err(WorkspaceError::ManifestNotFound(path));
         }
-        let manifest = read_json(&manifest_path)?;
-        Ok(Self { root, manifest })
+        let manifest: WorkspaceManifest = read_json(&path)?;
+        if manifest.schema_version != 2 {
+            return Err(WorkspaceError::History(format!(
+                "unsupported workspace format {} at {}; use a new workspace",
+                manifest.schema_version,
+                root.display()
+            )));
+        }
+        Ok(manifest)
+    }
+
+    /// File-only worker handle. Recording workers never read or write catalog metadata.
+    pub fn open_files(root: PathBuf) -> Result<Self, WorkspaceError> {
+        let manifest = Self::load_manifest(&root)?;
+        Ok(Self {
+            root,
+            manifest,
+            history: HistoryStore::local(),
+        })
+    }
+
+    pub fn verify_files(&self) -> Result<(), WorkspaceError> {
+        if Self::load_manifest(&self.root)?.workspace_id != self.manifest.workspace_id {
+            return Err(WorkspaceError::History(
+                "project directory now contains a different workspace".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -208,6 +215,7 @@ impl Workspace {
         kind: &str,
         file_name: &str,
     ) -> Result<PathBuf, WorkspaceError> {
+        self.verify_files()?;
         validate_path_segment(kind)?;
         validate_path_segment(file_name)?;
         let dir = self.root.join(ARTIFACTS_DIR).join(kind);
@@ -241,6 +249,7 @@ impl Workspace {
         &self,
         relative_path: impl AsRef<Path>,
     ) -> Result<PathBuf, WorkspaceError> {
+        self.verify_files()?;
         let relative_path = relative_path.as_ref();
         validate_artifact_relative_path(relative_path)?;
         let path = self.root.join(relative_path);
@@ -273,7 +282,7 @@ impl Workspace {
                 }
             }
         }
-        append_json_line(self.root.join(ARTIFACTS_LOG), &metadata)
+        self.save_artifact(&metadata)
     }
 
     /// Resolve the registered relative path, then validate the opened object too.
@@ -319,102 +328,6 @@ impl Workspace {
         Ok(file)
     }
 
-    pub fn list_artifacts(&self) -> Result<Vec<ArtifactMetadata>, WorkspaceError> {
-        read_json_lines(self.root.join(ARTIFACTS_LOG))
-    }
-
-    pub fn get_artifact(
-        &self,
-        artifact_id: &ArtifactRef,
-    ) -> Result<Option<ArtifactMetadata>, WorkspaceError> {
-        Ok(self
-            .list_artifacts()?
-            .into_iter()
-            .find(|artifact| artifact.artifact_id == *artifact_id))
-    }
-
-    pub fn append_operation(&self, record: &OperationRecord) -> Result<(), WorkspaceError> {
-        let _guard = OPERATION_LOG_LOCK.lock().map_err(|_| WorkspaceError::Io {
-            path: self.root.join(OPERATIONS_LOG),
-            source: std::io::Error::other("operation log lock poisoned"),
-        })?;
-        let mut record = record.clone();
-        if let Some(previous) = self
-            .list_operations_unlocked()?
-            .into_iter()
-            .find(|p| p.operation_id == record.operation_id)
-        {
-            if matches!(
-                previous.status,
-                OperationStatus::Success | OperationStatus::Failed | OperationStatus::Canceled
-            ) && matches!(
-                record.status,
-                OperationStatus::Pending | OperationStatus::Running | OperationStatus::Unknown
-            ) {
-                record.status = previous.status.clone();
-                record.summary = previous.summary.clone();
-                record.artifacts = previous.artifacts.clone();
-                record.raw_output = previous.raw_output.clone();
-            }
-            record.created_at = previous.created_at;
-            record.details.session_id = previous.details.session_id.or(record.details.session_id);
-            record.details.input = previous.details.input.or(record.details.input);
-            record.details.execution_context = previous
-                .details
-                .execution_context
-                .or(record.details.execution_context);
-            if record.details.related_operation_id.is_none() {
-                record.details.related_operation_id = previous.details.related_operation_id;
-            }
-            if record.details.output_error.is_none() {
-                record.details.output_error = previous.details.output_error;
-            }
-            record.details.update_seq = previous.details.update_seq + 1;
-        }
-        append_json_line(self.root.join(OPERATIONS_LOG), &record)
-    }
-
-    pub fn list_operations(&self) -> Result<Vec<OperationRecord>, WorkspaceError> {
-        let _guard = OPERATION_LOG_LOCK.lock().map_err(|_| WorkspaceError::Io {
-            path: self.root.join(OPERATIONS_LOG),
-            source: std::io::Error::other("operation log lock poisoned"),
-        })?;
-        self.list_operations_unlocked()
-    }
-
-    fn list_operations_unlocked(&self) -> Result<Vec<OperationRecord>, WorkspaceError> {
-        let records: Vec<OperationRecord> = read_json_lines(self.root.join(OPERATIONS_LOG))?;
-        let mut latest = std::collections::BTreeMap::new();
-        for record in records {
-            let key = record.operation_id.to_string();
-            if latest.get(&key).is_none_or(|old: &OperationRecord| {
-                old.details.update_seq <= record.details.update_seq
-            }) {
-                latest.insert(key, record);
-            }
-        }
-        Ok(latest.into_values().collect())
-    }
-
-    pub fn get_operation(
-        &self,
-        operation_id: &OperationRef,
-    ) -> Result<Option<OperationRecord>, WorkspaceError> {
-        Ok(self
-            .list_operations()?
-            .into_iter()
-            .rev()
-            .find(|operation| operation.operation_id == *operation_id))
-    }
-
-    pub fn append_command_audit(&self, record: &CommandAuditRecord) -> Result<(), WorkspaceError> {
-        append_json_line(self.root.join(COMMAND_AUDIT_LOG), record)
-    }
-
-    pub fn list_command_audit(&self) -> Result<Vec<CommandAuditRecord>, WorkspaceError> {
-        read_json_lines(self.root.join(COMMAND_AUDIT_LOG))
-    }
-
     pub fn facts(&self) -> Result<WorkspaceFacts, WorkspaceError> {
         Ok(WorkspaceFacts {
             artifacts: self.list_artifacts()?,
@@ -454,6 +367,7 @@ impl Workspace {
     }
 
     fn ensure_domain_artifact_dir(&self, domain: &str, id: &Id) -> Result<PathBuf, WorkspaceError> {
+        self.verify_files()?;
         let dir = self.root.join(ARTIFACTS_DIR).join(domain).join(id.as_str());
         create_dir(&dir)?;
         Ok(dir)
@@ -484,6 +398,38 @@ impl Workspace {
 
         Ok(())
     }
+}
+
+fn merge_update(record: &mut OperationRecord, previous: OperationRecord) {
+    if matches!(
+        previous.status,
+        OperationStatus::Success | OperationStatus::Failed | OperationStatus::Canceled
+    ) && matches!(
+        record.status,
+        OperationStatus::Pending | OperationStatus::Running | OperationStatus::Unknown
+    ) {
+        record.status = previous.status.clone();
+        record.summary = previous.summary.clone();
+        record.artifacts = previous.artifacts.clone();
+        record.raw_output = previous.raw_output.clone();
+    }
+    record.created_at = previous.created_at;
+    record.details.session_id = previous
+        .details
+        .session_id
+        .or(record.details.session_id.take());
+    record.details.input = previous.details.input.or(record.details.input.take());
+    record.details.execution_context = previous
+        .details
+        .execution_context
+        .or(record.details.execution_context.take());
+    if record.details.related_operation_id.is_none() {
+        record.details.related_operation_id = previous.details.related_operation_id;
+    }
+    if record.details.output_error.is_none() {
+        record.details.output_error = previous.details.output_error;
+    }
+    record.details.update_seq = previous.details.update_seq + 1;
 }
 
 fn validate_path_segment(value: &str) -> Result<(), WorkspaceError> {
@@ -547,17 +493,6 @@ fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     }
 }
 
-fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), WorkspaceError> {
-    let file = File::create(path).map_err(|source| WorkspaceError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::to_writer_pretty(file, value).map_err(|source| WorkspaceError::Json {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, WorkspaceError> {
     let file = File::open(path).map_err(|source| WorkspaceError::Io {
         path: path.to_path_buf(),
@@ -596,52 +531,21 @@ fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), Worksp
         .map_err(|source| WorkspaceError::Io { path, source })
 }
 
-fn read_json_lines<T: DeserializeOwned>(path: PathBuf) -> Result<Vec<T>, WorkspaceError> {
-    let _guard = JSONL_IO_LOCK.lock().map_err(|_| WorkspaceError::Io {
-        path: path.clone(),
-        source: std::io::Error::other("JSONL lock poisoned"),
-    })?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    // 读取端保持宽容：空文件或空行代表“暂无事实”，但非空坏 JSON
-    // 仍立即报错，防止上层基于损坏索引继续分析。
-    let file = File::open(&path).map_err(|source| WorkspaceError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let reader = BufReader::new(file);
-    let mut values = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|source| WorkspaceError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        values.push(
-            serde_json::from_str(&line).map_err(|source| WorkspaceError::Json {
-                path: path.clone(),
-                source,
-            })?,
-        );
-    }
-    Ok(values)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn legacy_journal_merges_updates_without_inventing_identity_or_changing_input() {
+    fn catalog_merges_updates_without_inventing_identity_or_changing_input() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path().join("legacy"), Default::default()).unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(temp.path().join("legacy"), Default::default())
+            .unwrap();
         let legacy = serde_json::json!({"operation_id":{"id":"old-op"},"adapter_id":"service","capability":"debug.eval",
             "status":"Running","created_at":{"unix_millis":1},"summary":"old","artifacts":[],"raw_output":null});
-        std::fs::write(workspace.root().join(OPERATIONS_LOG), format!("{legacy}\n")).unwrap();
+        workspace
+            .append_operation(&serde_json::from_value(legacy).unwrap())
+            .unwrap();
         let id = OperationRef::new(Id::new("old-op").unwrap());
         let mut record = workspace.get_operation(&id).unwrap().unwrap();
         assert!(record.details.session_id.is_none());
@@ -660,10 +564,10 @@ mod tests {
         );
         assert_eq!(merged[0].status, OperationStatus::Unknown);
         assert_eq!(
-            std::fs::read_to_string(workspace.root().join(OPERATIONS_LOG))
+            workspace
+                .history_entries(Some(id.id.as_str()), None, 0, 10)
                 .unwrap()
-                .lines()
-                .count(),
+                .len(),
             3
         );
     }
@@ -672,13 +576,14 @@ mod tests {
     fn init_creates_visible_workspace_layout() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("case-001");
-        let workspace = Workspace::init(
-            &root,
-            WorkspaceInitOptions {
-                create_inputs: true,
-            },
-        )
-        .unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(
+                &root,
+                WorkspaceInitOptions {
+                    create_inputs: true,
+                },
+            )
+            .unwrap();
 
         assert_eq!(workspace.root(), root.as_path());
         assert!(root.join(MANIFEST_FILE).is_file());
@@ -686,14 +591,18 @@ mod tests {
         assert!(root.join(ANALYSIS_DIR).is_dir());
         assert!(root.join(INPUTS_DIR).is_dir());
 
-        let reopened = Workspace::open(&root).unwrap();
-        assert_eq!(reopened.manifest().schema_version, 1);
+        let reopened = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .open_workspace(&root)
+            .unwrap();
+        assert_eq!(reopened.manifest().schema_version, 2);
     }
 
     #[test]
     fn register_and_list_artifacts() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path().join("case-002"), Default::default()).unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(temp.path().join("case-002"), Default::default())
+            .unwrap();
         let artifact_path = workspace
             .allocate_artifact_path("raw", "command-output.txt")
             .unwrap();
@@ -727,8 +636,9 @@ mod tests {
     #[test]
     fn creates_domain_artifact_directories() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace =
-            Workspace::init(temp.path().join("case-layout"), Default::default()).unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(temp.path().join("case-layout"), Default::default())
+            .unwrap();
         let id = Id::new("session-001").unwrap();
 
         assert!(
@@ -755,8 +665,9 @@ mod tests {
     #[test]
     fn rejects_artifact_paths_outside_workspace_artifacts() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace =
-            Workspace::init(temp.path().join("case-paths"), Default::default()).unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(temp.path().join("case-paths"), Default::default())
+            .unwrap();
 
         for path in [
             PathBuf::from(r"C:\absolute.txt"),
@@ -775,8 +686,9 @@ mod tests {
     #[test]
     fn rejects_artifact_paths_through_directory_links_when_available() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace =
-            Workspace::init(temp.path().join("case-links"), Default::default()).unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(temp.path().join("case-links"), Default::default())
+            .unwrap();
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let link = workspace.root().join("artifacts").join("linked");
@@ -795,8 +707,9 @@ mod tests {
     #[test]
     fn appends_event_jsonl_and_text_artifacts() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace =
-            Workspace::init(temp.path().join("case-events"), Default::default()).unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(temp.path().join("case-events"), Default::default())
+            .unwrap();
 
         workspace
             .append_event_jsonl(
@@ -825,27 +738,26 @@ mod tests {
     }
 
     #[test]
-    fn list_operations_accepts_legacy_pascal_case_status() {
+    fn rejects_old_manifest_without_modifying_it() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace =
-            Workspace::init(temp.path().join("case-legacy"), Default::default()).unwrap();
-        std::fs::write(
-            workspace.root().join(OPERATIONS_LOG),
-            r#"{"operation_id":{"id":"op-legacy"},"adapter_id":"mock","capability":"native.version","status":"Success","created_at":{"unix_millis":1},"summary":"legacy success","artifacts":[]}"#,
-        )
-        .unwrap();
-
-        let operations = workspace.list_operations().unwrap();
-        assert_eq!(operations.len(), 1);
-        assert!(matches!(operations[0].status, OperationStatus::Success));
-        assert!(operations[0].raw_output.is_none());
+        let manifest = temp.path().join(MANIFEST_FILE);
+        let old = r#"{"schema_version":1,"workspace_id":"old","created_at":{"unix_millis":1},"tool":{"name":"DbgAtlas","version":"0.4.0"}}"#;
+        fs::write(&manifest, old).unwrap();
+        assert!(
+            Workspace::load_manifest(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported workspace format")
+        );
+        assert_eq!(fs::read_to_string(manifest).unwrap(), old);
     }
 
     #[test]
     fn command_audit_round_trips_and_facts_include_logs() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace =
-            Workspace::init(temp.path().join("case-audit"), Default::default()).unwrap();
+        let workspace = HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(temp.path().join("case-audit"), Default::default())
+            .unwrap();
         let operation_id = OperationRef::new(Id::new("op-audit").unwrap());
         let record = CommandAuditRecord {
             operation_id: operation_id.clone(),
@@ -858,6 +770,11 @@ mod tests {
             raw_output: None,
         };
 
+        assert!(workspace.append_command_audit(&record).is_err());
+        let execution = serde_json::json!({"operation_id":operation_id,"adapter_id":"dbgeng","capability":"debug.eval","status":"success","created_at":{"unix_millis":1},"summary":"done","artifacts":[]});
+        workspace
+            .append_operation(&serde_json::from_value(execution).unwrap())
+            .unwrap();
         workspace.append_command_audit(&record).unwrap();
 
         let audit = workspace.list_command_audit().unwrap();

@@ -44,7 +44,7 @@ impl ServiceHost {
         }
 
         let operation_id = self.action_operation_id();
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         self.begin_operation_record(
             &workspace,
             &operation_id,
@@ -83,7 +83,7 @@ impl ServiceHost {
         let session = self.reusable_debug_session(&request.session_id)?;
 
         let operation_id = self.action_operation_id();
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         let audit_command = if request.reload {
             format!(".sympath+ {}; .reload", request.symbol_path)
         } else {
@@ -126,7 +126,7 @@ impl ServiceHost {
         let session = self.reusable_debug_session(&request.session_id)?;
 
         let operation_id = self.action_operation_id();
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         let audit_command = format!(
             "read_memory address={} length={}",
             request.address, request.length

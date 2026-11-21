@@ -52,7 +52,7 @@
           </div>
         </form>
         <div class="recent">
-          <label for="recent">最近 / 本次服务已知项目</label
+          <label for="recent">中心库已登记项目</label
           ><select id="recent">
             <option value="">选择项目…</option>
           </select>
@@ -111,6 +111,8 @@
               <option value="canceled">已取消</option>
               <option value="unknown">未知</option>
             </select>
+            <label>从 <input type="datetime-local" id="time-start" /></label>
+            <label>至 <input type="datetime-local" id="time-end" /></label>
           </div>
           <div class="table-wrap">
             <table>
@@ -159,8 +161,14 @@
               <summary>执行上下文与输入参数</summary>
               <pre id="context"></pre>
             </details>
+            <details id="execution-history">
+              <summary>执行历史</summary>
+              <pre id="history-content"></pre>
+              <button type="button" id="history-more" hidden>继续读取</button>
+            </details>
             <h3>关联产物</h3>
             <div id="artifacts" class="artifact-list"></div>
+            <p id="provenance"></p>
           </div>
           <div class="output-panel">
             <div class="output-head">

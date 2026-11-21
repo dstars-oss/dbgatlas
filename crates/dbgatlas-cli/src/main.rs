@@ -15,7 +15,7 @@ use dbgatlas_service::{
     run_windows_service_dispatcher, run_windows_service_doctor, start_windows_service,
     status_windows_service, stop_windows_service, uninstall_windows_service,
 };
-use dbgatlas_workspace::{Workspace, WorkspaceInitOptions};
+
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -75,16 +75,31 @@ use execution_cli::{ExecutionCommand, SessionCommand};
 
 #[derive(Subcommand)]
 enum WorkspaceCommand {
+    Relink {
+        path: PathBuf,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+    },
+    List {
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
+    },
     Init {
         path: PathBuf,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
         #[arg(long)]
         with_inputs: bool,
     },
     Info {
         path: PathBuf,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
     },
     Facts {
         path: PathBuf,
+        #[arg(long)]
+        endpoint: Option<SocketAddr>,
     },
 }
 
@@ -386,51 +401,75 @@ fn run() -> Result<()> {
 }
 
 fn run_workspace(command: WorkspaceCommand, as_json: bool) -> Result<()> {
-    match command {
-        WorkspaceCommand::Init { path, with_inputs } => {
-            let workspace = Workspace::init(
-                path,
-                WorkspaceInitOptions {
-                    create_inputs: with_inputs,
-                },
-            )?;
-            if as_json {
-                print_json(json!({
-                    "root": workspace.root(),
-                    "manifest": workspace.manifest_path(),
-                    "workspace_id": workspace.manifest().workspace_id,
-                }))?;
-            } else {
-                println!("initialized workspace: {}", workspace.root().display());
-                println!("manifest: {}", workspace.manifest_path().display());
-            }
+    let (endpoint, method, params) = match command {
+        WorkspaceCommand::List { endpoint } => {
+            (endpoint, "history.query", json!({"action":"overview"}))
         }
-        WorkspaceCommand::Info { path } => {
-            let workspace = Workspace::open(path)?;
-            let info = workspace.info();
-            if as_json {
-                print_json(serde_json::to_value(&info)?)?;
-            } else {
-                println!("workspace: {}", info.root.display());
-                println!("workspace id: {}", info.manifest.workspace_id);
-                println!("schema version: {}", info.manifest.schema_version);
-                println!("artifacts dir: {}", info.has_artifacts_dir);
-                println!("analysis dir: {}", info.has_analysis_dir);
-                println!("inputs dir: {}", info.has_inputs_dir);
-            }
+        WorkspaceCommand::Init {
+            path,
+            with_inputs,
+            endpoint,
+        } => (
+            endpoint,
+            "workspace.init",
+            json!({"path":absolute_path(path)?,"with_inputs":with_inputs}),
+        ),
+        WorkspaceCommand::Info { path, endpoint } => (
+            endpoint,
+            "workspace.info",
+            json!({"path":absolute_path(path)?}),
+        ),
+        WorkspaceCommand::Facts { path, endpoint } => (
+            endpoint,
+            "history.query",
+            json!({"action":"facts","workspace_root":absolute_path(path)?}),
+        ),
+        WorkspaceCommand::Relink { path, endpoint } => (
+            endpoint,
+            "workspace.relink",
+            json!({"path":absolute_path(path)?}),
+        ),
+    };
+    let query_path = params["workspace_root"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let reply = call_service(endpoint, method, params)?;
+    if let Some(error) = rpc_failure(&reply) {
+        anyhow::bail!("{error}");
+    }
+    let value = reply.result.context("missing workspace result")?;
+    if as_json {
+        return print_json(value);
+    }
+    match method {
+        "workspace.init" => {
+            println!(
+                "initialized workspace: {}",
+                value["root"].as_str().unwrap_or_default()
+            );
+            println!(
+                "manifest: {}",
+                value["manifest"].as_str().unwrap_or_default()
+            );
         }
-        WorkspaceCommand::Facts { path } => {
-            let workspace = Workspace::open(path)?;
-            let facts = workspace.facts()?;
-            if as_json {
-                print_json(serde_json::to_value(&facts)?)?;
-            } else {
-                println!("workspace: {}", workspace.root().display());
-                println!("artifacts: {}", facts.artifacts.len());
-                println!("operations: {}", facts.operations.len());
-                println!("command audit records: {}", facts.command_audit.len());
-            }
+        "workspace.info" => {
+            let info: dbgatlas_workspace::WorkspaceInfo = serde_json::from_value(value)?;
+            println!("workspace: {}", info.root.display());
+            println!("workspace id: {}", info.manifest.workspace_id);
+            println!("schema version: {}", info.manifest.schema_version);
+            println!("artifacts dir: {}", info.has_artifacts_dir);
+            println!("analysis dir: {}", info.has_analysis_dir);
+            println!("inputs dir: {}", info.has_inputs_dir);
         }
+        "history.query" if value.get("operations").is_some() => {
+            let facts: dbgatlas_workspace::WorkspaceFacts = serde_json::from_value(value)?;
+            println!("workspace: {query_path}");
+            println!("artifacts: {}", facts.artifacts.len());
+            println!("operations: {}", facts.operations.len());
+            println!("command audit records: {}", facts.command_audit.len());
+        }
+        _ => print_json(value)?,
     }
     Ok(())
 }

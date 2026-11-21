@@ -311,11 +311,12 @@ mod tests {
     #[test]
     fn invokes_adapter_and_records_operation() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(
-            temp.path().join("case-core"),
-            WorkspaceInitOptions::default(),
-        )
-        .unwrap();
+        let workspace = dbgatlas_workspace::HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(
+                temp.path().join("case-core"),
+                WorkspaceInitOptions::default(),
+            )
+            .unwrap();
         let mut core = Core::with_workspace(workspace);
         core.register_adapter(MockAdapter {
             result_status: InvocationStatus::Success,
@@ -339,11 +340,12 @@ mod tests {
     #[test]
     fn records_structured_failed_result_as_failed_operation() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(
-            temp.path().join("case-failed"),
-            WorkspaceInitOptions::default(),
-        )
-        .unwrap();
+        let workspace = dbgatlas_workspace::HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(
+                temp.path().join("case-failed"),
+                WorkspaceInitOptions::default(),
+            )
+            .unwrap();
         let mut core = Core::with_workspace(workspace);
         core.register_adapter(MockAdapter {
             result_status: InvocationStatus::Failed,
@@ -366,11 +368,12 @@ mod tests {
     #[test]
     fn registers_raw_output_artifact_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(
-            temp.path().join("case-artifact"),
-            WorkspaceInitOptions::default(),
-        )
-        .unwrap();
+        let workspace = dbgatlas_workspace::HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(
+                temp.path().join("case-artifact"),
+                WorkspaceInitOptions::default(),
+            )
+            .unwrap();
         let mut core = Core::with_workspace(workspace);
         core.register_adapter(MockAdapter {
             result_status: InvocationStatus::Success,
@@ -395,11 +398,12 @@ mod tests {
     #[test]
     fn records_long_running_operation_status_transitions() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(
-            temp.path().join("case-long-op"),
-            WorkspaceInitOptions::default(),
-        )
-        .unwrap();
+        let workspace = dbgatlas_workspace::HistoryStore::new(temp.path().join("history.sqlite3"))
+            .init_workspace(
+                temp.path().join("case-long-op"),
+                WorkspaceInitOptions::default(),
+            )
+            .unwrap();
         let core = Core::with_workspace(workspace);
         let adapter_id = AdapterId::new("mock");
         let capability = Capability::new("debug.eval");
@@ -420,16 +424,12 @@ mod tests {
         assert_eq!(operations[0].operation_id.id, operation_id.id);
         assert!(matches!(operations[0].status, OperationStatus::Canceled));
         assert_eq!(operations[0].details.update_seq, 1);
-        let raw = std::fs::read_to_string(
-            core.workspace()
-                .root()
-                .join(dbgatlas_workspace::OPERATIONS_LOG),
-        )
-        .unwrap();
         assert_eq!(
-            raw.lines().count(),
-            2,
-            "original status updates remain available"
+            core.workspace()
+                .history_entries(Some(operation_id.id.as_str()), None, 0, 10)
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

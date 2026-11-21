@@ -7,11 +7,11 @@ license.workspace = true
 
 [dependencies]
 dbgatlas-model.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -84,7 +84,7 @@ impl ServiceHost {
             if session.kind != dbgatlas_model::SessionKind::Debug {
                 return Err(ServiceError::Rpc("session.read currently supports debug sessions; use recording artifact references".into()));
             }
-            let workspace = Workspace::open(&session.workspace.root)?;
+            let workspace = self.history.lookup(&session.workspace.root)?;
             let dir = workspace.ensure_session_artifact_dir(&sid.id)?;
             let ended = session.lifecycle.is_terminal() && session.cleanup.complete;
             let error = session.lifecycle == dbgatlas_model::SessionLifecycle::Failed
@@ -127,7 +127,7 @@ impl ServiceHost {
                 .get(sid.id.as_str())
                 .cloned()
                 .ok_or_else(|| ServiceError::SessionNotFound(sid.to_string()))?;
-            let workspace = Workspace::open(&session.workspace.root)?;
+            let workspace = self.history.lookup(&session.workspace.root)?;
             let dir = workspace.ensure_session_artifact_dir(&sid.id)?;
             let finished = self
                 .execution_job(&id)
@@ -275,7 +275,9 @@ impl ServiceHost {
         let project = params["project_root"]
             .as_str()
             .ok_or_else(|| ServiceError::Rpc("project_root is required".into()))?;
-        let facts = workspace_facts_with_fallback(Path::new(project))?;
+        let workspace = self
+            .history
+            .lookup(Path::new(project).join(INTERNAL_WORKSPACE_DIR))?;
         let session: Option<SessionRef> = params
             .get("session_id")
             .cloned()
@@ -297,7 +299,7 @@ impl ServiceHost {
             .unwrap_or(20) as usize;
         let resource = format!(
             "execution.list:{}:{}:{}",
-            fs::canonicalize(project)?.display(),
+            workspace.manifest().workspace_id,
             serde_json::to_string(&session)?,
             serde_json::to_string(&status)?
         );
@@ -314,7 +316,7 @@ impl ServiceHost {
             }
         };
         let mut values = Vec::new();
-        for record in facts.operations {
+        for record in workspace.list_operations()? {
             if session
                 .as_ref()
                 .is_some_and(|id| record.details.session_id.as_ref() != Some(id))

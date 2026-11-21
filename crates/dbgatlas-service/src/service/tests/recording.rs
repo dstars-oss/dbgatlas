@@ -183,7 +183,9 @@ fn recording_start_creates_recording_artifacts() {
     assert_eq!(result["operation_status"], "success");
     assert_eq!(result["artifact_refs"].as_array().unwrap().len(), 2);
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let artifacts = workspace.list_artifacts().unwrap();
     assert!(
         artifacts
@@ -296,7 +298,9 @@ fn recording_ttd_registers_run_trace_and_metadata() {
         )
     );
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let artifacts = workspace.list_artifacts().unwrap();
     assert!(
         artifacts
@@ -361,7 +365,9 @@ fn recording_ttd_attach_uses_attach_args_and_requested_identity() {
     assert!(args.contains(&"4242".to_string()));
     assert!(!args.contains(&"-launch".to_string()));
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let recording_id = result["recording_id"]["id"].as_str().unwrap();
     let metadata: Value = serde_json::from_str(
         &fs::read_to_string(
@@ -425,7 +431,9 @@ fn recording_ttd_launch_uses_start_directory() {
     assert!(!args.contains(&start_directory.to_string_lossy().into_owned()));
     drop(invocations);
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let recording_id = result["recording_id"]["id"].as_str().unwrap();
     let metadata: Value = serde_json::from_str(
         &fs::read_to_string(
@@ -588,7 +596,9 @@ fn recording_ttd_timeout_invokes_stop_and_keeps_trace() {
     assert_eq!(result["state"], "timed_out");
     assert_eq!(result["operation_status"], "success");
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let artifacts = workspace.list_artifacts().unwrap();
     assert!(artifacts.iter().any(|artifact| {
         artifact.relative_path.ends_with("recorder-stop.stdout.txt")
@@ -677,7 +687,9 @@ fn recording_stop_registers_trace_and_category_events() {
     assert_eq!(result["state"], "stopped");
     assert_eq!(result["operation_status"], "success");
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let artifacts = workspace.list_artifacts().unwrap();
     assert!(
         artifacts
@@ -755,7 +767,9 @@ fn recording_workspace_facts_exposes_reportable_event_materials() {
         serde_json::from_value::<OperationRef>(stop.result.unwrap()["operation_id"].clone())
             .unwrap();
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let facts = workspace.facts().unwrap();
     assert!(facts.operations.iter().any(|operation| {
         operation.operation_id == stop_operation_id
@@ -831,7 +845,9 @@ fn recording_cancel_is_terminal() {
     });
     assert_eq!(stop.error.unwrap().code, -32016);
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let operations = workspace.list_operations().unwrap();
     let cancel_operation = operations
         .iter()
@@ -867,7 +883,9 @@ fn recording_kill_records_failed_operation_and_keeps_artifacts_in_facts() {
     let kill_operation_id =
         serde_json::from_value::<OperationRef>(result["operation_id"].clone()).unwrap();
 
-    let workspace = Workspace::open(temp.path().join(INTERNAL_WORKSPACE_DIR)).unwrap();
+    let workspace = test_history()
+        .open_workspace(temp.path().join(INTERNAL_WORKSPACE_DIR))
+        .unwrap();
     let facts = workspace.facts().unwrap();
     assert!(facts.operations.iter().any(|operation| {
         operation.capability == "recording.kill"

@@ -18,7 +18,7 @@ impl ServiceHost {
             .map(|s| s.session_id.clone())
             .unwrap_or_else(next_session_ref);
         let operation_id = self.action_operation_id();
-        let workspace = ensure_project_workspace(&params.project_root)?;
+        let workspace = self.ensure_project_workspace(&params.project_root)?;
         let session_dir = workspace.ensure_session_artifact_dir(&session_id.id)?;
         if self.execution_scope.is_none() {
             self.open_session_record(
@@ -245,7 +245,7 @@ impl ServiceHost {
                     "no active target run; use operation.cancel for an active command".into(),
                 )
             })?;
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         let id = self.action_operation_id();
         self.begin_operation_record(
             &workspace,
@@ -334,7 +334,7 @@ impl ServiceHost {
         } else {
             "debug.session.kill"
         };
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         self.begin_operation_record(
             &workspace,
             &operation_id,
@@ -549,7 +549,7 @@ impl ServiceHost {
             .try_lock()
             .map_err(|_| ServiceError::SessionBusy(params.session_id.to_string()))?;
         let session = self.reusable_debug_session(&params.session_id)?;
-        let workspace = Workspace::open(&session.internal_workspace_root)?;
+        let workspace = self.history.lookup(&session.internal_workspace_root)?;
         let batch_operation_id = self.action_operation_id();
         let now = Timestamp::now();
         self.begin_operation_record(&workspace, &batch_operation_id, &session.session_id,
